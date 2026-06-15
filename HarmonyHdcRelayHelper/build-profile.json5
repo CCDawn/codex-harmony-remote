@@ -1,0 +1,55 @@
+﻿{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "",
+          "keyAlias": "debugKey",
+          "keyPassword": "",
+          "profile": "",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "",
+          "storePassword": ""
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "6.0.2(22)",
+        "runtimeOS": "HarmonyOS",
+        "arkTSVersion": "1.1",
+        "bundleType": "app",
+        "label": "$string:app_name",
+        "icon": "$media:app_icon",
+        "versionCode": 1000010,
+        "versionName": "1.0.10",
+        "vendor": "codex-remote",
+        "buildOption": {
+          "arkOptions": {
+            "types": []
+          }
+        },
+        "targetSdkVersion": "6.0.2(22)"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}
+

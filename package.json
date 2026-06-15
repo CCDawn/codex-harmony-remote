@@ -1,0 +1,32 @@
+{
+  "name": "codex-harmony-remote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "hdc:relay": "node scripts/hdc-relay/start-relay.mjs",
+    "hdc:proxy": "node scripts/hdc-relay/start-local-proxy.mjs",
+    "bridge:relay-proxy": "node scripts/hdc-relay/start-bridge-proxy.mjs",
+    "hdc:helper:node": "node scripts/hdc-relay/start-phone-helper-node.mjs",
+    "screen:capture": "powershell -ExecutionPolicy Bypass -File ./scripts/capture-device-screen.ps1",
+    "logs:analyze": "powershell -ExecutionPolicy Bypass -File ./scripts/analyze-latest-logs.ps1",
+    "link:smoke": "powershell -ExecutionPolicy Bypass -File ./tools/harmony/smoke-link.ps1",
+    "link:background": "powershell -ExecutionPolicy Bypass -File ./tools/harmony/background-lock-smoke.ps1",
+    "deploy:safe": "powershell -ExecutionPolicy Bypass -File ./tools/harmony/safe-deploy.ps1",
+    "desktop:connect": "node scripts/connect-desktop-live.mjs",
+    "desktop:recover:soft": "powershell -ExecutionPolicy Bypass -File ./scripts/recover-codex-desktop-live-soft.ps1",
+    "desktop:live:start": "powershell -ExecutionPolicy Bypass -File ./scripts/restart-codex-desktop-live.ps1",
+    "agent:setup": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/setup.ps1",
+    "agent:doctor": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/doctor.ps1",
+    "agent:start": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/start-stack.ps1",
+    "agent:deploy": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/deploy-app.ps1",
+    "agent:scan": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/scan-open-source.ps1",
+    "agent:stage": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/create-open-source-staging.ps1 -ForceClean",
+    "agent:verify-release": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/verify-open-source-release.ps1",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

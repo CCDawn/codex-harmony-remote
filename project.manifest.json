@@ -1,0 +1,57 @@
+{
+  "name": "codex-harmony-remote",
+  "description": "HarmonyOS remote client and relay tooling for operating Codex Desktop from a phone.",
+  "agentEntry": "AGENTS.md",
+  "bootstrap": "docs/agent/BOOTSTRAP.md",
+  "architecture": "docs/agent/ARCHITECTURE.md",
+  "configuration": "docs/agent/CONFIGURATION.md",
+  "troubleshooting": "docs/agent/TROUBLESHOOTING.md",
+  "taskRecipes": "docs/agent/TASKS.md",
+  "runtime": {
+    "node": ">=20",
+    "os": "windows",
+    "shell": "powershell"
+  },
+  "modules": [
+    {
+      "name": "local-bridge",
+      "path": "src",
+      "purpose": "HTTP bridge, Codex session APIs, desktop live/CDP integration, and link recovery."
+    },
+    {
+      "name": "main-harmony-app",
+      "path": "HarmonyCodexRemote",
+      "bundleName": "com.codex.remote.app",
+      "purpose": "Phone UI for Codex conversations, images, screenshots, interrupts, model settings, and recovery."
+    },
+    {
+      "name": "hdc-relay-helper",
+      "path": "HarmonyHdcRelayHelper",
+      "bundleName": "com.codex.remote.hdc.helper",
+      "purpose": "Phone-side relay helper for wireless HDC continuity."
+    }
+  ],
+  "safeAgentScripts": {
+    "setup": "scripts/agent/setup.ps1",
+    "doctor": "scripts/agent/doctor.ps1",
+    "startStack": "scripts/agent/start-stack.ps1",
+    "deployApp": "scripts/agent/deploy-app.ps1",
+    "scanOpenSource": "scripts/agent/scan-open-source.ps1",
+    "createOpenSourceStaging": "scripts/agent/create-open-source-staging.ps1",
+    "verifyOpenSourceRelease": "scripts/agent/verify-open-source-release.ps1"
+  },
+  "neverCommit": [
+    "logs/",
+    "tmp/",
+    "artifacts/",
+    "bin/",
+    "*.local.psd1",
+    "*.hap",
+    "*.p12",
+    "*.p7b",
+    "*.cer",
+    "HarmonyCodexRemote/entry/src/main/ets/config/BridgeConfig.ets",
+    "tools/harmony/sdk-overlay/",
+    "tools/harmony/sdk-shim-cli/"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "公网无线 HDC 中继助手" },
+    { "name": "app_name", "value": "HDC 中继助手" },
+    { "name": "ability_desc", "value": "连接公网 HDC Relay 并转发本机 hdcd" },
+    { "name": "permission_internet_reason", "value": "连接公网 HDC Relay 与本机 hdcd" },
+    { "name": "permission_background_reason", "value": "保持 HDC 中继在后台持续转发数据" }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Harmony Remote Local Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "bridgeUrl": {
+      "type": "string",
+      "description": "URL used by the phone app to reach the local bridge or public relay.",
+      "examples": ["http://127.0.0.1:8787", "http://192.168.1.10:8787"]
+    },
+    "bridgeToken": {
+      "type": "string",
+      "description": "Shared bridge token. Leave empty only when the bridge is private and local."
+    },
+    "relayHost": {
+      "type": "string",
+      "description": "Public relay host or IP."
+    },
+    "relayPort": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 19078
+    },
+    "relayToken": {
+      "type": "string",
+      "description": "Shared token used by PC and phone helper for the relay."
+    },
+    "deviceId": {
+      "type": "string",
+      "description": "HDC target device id."
+    },
+    "hdcPath": {
+      "type": "string",
+      "description": "Absolute path to hdc.exe."
+    }
+  },
+  "required": ["bridgeUrl", "hdcPath"]
+}

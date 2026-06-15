@@ -1,0 +1,10 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "Codex 远程桥接控制台" },
+    { "name": "app_name", "value": "Codex 远程控制" },
+    { "name": "ability_desc", "value": "Codex 远程控制入口" },
+    { "name": "permission_internet_reason", "value": "连接电脑上的本地 Codex 桥接服务" },
+    { "name": "permission_background_reason", "value": "保持远程 HDC 中继在线，便于无线调试和更新" },
+    { "name": "permission_sensor_reason", "value": "在查看桌面截图时根据手机方向自动旋转图片" }
+  ]
+}

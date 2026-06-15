@@ -1,0 +1,11 @@
+{
+  "modelVersion": "6.0.2",
+  "name": "harmony-codex-remote",
+  "version": "1.0.4",
+  "description": "HarmonyOS remote console for a local Codex bridge",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {},
+  "overrides": {}
+}

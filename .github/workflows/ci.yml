@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  node-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm test
+      - shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\agent\scan-open-source.ps1
+      - shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\agent\verify-open-source-release.ps1

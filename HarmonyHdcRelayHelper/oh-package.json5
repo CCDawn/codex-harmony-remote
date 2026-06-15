@@ -1,0 +1,11 @@
+{
+  "modelVersion": "6.0.2",
+  "name": "harmony-hdc-relay-helper",
+  "version": "0.1.0",
+  "description": "Independent HarmonyOS helper for remote HDC relay",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {},
+  "overrides": {}
+}

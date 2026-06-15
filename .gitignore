@@ -1,0 +1,65 @@
+# Dependencies
+node_modules/
+HarmonyCodexRemote/node_modules/
+HarmonyHdcRelayHelper/node_modules/
+tools/harmony/local-hvigor/
+
+# Harmony build outputs
+.hvigor/
+build/
+entry/build/
+HarmonyCodexRemote/.hvigor/
+HarmonyCodexRemote/build/
+HarmonyCodexRemote/entry/build/
+HarmonyCodexRemote/.idea/
+HarmonyCodexRemote/.deveco/
+HarmonyHdcRelayHelper/.hvigor/
+HarmonyHdcRelayHelper/build/
+HarmonyHdcRelayHelper/entry/build/
+HarmonyHdcRelayHelper/.idea/
+HarmonyHdcRelayHelper/.deveco/
+HarmonyCodexRelay/.hvigor/
+HarmonyCodexRelay/build/
+HarmonyCodexRelay/entry/build/
+
+# Runtime state and diagnostics
+logs/
+tmp/
+artifacts/
+docs/plans/
+tools/harmony/diagnostics/
+*.log
+*.jsonl
+
+# Local machine configuration and generated app config
+*.local.psd1
+.env
+.env.local
+HarmonyCodexRemote/entry/src/main/ets/config/BridgeConfig.ets
+HarmonyHdcRelayHelper/entry/src/main/ets/config/RelayConfig.ets
+HarmonyHdcRelayHelper/entry/src/main/ets/config/BridgeConfig.ets
+HarmonyCodexRelay/
+tools/harmony/virtual-hdc.local.psd1
+tools/harmony/hdc-relay.local.psd1
+
+# Secrets, signing, and installable artifacts
+*.p12
+*.p7b
+*.cer
+*.hap
+*.app
+*.rdp
+tmp-verify*.json
+
+# Local binaries and SDK overlays
+bin/
+tools/harmony/sdk-shim-cli/
+tools/harmony/sdk-overlay/
+
+# Extracted desktop/proprietary bundles or temporary generated assets
+app-main-*.js
+app-session-*.js
+main-*.js
+bootstrap.js
+preload.js
+comment-preload.js

@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "goal": "Let an agent deploy Codex Harmony Remote with minimal user interaction.",
+  "preflight": [
+    {
+      "id": "node",
+      "command": "node --version",
+      "required": true
+    },
+    {
+      "id": "npm",
+      "command": "npm --version",
+      "required": true
+    },
+    {
+      "id": "doctor",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\agent\\doctor.ps1 -Json",
+      "required": true
+    }
+  ],
+  "phases": [
+    {
+      "id": "setup",
+      "description": "Create local config files from examples without overwriting existing user config.",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\agent\\setup.ps1"
+    },
+    {
+      "id": "start-stack",
+      "description": "Start local bridge, optional HDC relay, and Codex Desktop live channel.",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\agent\\start-stack.ps1"
+    },
+    {
+      "id": "deploy-main-app",
+      "description": "Build, install, and launch the HarmonyOS main app.",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\agent\\deploy-app.ps1 -Build"
+    },
+    {
+      "id": "verify",
+      "description": "Check bridge, CDP, HDC, relay, and app deployment state.",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\agent\\doctor.ps1 -Json"
+    }
+  ],
+  "successCriteria": {
+    "doctorRequiredStatuses": [
+      "node:ok",
+      "bridge:ok",
+      "sessions:ok"
+    ],
+    "optionalStatuses": [
+      "cdp:ok",
+      "hdc:ok",
+      "relay:ok"
+    ]
+  }
+}
