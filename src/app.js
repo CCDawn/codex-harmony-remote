@@ -55,6 +55,11 @@ export function createApp({ config, adapter }) {
     adapter,
     eventBus,
     logger,
+    interruptReconciler: config.interruptReconciler === false
+      ? null
+      : config.interruptReconciler ?? createThreadInterruptReconciler({ threadService }),
+    interruptReconcileTimeoutMs: config.interruptReconcileTimeoutMs,
+    interruptReconcilePollMs: config.interruptReconcilePollMs,
     beforeRun: createBeforeRunDesktopVerification({
       adapter,
       logger,
@@ -105,11 +110,101 @@ export function createApp({ config, adapter }) {
       if (error.desktop) {
         payload.desktop = error.desktop;
       }
+      if (error.preflight) {
+        payload.preflight = error.preflight;
+      }
       sendJson(response, error.statusCode ?? 500, payload);
     }
   });
 
   return { server, store, eventBus, logger, threadService };
+}
+
+function createThreadInterruptReconciler({ threadService }) {
+  return async ({ task, threadId, activeTurnId }) => {
+    if (!threadService || typeof threadService.getThread !== 'function' || !threadId) {
+      return { status: 'unknown', reason: 'thread_service_unavailable' };
+    }
+    if (!activeTurnId) {
+      return { status: 'unknown', reason: 'missing_active_turn_id' };
+    }
+    const session = await threadService.getThread(threadId, { tail: 160 });
+    const runtimeState = normalizeRuntimeState(session?.runtimeState ?? session?.activityStatus);
+    const terminalReason = normalizeRuntimeState(session?.terminalReason ?? '');
+    const activityAt = sessionActivityTimestamp(session);
+    const requestedAt = String(task?.interruptRequestedAt ?? '');
+    const taskCreatedAt = Date.parse(requestedAt || String(task?.createdAt ?? ''));
+    const activityTime = Date.parse(activityAt);
+    const activityIsRelevant = !Number.isFinite(taskCreatedAt)
+      || !Number.isFinite(activityTime)
+      || activityTime >= taskCreatedAt;
+    if (!activityIsRelevant) {
+      return {
+        status: 'unknown',
+        reason: 'terminal_state_before_task',
+        message: activityAt
+      };
+    }
+    if (runtimeState === 'interrupted' || terminalReason === 'interrupted') {
+      return {
+        status: 'unknown',
+        reason: 'thread_level_interrupted_without_turn_evidence',
+        message: activityAt
+      };
+    }
+    if (runtimeState === 'completed' || terminalReason === 'completed') {
+      return {
+        status: 'unknown',
+        reason: 'thread_level_completed_without_turn_evidence',
+        message: activityAt
+      };
+    }
+    if (runtimeState === 'failed' || terminalReason === 'failed') {
+      return {
+        status: 'unknown',
+        reason: 'thread_level_failed_without_turn_evidence',
+        message: activityAt
+      };
+    }
+    if (runtimeState === 'idle') {
+      return {
+        status: 'unknown',
+        reason: 'thread_level_idle_without_turn_evidence',
+        message: activityAt
+      };
+    }
+    if (runtimeState === 'running') {
+      return { status: 'running', reason: 'desktop_in_progress', message: activityAt };
+    }
+    return { status: 'unknown', reason: 'desktop_state_unknown', message: activityAt };
+  };
+}
+
+function sessionActivityTimestamp(session) {
+  if (!session || typeof session !== 'object') {
+    return '';
+  }
+  return String(session.runtimeUpdatedAt ?? session.activityUpdatedAt ?? session.updatedAt ?? '');
+}
+
+function normalizeRuntimeState(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['running', 'in_progress', 'inprogress', 'processing'].includes(normalized)) {
+    return 'running';
+  }
+  if (['completed', 'complete', 'done'].includes(normalized)) {
+    return 'completed';
+  }
+  if (['interrupted', 'aborted', 'cancelled', 'canceled'].includes(normalized)) {
+    return 'interrupted';
+  }
+  if (['failed', 'error'].includes(normalized)) {
+    return 'failed';
+  }
+  if (['idle', 'ready', ''].includes(normalized)) {
+    return normalized || '';
+  }
+  return normalized;
 }
 
 function shouldLogCompletedRequest(request) {
@@ -195,6 +290,18 @@ function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecove
       targetSessionId: task.codexSessionId,
       message: '正在校验桌面 Codex 会话，防止消息进入错误会话。'
     });
+    if (task.verifiedDesktopStatus?.desktopLive === true && task.verifiedDesktopStatus?.sessionVerified === true) {
+      emit('codex.desktop_live.verification.completed', {
+        status: task.verifiedDesktopStatus.status,
+        desktopLive: true,
+        currentSessionId: task.verifiedDesktopStatus.currentSessionId ?? null,
+        targetSessionId: task.codexSessionId,
+        sessionVerified: true,
+        message: task.verifiedDesktopStatus.message ?? '发送前已校验当前桌面会话',
+        source: 'preflight'
+      });
+      return;
+    }
     const desktopOpen = await maybeOpenDesktopThreadForPhoneSend({
       desktopOpener,
       threadId: task.codexSessionId,
@@ -416,7 +523,7 @@ async function route({ request, response, config, store, eventBus, logger, sessi
   }
 
   if (method === 'GET' && url.pathname === '/desktop/script/status') {
-    sendJson(response, 200, { bridge: desktopScriptBridge.snapshot() });
+    sendJson(response, 200, { bridge: desktopScriptBridge.snapshot({ authRequired: isBridgeAuthRequired() }) });
     return;
   }
 
@@ -504,6 +611,16 @@ async function route({ request, response, config, store, eventBus, logger, sessi
       itemCount: Array.isArray(usage?.items) ? usage.items.length : 0
     }).catch(() => {});
     sendJson(response, 200, { usage });
+    return;
+  }
+
+  const apiThreadSyncMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/sync$/);
+  if (method === 'GET' && apiThreadSyncMatch) {
+    const limit = url.searchParams.get('limit') ?? '80';
+    const after = url.searchParams.get('after') ?? '';
+    const before = url.searchParams.get('before') ?? '';
+    const thread = await threadService.syncThread(apiThreadSyncMatch[1], { limit, after, before });
+    sendJson(response, 200, { thread, session: thread });
     return;
   }
 
@@ -606,12 +723,32 @@ async function route({ request, response, config, store, eventBus, logger, sessi
       requestedTitle: sessionFingerprint.title ?? '',
       requestedProjectLabel: sessionFingerprint.projectLabel ?? ''
     });
+    const desktopOpen = await maybeOpenDesktopThreadForPhoneSend({
+      desktopOpener,
+      threadId,
+      logger
+    });
+    const desktop = await getRecoverableDesktopLiveStatus({
+      adapter: store.adapter,
+      sessionId: threadId,
+      logger,
+      recovery: desktopLiveRecovery,
+      diagnostics: desktopLiveDiagnostics,
+      source: 'api.codex.thread.message.preflight'
+    });
+    const verifiedDesktopStatus = {
+      ...desktop,
+      desktopOpen,
+      preflight: buildDesktopSendPreflight(desktop, threadId)
+    };
+    assertDesktopThreadReady(verifiedDesktopStatus, threadId);
     const task = store.createTask({
       projectId,
       prompt,
       codexSessionId: threadId,
       sessionFingerprint,
       verifiedSessionTarget: verified,
+      verifiedDesktopStatus,
       submissionSource: 'phone_thread_message',
       model,
       reasoningEffort
@@ -623,7 +760,10 @@ async function route({ request, response, config, store, eventBus, logger, sessi
       promptLength: prompt.length,
       model: model || 'auto',
       reasoningEffort: reasoningEffort || 'auto',
-      desktopVerification: 'deferred_to_task'
+      desktopVerification: 'verified_before_task',
+      desktopStatus: verifiedDesktopStatus.status,
+      desktopCurrentSessionId: verifiedDesktopStatus.currentSessionId ?? '',
+      desktopSessionVerified: verifiedDesktopStatus.sessionVerified === true
     });
     sendJson(response, 202, { run: serializeTask(task, serializationOptions(url)) });
     return;
@@ -1150,15 +1290,76 @@ function assertDesktopThreadReady(status, threadId) {
   if (status?.desktopLive === true && status?.sessionVerified === true) {
     return;
   }
+  const preflight = status?.preflight ?? buildDesktopSendPreflight(status, threadId);
   const message = status?.message ?? status?.reason ?? '桌面官方实时通道未校验，手机端已阻止发送。';
   const error = new Error(`桌面端未确认当前会话，已阻止发送，避免手机端和桌面端不同步：${message}`);
-  error.statusCode = 409;
+  error.statusCode = preflight.recommendedAction === 'sync_session' ? 409 : 503;
   error.desktop = {
     ...status,
     targetSessionId: status?.targetSessionId ?? threadId,
     required: 'desktop_live_verified_session'
   };
+  error.preflight = preflight;
   throw error;
+}
+
+function buildDesktopSendPreflight(status, threadId) {
+  const targetSessionId = status?.targetSessionId ?? threadId;
+  const desktopLive = status?.desktopLive === true;
+  const sessionVerified = status?.sessionVerified === true;
+  const ok = desktopLive && sessionVerified;
+  const mode = chooseDesktopRepairMode(status);
+  let recommendedAction = 'none';
+  let recoverableFromPhone = true;
+  let severity = 'ok';
+  let message = status?.message ?? status?.reason ?? '';
+
+  if (!ok) {
+    if (desktopLive) {
+      recommendedAction = 'sync_session';
+      recoverableFromPhone = true;
+      severity = 'degraded';
+      message = message || '桌面链路在线，但当前桌面会话与手机目标会话没有校验一致。';
+    } else if (mode === 'hard') {
+      recommendedAction = 'desktop_cdp_restart_required';
+      recoverableFromPhone = false;
+      severity = 'blocked';
+      message = status?.recoveryHint ?? (message || '当前 Codex 没有可用 CDP，手机端不能软恢复。');
+    } else if (status?.mobileRecoverable !== false) {
+      recommendedAction = 'soft_recover_live_host';
+      recoverableFromPhone = true;
+      severity = 'degraded';
+      message = status?.recoveryHint ?? (message || '桌面 live-host 不在线，可先从手机端软恢复后重试。');
+    } else {
+      recommendedAction = 'desktop_required';
+      recoverableFromPhone = false;
+      severity = 'blocked';
+      message = status?.recoveryHint ?? (message || '手机端无法恢复当前桌面链路，需要在电脑端处理。');
+    }
+  }
+
+  return {
+    ok,
+    canSend: ok,
+    canGuideRunningTurn: ok,
+    canInterrupt: ok,
+    desktopLive,
+    sessionVerified,
+    status: status?.status ?? '',
+    currentSessionId: status?.currentSessionId ?? null,
+    targetSessionId,
+    severity,
+    recommendedAction,
+    recoverableFromPhone,
+    requiresHardRecovery: !ok && mode === 'hard',
+    requiresDesktopCdp: status?.requiresDesktopCdp === true,
+    failureClass: status?.failureClass ?? '',
+    desktopProcessMode: status?.desktopProcessMode ?? '',
+    recoveryAttempted: status?.recoveryAttempted === true,
+    recoveryOk: status?.recoveryOk === true,
+    recoveryError: status?.recoveryError ?? '',
+    message
+  };
 }
 
 function assertValidCodexSessionId(sessionId) {
@@ -1304,7 +1505,7 @@ async function collectSystemRepairStatus({ store, sessions, logger, diagnostics,
     }
   }
 
-  const script = desktopScriptBridge.snapshot();
+  const script = desktopScriptBridge.snapshot({ authRequired: isBridgeAuthRequired() });
   const sessionProbe = await probeSessions(sessions);
   const action = chooseSystemRepairAction({ desktop, script, sessionProbe });
   return {
@@ -1325,7 +1526,7 @@ async function collectSystemRepairStatus({ store, sessions, logger, diagnostics,
 }
 
 async function collectSystemLinkStatus({ config, store, sessions, logger, diagnostics, sessionId = '', desktopOverride = null }) {
-  return await collectLinkHealth({
+  const health = await collectLinkHealth({
     repoRoot: config.repoRoot ?? process.cwd(),
     sessionId,
     logger,
@@ -1342,6 +1543,7 @@ async function collectSystemLinkStatus({ config, store, sessions, logger, diagno
     relayProbeProvider: config.linkRelayProbeProvider,
     hdcProbeProvider: config.linkHdcProbeProvider
   });
+  return decorateLinkHealthWithScriptAuth(health, desktopScriptBridge.snapshot({ authRequired: isBridgeAuthRequired() }));
 }
 
 async function recoverSystemLink({ config, store, sessions, logger, diagnostics, recovery, sessionId = '', mode = 'auto' }) {
@@ -1471,6 +1673,14 @@ function chooseSystemRepairAction({ desktop, script, sessionProbe }) {
     };
   }
   if (desktop?.desktopLive === true) {
+    if (script?.scriptAuth?.healthy === false) {
+      return {
+        action: 'reconnect_desktop_script',
+        severity: 'degraded',
+        recoverableFromPhone: true,
+        message: '桌面 CDP 可用，但脚本桥认证异常；将只重启 live-host，不重启 Codex。'
+      };
+    }
     if (desktop?.targetSessionId && desktop?.sessionVerified !== true) {
       return {
         action: 'sync_session',
@@ -1635,9 +1845,39 @@ function requireAuth({ request, url }) {
     return;
   }
 
+  if (url.pathname.startsWith('/desktop/script/')) {
+    desktopScriptBridge.recordUnauthorized(url.pathname);
+  }
   const error = new Error('Unauthorized');
   error.statusCode = 401;
   throw error;
+}
+
+function isBridgeAuthRequired() {
+  return String(process.env.CODEX_BRIDGE_TOKEN ?? '').trim().length > 0;
+}
+
+function decorateLinkHealthWithScriptAuth(health, script) {
+  const scriptAuth = script?.scriptAuth ?? null;
+  const desktop = scriptAuth
+    ? { ...(health.desktop ?? {}), scriptAuth }
+    : health.desktop;
+  const next = {
+    ...health,
+    desktop,
+    script
+  };
+  if (scriptAuth?.healthy === false && health.desktop?.desktopLive === true) {
+    return {
+      ...next,
+      ok: true,
+      severity: health.severity === 'blocked' ? 'blocked' : 'degraded',
+      recommendedAction: 'reconnect_desktop_script',
+      recoverableFromPhone: true,
+      message: '桌面 CDP 可用，但脚本桥认证异常；发送仍优先走 CDP，脚本 fallback 需要软恢复。'
+    };
+  }
+  return next;
 }
 
 function sanitizeRequestUrl(value) {
@@ -1756,7 +1996,7 @@ async function maybeWaitForInterruptConfirmation(store, task, url) {
   if (!task || url.searchParams.get('confirm') !== '1') {
     return task;
   }
-  const timeoutMs = parseNonNegativeInteger(url.searchParams.get('confirmTimeoutMs'), 700);
+  const timeoutMs = parseNonNegativeInteger(url.searchParams.get('confirmTimeoutMs'), 8000);
   return await store.waitForInterruptDispatch(task.id, timeoutMs) ?? task;
 }
 
@@ -1780,6 +2020,11 @@ function serializeTask(task, options = {}) {
       interruptReady: normalized.interruptReady,
       interruptRequested: normalized.interruptRequested,
       interruptDispatching: normalized.interruptDispatching,
+      interruptRecovering: normalized.interruptRecovering,
+      interruptAttemptCount: normalized.interruptAttemptCount,
+      interruptReconcileUntil: normalized.interruptReconcileUntil,
+      lastInterruptFailure: normalized.lastInterruptFailure,
+      interruptState: normalized.interruptState,
       interruptError: normalized.interruptError,
       syntheticInterrupt: normalized.syntheticInterrupt,
       result: normalized.result,
@@ -1810,6 +2055,11 @@ function serializeTask(task, options = {}) {
     interruptReady: normalized.interruptReady,
     interruptRequested: normalized.interruptRequested,
     interruptDispatching: normalized.interruptDispatching,
+    interruptRecovering: normalized.interruptRecovering,
+    interruptAttemptCount: normalized.interruptAttemptCount,
+    interruptReconcileUntil: normalized.interruptReconcileUntil,
+    lastInterruptFailure: normalized.lastInterruptFailure,
+    interruptState: normalized.interruptState,
     interruptError: normalized.interruptError,
     syntheticInterrupt: normalized.syntheticInterrupt,
     resultSummary: serializeResultSummary(normalized.result),
@@ -1843,6 +2093,11 @@ function serializeTaskSummary(task) {
     interruptReady: normalized.interruptReady,
     interruptRequested: normalized.interruptRequested,
     interruptDispatching: normalized.interruptDispatching,
+    interruptRecovering: normalized.interruptRecovering,
+    interruptAttemptCount: normalized.interruptAttemptCount,
+    interruptReconcileUntil: normalized.interruptReconcileUntil,
+    lastInterruptFailure: normalized.lastInterruptFailure,
+    interruptState: normalized.interruptState,
     interruptError: normalized.interruptError,
     syntheticInterrupt: normalized.syntheticInterrupt,
     resultSummary: serializeResultSummary(normalized.result),
@@ -1860,6 +2115,13 @@ function normalizeTaskLike(task) {
   const codexSessionId = task.codexSessionId ?? task.threadId ?? '';
   const createdCodexSessionId = task.createdCodexSessionId ?? task.createdThreadId ?? '';
   const activeCodexTurnId = String(task.activeCodexTurnId ?? '');
+  const status = String(task.status ?? 'idle');
+  const interruptRequested = task.interruptRequested === true;
+  const interruptDispatching = task.interruptDispatching === true;
+  const interruptRecovering = task.interruptRecovering === true;
+  const interruptError = task.interruptError ?? null;
+  const lastInterruptFailure = task.lastInterruptFailure ?? null;
+  const syntheticInterrupt = task.syntheticInterrupt === true;
   return {
     id: String(task.id ?? ''),
     projectId: String(task.projectId ?? ''),
@@ -1870,21 +2132,60 @@ function normalizeTaskLike(task) {
     createdCodexSessionId,
     model: normalizeModelId(task.model ?? ''),
     reasoningEffort: normalizeReasoningEffort(task.reasoningEffort ?? ''),
-    status: String(task.status ?? 'idle'),
+    status,
     createdAt: String(task.createdAt ?? ''),
     updatedAt: String(task.updatedAt ?? ''),
     activeCodexTurnId,
     interruptReady: task.interruptReady === true || activeCodexTurnId.length > 0,
-    interruptRequested: task.interruptRequested === true,
-    interruptDispatching: task.interruptDispatching === true,
-    interruptError: task.interruptError ?? null,
-    syntheticInterrupt: task.syntheticInterrupt === true,
+    interruptRequested,
+    interruptDispatching,
+    interruptRecovering,
+    interruptAttemptCount: Number(task.interruptAttemptCount ?? 0) || 0,
+    interruptReconcileUntil: String(task.interruptReconcileUntil ?? ''),
+    lastInterruptFailure,
+    interruptState: deriveInterruptState({
+      status,
+      interruptRequested,
+      interruptDispatching,
+      interruptRecovering,
+      interruptError,
+      lastInterruptFailure,
+      syntheticInterrupt,
+      error: task.error ?? null
+    }),
+    interruptError,
+    syntheticInterrupt,
     result,
     error: task.error ?? null,
     desktopSync: task.desktopSync ?? null,
     session,
     events: Array.isArray(task.events) ? task.events : []
   };
+}
+
+function deriveInterruptState({ status, interruptRequested, interruptDispatching, interruptRecovering, interruptError, lastInterruptFailure, syntheticInterrupt, error }) {
+  if (status === 'interrupted') {
+    return 'confirmed';
+  }
+  if (interruptRecovering === true && ['queued', 'running', 'waiting_approval'].includes(status)) {
+    return 'reconciling';
+  }
+  if (typeof interruptError === 'string' && interruptError.length > 0) {
+    return 'failed';
+  }
+  if (syntheticInterrupt === true && status === 'failed' && String(error ?? '').indexOf('中断失败') >= 0) {
+    return 'failed';
+  }
+  if (interruptDispatching === true && ['queued', 'running', 'waiting_approval'].includes(status)) {
+    return 'dispatching';
+  }
+  if (interruptRequested === true && ['queued', 'running', 'waiting_approval'].includes(status)) {
+    if (typeof lastInterruptFailure === 'string' && lastInterruptFailure.length > 0) {
+      return 'recoverable_failed';
+    }
+    return 'requested';
+  }
+  return 'idle';
 }
 
 function serializeEventWindow(events, options = {}) {
@@ -1974,6 +2275,11 @@ function serializeSessionSummary(session) {
     activitySource: session.activitySource ?? '',
     activityStatus: session.activityStatus ?? '',
     activityUpdatedAt: session.activityUpdatedAt ?? '',
+    runtimeState: session.runtimeState ?? session.activityStatus ?? '',
+    runtimeSource: session.runtimeSource ?? session.activitySource ?? '',
+    runtimeUpdatedAt: session.runtimeUpdatedAt ?? session.activityUpdatedAt ?? '',
+    canInterrupt: session.canInterrupt === true,
+    terminalReason: session.terminalReason ?? '',
     pinned: session.pinned === true,
     detailAvailable: session.detailAvailable !== false,
     filePath: session.filePath ?? '',

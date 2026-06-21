@@ -357,7 +357,9 @@ test('CodexDesktopCdpAdapter waits briefly for an active turn before interruptin
   const adapter = new CodexDesktopCdpAdapter({
     client,
     interruptTurnLookupTimeoutMs: 500,
-    interruptTurnLookupIntervalMs: 10
+    interruptTurnLookupIntervalMs: 10,
+    interruptConfirmationTimeoutMs: 80,
+    interruptConfirmationIntervalMs: 10
   });
   const events = [];
 
@@ -369,14 +371,76 @@ test('CodexDesktopCdpAdapter waits briefly for an active turn before interruptin
     emit: (type, payload) => events.push({ type, payload })
   });
 
-  assert.deepEqual(result, { ok: true });
+  assert.equal(result.accepted, true);
+  assert.equal(result.confirmed, true);
   assert.deepEqual(client.interrupted, {
     threadId: '019e-wait-thread',
     turnId: 'turn-delayed-active'
   });
-  assert.equal(client.activeLookupCount, 3);
+  assert.equal(client.activeLookupCount >= 3, true);
   assert.ok(events.some((event) => event.type === 'codex.app_server.turn.waiting_active_for_interrupt'));
   assert.ok(events.some((event) => event.type === 'codex.app_server.turn.active_found_for_interrupt'));
+  assert.ok(events.some((event) => event.type === 'codex.app_server.turn.interrupt_confirmed'));
+  assert.ok(events.some((event) => event.type === 'codex.app_server.turn.interrupted'));
+});
+
+test('CodexDesktopCdpAdapter interrupts a running thread even when active turn ack was lost', async () => {
+  const client = new SnapshotActiveTurnInterruptClient();
+  const adapter = new CodexDesktopCdpAdapter({
+    client,
+    interruptConfirmationTimeoutMs: 80,
+    interruptConfirmationIntervalMs: 10
+  });
+  const events = [];
+
+  const result = await adapter.interrupt({
+    task: {
+      id: 'task-ackless-interrupt',
+      codexSessionId: '019e-ackless-thread',
+      activeCodexTurnId: ''
+    },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.confirmed, true);
+  assert.deepEqual(client.interrupted, {
+    threadId: '019e-ackless-thread',
+    turnId: 'turn-from-thread-read'
+  });
+  assert.ok(events.some((event) => {
+    return event.type === 'codex.app_server.turn.active_found_for_interrupt'
+      && event.payload.source === 'thread_read_snapshot';
+  }));
+});
+
+test('CodexDesktopCdpAdapter leaves interrupt pending when accepted turn stays in progress', async () => {
+  const client = new PendingInterruptConfirmationClient();
+  const adapter = new CodexDesktopCdpAdapter({
+    client,
+    interruptConfirmationTimeoutMs: 30,
+    interruptConfirmationIntervalMs: 10
+  });
+  const events = [];
+
+  const result = await adapter.interrupt({
+    task: {
+      id: 'task-pending-interrupt',
+      codexSessionId: '019e-pending-thread',
+      activeCodexTurnId: 'turn-still-running'
+    },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.confirmed, false);
+  assert.deepEqual(client.interrupted, {
+    threadId: '019e-pending-thread',
+    turnId: 'turn-still-running'
+  });
+  assert.ok(events.some((event) => event.type === 'codex.app_server.turn.interrupt_accepted'));
+  assert.ok(events.some((event) => event.type === 'codex.app_server.turn.interrupt_pending'));
+  assert.equal(events.some((event) => event.type === 'codex.app_server.turn.interrupted'), false);
 });
 
 test('CodexDesktopCdpAdapter shares one notification drain loop across thread subscriptions', async () => {
@@ -465,6 +529,35 @@ test('CodexDesktopCdpAdapter soft-completes stable rollout assistant replies wit
   assert.equal(events.some((event) => event.type === 'codex.session_file.turn.waiting_terminal'), false);
 });
 
+test('CodexDesktopCdpAdapter blocks session-file soft completion while official turn is still running', async () => {
+  const adapter = new CodexDesktopCdpAdapter({
+    client: new FakeDesktopClient(),
+    sessions: new StableAssistantOnlySessionStore(),
+    softCompleteAfterAssistantStableMs: 1000
+  });
+  const events = [];
+
+  const completed = await adapter.readCompletedTurnFromSessionFile({
+    cursor: {
+      sessionId: '019e-existing-thread',
+      filePath: 'C:\\sessions\\rollout-019e-existing-thread.jsonl',
+      offset: 100
+    },
+    threadId: '019e-existing-thread',
+    turnId: 'turn-file-1',
+    prompt: '请继续优化',
+    officialTurnStatus: 'inProgress',
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  assert.equal(completed, null);
+  assert.equal(events.some((event) => event.type === 'codex.session_file.turn.soft_completed'), false);
+  assert.ok(events.some((event) => {
+    return event.type === 'codex.session_file.turn.waiting_terminal'
+      && event.payload.reason === 'official_turn_in_progress';
+  }));
+});
+
 test('CodexDesktopCdpAdapter completes rollout turns anchored by response_item user messages', async () => {
   const adapter = new CodexDesktopCdpAdapter({
     client: new FakeDesktopClient(),
@@ -519,6 +612,32 @@ test('CodexDesktopCdpAdapter completes rollout turns when task_complete has no a
     return event.type === 'codex.session_file.turn.completed'
       && event.payload.source === 'task_complete';
   }));
+  assert.equal(events.some((event) => event.type === 'codex.session_file.turn.waiting_terminal'), false);
+});
+
+test('CodexDesktopCdpAdapter treats rollout turn_aborted after a phone prompt as interrupted', async () => {
+  const adapter = new CodexDesktopCdpAdapter({
+    client: new FakeDesktopClient(),
+    sessions: new AbortedAfterPromptSessionStore(),
+    softCompleteAfterAssistantStableMs: 10 * 60 * 1000
+  });
+  const events = [];
+
+  const completed = await adapter.readCompletedTurnFromSessionFile({
+    cursor: {
+      sessionId: '019e-existing-thread',
+      filePath: 'C:\\sessions\\rollout-019e-existing-thread.jsonl',
+      offset: 100
+    },
+    threadId: '019e-existing-thread',
+    turnId: 'turn-aborted-file',
+    prompt: '继续修复打断',
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  assert.equal(completed.turn.status, 'interrupted');
+  assert.equal(completed.turn.items.at(-1).text, '本轮已在 Codex 桌面端中断。');
+  assert.ok(events.some((event) => event.type === 'codex.session_file.turn.interrupted'));
   assert.equal(events.some((event) => event.type === 'codex.session_file.turn.waiting_terminal'), false);
 });
 
@@ -617,6 +736,45 @@ test('CodexDesktopCdpAdapter extends turn wait while desktop notifications keep 
   const completed = await waiting;
   assert.equal(completed.turn.status, 'completed');
   assert.equal(completed.turn.items[0].text, '完成');
+});
+
+test('CodexDesktopCdpAdapter surfaces desktop context window exhaustion notices', async () => {
+  const adapter = new CodexDesktopCdpAdapter({
+    client: new FakeDesktopClient(),
+    idleTimeoutMs: 120
+  });
+  const notifications = [];
+  const events = [];
+
+  const waiting = adapter.waitForDesktopTurnCompletion({
+    notifications,
+    threadId: '019e-existing-thread',
+    turnId: 'turn-context-limit',
+    prompt: '继续',
+    emit: (type, payload) => events.push({ type, payload }),
+    timeoutMs: 1000
+  });
+
+  notifications.push({
+    method: 'error',
+    params: {
+      threadId: '019e-existing-thread',
+      turnId: 'turn-context-limit',
+      message: "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
+    }
+  });
+
+  await assert.rejects(waiting, (error) => {
+    assert.equal(error.code, 'CODEX_CLIENT_NOTICE');
+    assert.equal(error.notice.kind, 'context_limit');
+    assert.equal(error.notice.severity, 'error');
+    assert.match(error.message, /上下文窗口已满/);
+    return true;
+  });
+
+  const notice = events.find((event) => event.type === 'codex.desktop_live.client_error');
+  assert.equal(notice.payload.notice.kind, 'context_limit');
+  assert.match(notice.payload.notice.detail, /ran out of room/);
 });
 
 test('CodexDesktopCdpAdapter extends turn wait while rollout file keeps receiving activity', async () => {
@@ -777,6 +935,40 @@ test('CodexDesktopCdpAdapter retries after compaction interrupts before the phon
   assert.ok(events.some((event) => event.type === 'codex.app_server.user_message.persisted'));
 });
 
+test('CodexDesktopCdpAdapter reconciles turn/start ack loss after prompt persisted to session file', async () => {
+  const client = new TurnStartAckLossDesktopClient();
+  const sessions = new PromptPersistedSessionStore({
+    prompt: '现在应该可以了，开始直接工作。',
+    assistant: '已经开始工作。'
+  });
+  const adapter = new CodexDesktopCdpAdapter({
+    client,
+    sessions,
+    idleTimeoutMs: 120,
+    postSubmitAckReconcileMs: 800
+  });
+  const events = [];
+
+  const result = await adapter.run({
+    task: {
+      id: 'task-ack-loss',
+      prompt: '现在应该可以了，开始直接工作。',
+      codexSessionId: '019eb49c-623e-7812-83af-4ad970423570',
+      verifiedSessionTarget: {
+        filePath: 'C:\\sessions\\rollout-019eb49c-623e-7812-83af-4ad970423570.jsonl'
+      }
+    },
+    project: { root: 'C:\\work' },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.summary, '已经开始工作。');
+  assert.equal(client.requests.filter((request) => request.method === 'turn/start').length, 1);
+  assert.ok(events.some((event) => event.type === 'codex.app_server.turn.accepted_without_ack'));
+  assert.ok(events.some((event) => event.type === 'codex.app_server.user_message.persisted'));
+});
+
 class FakeDesktopClient {
   constructor() {
     this.hostCalls = [];
@@ -906,7 +1098,9 @@ class DelayedActiveTurnInterruptClient {
         thread: {
           id: params.threadId,
           sessionId: params.threadId,
-          turns: this.activeLookupCount >= 3
+          turns: this.interrupted
+            ? [{ id: 'turn-delayed-active', status: 'interrupted', items: [] }]
+            : this.activeLookupCount >= 3
             ? [{ id: 'turn-delayed-active', status: 'inProgress', items: [] }]
             : []
         }
@@ -915,6 +1109,60 @@ class DelayedActiveTurnInterruptClient {
     if (method === 'turn/interrupt') {
       this.interrupted = params;
       return { ok: true };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  }
+}
+
+class SnapshotActiveTurnInterruptClient {
+  constructor() {
+    this.requests = [];
+    this.interrupted = null;
+  }
+
+  async request(method, params) {
+    this.requests.push({ method, params });
+    if (method === 'thread/read' && params.includeTurns === true) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          turns: [{
+            id: 'turn-from-thread-read',
+            status: this.interrupted ? 'interrupted' : 'inProgress',
+            items: []
+          }]
+        }
+      };
+    }
+    if (method === 'turn/interrupt') {
+      this.interrupted = params;
+      return { ok: true };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  }
+}
+
+class PendingInterruptConfirmationClient {
+  constructor() {
+    this.requests = [];
+    this.interrupted = null;
+  }
+
+  async request(method, params) {
+    this.requests.push({ method, params });
+    if (method === 'turn/interrupt') {
+      this.interrupted = params;
+      return { ok: true };
+    }
+    if (method === 'thread/read' && params.includeTurns === true) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          turns: [{ id: 'turn-still-running', status: 'inProgress', items: [] }]
+        }
+      };
     }
     throw new Error(`Unexpected request ${method}`);
   }
@@ -1007,6 +1255,45 @@ class RetryAfterMissingPromptClient extends FakeDesktopClient {
           }]
         }
       };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  }
+}
+
+class TurnStartAckLossDesktopClient extends FakeDesktopClient {
+  async request(method, params) {
+    this.requests.push({ method, params });
+    if (method === 'thread/read' && params.includeTurns === false) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          status: { type: 'ready' }
+        }
+      };
+    }
+    if (method === 'thread/read' && params.includeTurns === true) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          turns: []
+        }
+      };
+    }
+    if (method === 'thread/resume') {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          cwd: params.cwd ?? null,
+          status: { type: 'ready' }
+        }
+      };
+    }
+    if (method === 'turn/start') {
+      this.resolveWaiters(method);
+      throw new Error('Codex 桌面 CDP 连接错误');
     }
     throw new Error(`Unexpected request ${method}`);
   }
@@ -1342,6 +1629,81 @@ class InProgressDesktopClient extends FakeDesktopClient {
   }
 }
 
+class PromptPersistedSessionStore {
+  constructor({ prompt, assistant }) {
+    this.prompt = prompt;
+    this.assistant = assistant;
+  }
+
+  async getSessionFileCursor(sessionId, filePath) {
+    return {
+      sessionId,
+      filePath,
+      offset: 100,
+      updatedAtMs: Date.now()
+    };
+  }
+
+  async readSessionRecordsAfterCursor() {
+    return [{
+      timestamp: '2026-06-16T14:37:21.842Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: this.prompt }]
+      }
+    }, {
+      timestamp: '2026-06-16T14:37:35.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ text: this.assistant }]
+      }
+    }, {
+      timestamp: '2026-06-16T14:37:36.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'turn-ack-loss-file',
+        last_agent_message: this.assistant
+      }
+    }];
+  }
+
+  async readSessionEntriesAfterCursor() {
+    return [];
+  }
+
+  async getSession(sessionId) {
+    return {
+      id: sessionId,
+      title: '监督进化',
+      updatedAt: '2026-06-16T14:37:36.000Z',
+      relativeTime: '刚刚',
+      projectRoot: 'C:\\work',
+      projectLabel: 'work',
+      source: 'desktop-sidebar',
+      pinned: false,
+      detailAvailable: true,
+      filePath: 'C:\\sessions\\rollout-019eb49c-623e-7812-83af-4ad970423570.jsonl',
+      entries: [{
+        timestamp: '2026-06-16T14:37:21.842Z',
+        type: 'response_item',
+        role: 'user',
+        text: this.prompt
+      }, {
+        timestamp: '2026-06-16T14:37:35.000Z',
+        type: 'response_item',
+        role: 'assistant',
+        text: this.assistant
+      }],
+      entryCount: 2
+    };
+  }
+}
+
 class FakeSessionStore {
   async getSessionFileCursor(sessionId, filePath) {
     return {
@@ -1531,6 +1893,42 @@ class TerminalOnlySessionStore {
         turn_id: 'turn-terminal-only',
         last_agent_message: null,
         duration_ms: 307020
+      }
+    }];
+  }
+
+  async readSessionEntriesAfterCursor() {
+    return [];
+  }
+}
+
+class AbortedAfterPromptSessionStore {
+  async readSessionRecordsAfterCursor() {
+    const userTimestamp = new Date(Date.now() - 70 * 1000).toISOString();
+    const assistantTimestamp = new Date(Date.now() - 60 * 1000).toISOString();
+    const abortedTimestamp = new Date(Date.now() - 5 * 1000).toISOString();
+    return [{
+      timestamp: userTimestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        message: '继续修复打断'
+      }
+    }, {
+      timestamp: assistantTimestamp,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ text: '我正在处理打断链路。' }]
+      }
+    }, {
+      timestamp: abortedTimestamp,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>' }]
       }
     }];
   }

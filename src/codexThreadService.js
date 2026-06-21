@@ -4,10 +4,12 @@ import { CodexAppServerClient } from './codexAppServerClient.js';
 import { buildSessionSnapshot, sanitize, summarizeThreadForEvent } from './codexProtocolUtils.js';
 import { CodexAppServerEventConverter } from './codexAppServerEvents.js';
 import { isLiveActivityEntry } from './codexLiveActivity.js';
+import { classifyCodexClientNotice, createCodexClientNoticeEntry } from './codexClientNotices.js';
 import { normalizeModelId } from './sessionSettingsStore.js';
 import { isSameOrChildPath, resolveSafeProjectRoot } from './workspaceGuard.js';
 
 const VALID_THREAD_ID = /^[A-Za-z0-9_-]+$/;
+const MAX_RUNNING_DESKTOP_REFRESHES = 6;
 
 export class CodexThreadService {
   constructor(options = {}) {
@@ -35,7 +37,8 @@ export class CodexThreadService {
     const liveSummaries = [...this.liveSessions.values()].map((session) => sessionToSummary(session));
     const desktopThreads = await this.listDesktopThreads({ limit: max, query });
     if (desktopThreads.length > 0) {
-      return filterSessions(mergeDesktopAlignedSessions(liveSummaries, desktopThreads), query).slice(0, max);
+      const refreshedLiveSummaries = await this.refreshTerminalStatesForRunningDesktopThreads(liveSummaries, desktopThreads);
+      return filterSessions(mergeDesktopAlignedSessions(refreshedLiveSummaries, desktopThreads), query).slice(0, max);
     }
 
     const response = await this.client.request('thread/list', {
@@ -67,11 +70,39 @@ export class CodexThreadService {
     }
   }
 
+  async refreshTerminalStatesForRunningDesktopThreads(liveSummaries, desktopThreads) {
+    const liveById = new Map(liveSummaries.map((session) => [session.id, session]));
+    const candidates = desktopThreads
+      .filter((session) => {
+        const desktopStatus = normalizeActivityStatus(session.runtimeState ?? session.activityStatus);
+        if (!isRunningActivityStatus(desktopStatus)) {
+          return false;
+        }
+        const liveStatus = normalizeActivityStatus(liveById.get(session.id)?.runtimeState ?? liveById.get(session.id)?.activityStatus);
+        return !isTerminalActivityStatus(liveStatus);
+      })
+      .slice(0, MAX_RUNNING_DESKTOP_REFRESHES);
+
+    for (const session of candidates) {
+      const refreshed = await this.readLiveTerminalSnapshot(session.id);
+      if (refreshed) {
+        liveById.set(session.id, sessionToSummary(refreshed));
+      }
+    }
+
+    return [...liveById.values()];
+  }
+
   async getThread(threadId, { tail = 120 } = {}) {
     assertThreadId(threadId);
     const local = await this.readLocalThread(threadId, { tail });
     if (local) {
-      return limitSessionEntries(local, tail);
+      const merged = mergeLocalThreadWithLiveState(local, this.liveSessions.get(threadId));
+      if (isRunningActivityStatus(normalizeActivityStatus(merged.runtimeState ?? merged.activityStatus))) {
+        const refreshed = await this.readLiveTerminalSnapshot(threadId);
+        return limitSessionEntries(mergeLocalThreadWithLiveState(merged, refreshed), tail);
+      }
+      return limitSessionEntries(merged, tail);
     }
 
     const live = this.liveSessions.get(threadId);
@@ -86,6 +117,35 @@ export class CodexThreadService {
     const session = buildSessionSnapshot(response.thread ?? response, { threadId });
     this.liveSessions.set(threadId, session);
     return limitSessionEntries(session, tail);
+  }
+
+  async syncThread(threadId, { limit = 80, after = '', before = '' } = {}) {
+    assertThreadId(threadId);
+    const local = await this.readLocalThreadSync(threadId, { limit, after, before });
+    if (local) {
+      const merged = mergeLocalThreadWithLiveState(local, this.liveSessions.get(threadId));
+      if (isRunningActivityStatus(normalizeActivityStatus(merged.runtimeState ?? merged.activityStatus))) {
+        const refreshed = await this.readLiveTerminalSnapshot(threadId);
+        return mergeLocalThreadWithLiveState(merged, refreshed);
+      }
+      return merged;
+    }
+    const fallback = await this.getThread(threadId, { tail: limit });
+    return {
+      ...fallback,
+      sync: {
+        mode: 'snapshot',
+        source: fallback.source ?? 'app-server-live',
+        filePath: fallback.filePath ?? '',
+        fileSize: 0,
+        fileUpdatedAt: fallback.activityUpdatedAt ?? fallback.updatedAt ?? '',
+        cursorStart: '0',
+        cursorEnd: String(fallback.entries?.length ?? 0),
+        hasMoreBefore: false,
+        hasMoreAfter: false,
+        entryCount: fallback.entries?.length ?? 0
+      }
+    };
   }
 
   async deleteThread(threadId) {
@@ -129,6 +189,36 @@ export class CodexThreadService {
     return deletion;
   }
 
+  async readLiveTerminalSnapshot(threadId) {
+    try {
+      const response = await this.client.request('thread/read', {
+        threadId,
+        includeTurns: true
+      });
+      const runtimeState = runtimeStateFromDesktopThread(response.thread ?? response);
+      if (!isTerminalActivityStatus(runtimeState)) {
+        return null;
+      }
+      const session = buildSessionSnapshot(response.thread ?? response, { threadId });
+      applyTerminalStateToSession(session, runtimeState, session.updatedAt || new Date().toISOString());
+      session.activitySource = 'desktop-thread-read';
+      session.runtimeSource = 'desktop-thread-read';
+      this.liveSessions.set(threadId, session);
+      this.addServiceEvent('codex.thread.live_terminal_overlay', {
+        threadId,
+        runtimeState,
+        source: 'thread_read_for_local_running'
+      });
+      return session;
+    } catch (error) {
+      this.addServiceEvent('codex.thread.live_terminal_overlay_failed', {
+        threadId,
+        message: error.message ?? String(error)
+      });
+      return null;
+    }
+  }
+
   async readLocalThread(threadId, { tail = 120 } = {}) {
     if (!this.sessions || typeof this.sessions.getSession !== 'function') {
       return null;
@@ -145,6 +235,29 @@ export class CodexThreadService {
       };
     } catch (error) {
       this.addServiceEvent('codex.local_thread.read_failed', {
+        threadId,
+        message: error.message ?? String(error)
+      });
+      return null;
+    }
+  }
+
+  async readLocalThreadSync(threadId, { limit = 80, after = '', before = '' } = {}) {
+    if (!this.sessions || typeof this.sessions.getSessionSync !== 'function') {
+      return null;
+    }
+    try {
+      const local = await this.sessions.getSessionSync(threadId, { limit, after, before });
+      if (!local || local.detailAvailable === false || !Array.isArray(local.entries)) {
+        return null;
+      }
+      return {
+        ...local,
+        source: local.source ?? 'session-file',
+        activitySource: local.activitySource ?? 'session-file'
+      };
+    } catch (error) {
+      this.addServiceEvent('codex.local_thread.sync_failed', {
         threadId,
         message: error.message ?? String(error)
       });
@@ -233,6 +346,7 @@ export class CodexThreadService {
     run.status = 'failed';
     run.error = '已中断当前回复';
     run.updatedAt = new Date().toISOString();
+    this.markLiveSessionTerminal(run.threadId, 'interrupted', run.updatedAt, run.turnId);
     return this.serializeRun(run);
   }
 
@@ -322,6 +436,8 @@ export class CodexThreadService {
         run.error = item.entry?.text ?? 'Codex 回合失败';
       }
       if (item.terminal) {
+        const terminalStatus = terminalStatusFromConvertedEvent(item);
+        this.markLiveSessionTerminal(run.threadId, terminalStatus, new Date().toISOString(), run.turnId);
         this.removeLiveActivity(run.threadId, run.turnId);
         if (run.status !== 'failed') {
           run.status = 'completed';
@@ -355,8 +471,10 @@ export class CodexThreadService {
         threadId: run.threadId,
         prompt: run.prompt
       });
-      this.liveSessions.set(run.threadId, session);
-      run.session = session;
+      applyTerminalStateToSession(session, run.status === 'failed' ? 'failed' : 'completed', run.updatedAt || new Date().toISOString(), run.turnId);
+      const merged = preserveClientNoticeEntries(this.liveSessions.get(run.threadId), session);
+      this.liveSessions.set(run.threadId, merged);
+      run.session = merged;
       this.addRunEvent(run, 'codex.thread.read', summarizeThreadForEvent(response));
     } catch (error) {
       this.addRunEvent(run, 'codex.thread.read.failed', { threadId: run.threadId, message: error.message });
@@ -370,13 +488,24 @@ export class CodexThreadService {
     run.error = error.message ?? String(error);
     run.updatedAt = new Date().toISOString();
     this.removeLiveActivity(run.threadId, run.turnId);
-    this.addEntry(run.threadId, {
-      timestamp: new Date().toISOString(),
-      type: 'error',
-      role: 'system',
-      text: run.error
-    });
-    this.addRunEvent(run, 'codex.run.failed', { threadId: run.threadId, message: run.error });
+    this.markLiveSessionTerminal(run.threadId, 'failed', run.updatedAt, run.turnId);
+    const notice = classifyCodexClientNotice(error, { source: 'codex.run.failed' });
+    if (notice) {
+      this.addEntry(run.threadId, createCodexClientNoticeEntry(error, {
+        notice,
+        threadId: run.threadId
+      }));
+    } else {
+      this.addEntry(run.threadId, {
+        timestamp: new Date().toISOString(),
+        type: 'error',
+        role: 'system',
+        text: run.error
+      });
+    }
+    this.addRunEvent(run, 'codex.run.failed', notice
+      ? { threadId: run.threadId, message: run.error, notice }
+      : { threadId: run.threadId, message: run.error });
   }
 
   addRunEvent(run, type, payload) {
@@ -478,6 +607,16 @@ export class CodexThreadService {
     session.entryCount = nextEntries.length;
     session.relativeTime = '刚刚';
     this.liveSessions.set(threadId, session);
+  }
+
+  markLiveSessionTerminal(threadId, status, timestamp = new Date().toISOString(), turnId = null) {
+    const session = this.liveSessions.get(threadId);
+    if (!session) {
+      return null;
+    }
+    applyTerminalStateToSession(session, status, timestamp, turnId);
+    this.liveSessions.set(threadId, session);
+    return session;
   }
 
   serializeRun(run) {
@@ -597,6 +736,7 @@ function cleanTitle(value) {
 }
 
 function sessionToSummary(session) {
+  const runtimeState = normalizeActivityStatus(session.runtimeState ?? session.activityStatus) || 'idle';
   return {
     id: session.id,
     title: session.title,
@@ -605,9 +745,14 @@ function sessionToSummary(session) {
     projectRoot: session.projectRoot ?? '',
     projectLabel: session.projectLabel ?? '未归类',
     source: session.source ?? 'app-server-live',
-    activitySource: session.activitySource ?? 'app-server-live',
-    activityStatus: session.activityStatus ?? 'idle',
-    activityUpdatedAt: session.activityUpdatedAt ?? '',
+    activitySource: session.runtimeSource ?? session.activitySource ?? 'app-server-live',
+    activityStatus: runtimeState,
+    activityUpdatedAt: session.runtimeUpdatedAt ?? session.activityUpdatedAt ?? '',
+    runtimeState,
+    runtimeSource: session.runtimeSource ?? session.activitySource ?? 'app-server-live',
+    runtimeUpdatedAt: session.runtimeUpdatedAt ?? session.activityUpdatedAt ?? '',
+    canInterrupt: session.canInterrupt === true || runtimeState === 'running',
+    terminalReason: terminalReasonForStatus(runtimeState),
     lastVisibleRole: session.lastVisibleRole ?? '',
     pinned: session.pinned ?? false,
     detailAvailable: true
@@ -635,14 +780,23 @@ function mergeDesktopAlignedSessions(liveSessions, desktopSessions) {
     if (!live) {
       return desktop;
     }
+    const runtime = mergeActivityState(live, desktop);
+    const runtimeState = runtime.status;
+    const runtimeUpdatedAt = runtime.updatedAt;
+    const terminal = isTerminalActivityStatus(runtimeState);
     return {
       ...desktop,
       updatedAt: live.updatedAt || desktop.updatedAt,
       relativeTime: live.relativeTime || desktop.relativeTime,
       source: live.source || desktop.source,
-      activitySource: live.activitySource || desktop.activitySource,
-      activityStatus: mergeActivityStatus(live.activityStatus, desktop.activityStatus),
-      activityUpdatedAt: latestIso(live.activityUpdatedAt, desktop.activityUpdatedAt),
+      activitySource: runtime.source,
+      activityStatus: runtimeState,
+      activityUpdatedAt: runtimeUpdatedAt,
+      runtimeState,
+      runtimeSource: runtime.source,
+      runtimeUpdatedAt,
+      canInterrupt: !terminal && (runtimeState === 'running' || runtimeState === 'waiting_approval' || live.canInterrupt === true || desktop.canInterrupt === true),
+      terminalReason: terminalReasonForStatus(runtimeState),
       lastVisibleRole: live.lastVisibleRole || desktop.lastVisibleRole || '',
       detailAvailable: desktop.detailAvailable !== false
     };
@@ -650,22 +804,229 @@ function mergeDesktopAlignedSessions(liveSessions, desktopSessions) {
   return [...liveOnly, ...desktopAligned];
 }
 
-function mergeActivityStatus(liveStatus, desktopStatus) {
-  const live = normalizeActivityStatus(liveStatus);
-  const desktop = normalizeActivityStatus(desktopStatus);
-  if (live === 'running' || desktop === 'running') {
+function mergeLocalThreadWithLiveState(localSession, liveSession) {
+  const liveStatus = normalizeActivityStatus(liveSession?.runtimeState ?? liveSession?.activityStatus);
+  if (!isTerminalActivityStatus(liveStatus)) {
+    return localSession;
+  }
+  const localStatus = normalizeActivityStatus(localSession?.runtimeState ?? localSession?.activityStatus);
+  if (!isRunningActivityStatus(localStatus) && !isLiveActivityEntry(localSession?.entries?.at(-1))) {
+    return localSession;
+  }
+  const liveUpdatedAt = liveSession?.runtimeUpdatedAt || liveSession?.activityUpdatedAt || liveSession?.updatedAt || '';
+  const localUpdatedAt = localSession?.runtimeUpdatedAt || localSession?.activityUpdatedAt || localSession?.updatedAt || '';
+  const liveSource = liveSession?.runtimeSource || liveSession?.activitySource || 'app-server-live';
+  if (liveSource !== 'desktop-thread-read' && isActivityStateNewerByMoreThan(
+    { status: localStatus, updatedAt: localUpdatedAt },
+    { status: liveStatus, updatedAt: liveUpdatedAt },
+    3000
+  )) {
+    return localSession;
+  }
+  const entries = withoutLiveActivity(localSession.entries ?? []);
+  return {
+    ...localSession,
+    entries,
+    entryCount: entries.length,
+    activitySource: liveSession.runtimeSource || liveSession.activitySource || 'app-server-live',
+    activityStatus: liveStatus,
+    activityUpdatedAt: liveUpdatedAt || localUpdatedAt,
+    runtimeState: liveStatus,
+    runtimeSource: liveSession.runtimeSource || liveSession.activitySource || 'app-server-live',
+    runtimeUpdatedAt: liveUpdatedAt || localUpdatedAt,
+    canInterrupt: false,
+    terminalReason: terminalReasonForStatus(liveStatus) || liveSession.terminalReason || liveStatus
+  };
+}
+
+function applyTerminalStateToSession(session, status, timestamp = new Date().toISOString(), turnId = null) {
+  const terminalStatus = normalizeActivityStatus(status) || 'completed';
+  const normalized = isTerminalActivityStatus(terminalStatus) ? terminalStatus : 'completed';
+  session.activitySource = 'app-server-live';
+  session.activityStatus = normalized;
+  session.activityUpdatedAt = timestamp;
+  session.runtimeState = normalized;
+  session.runtimeSource = 'app-server-live';
+  session.runtimeUpdatedAt = timestamp;
+  session.canInterrupt = false;
+  session.terminalReason = terminalReasonForStatus(normalized) || normalized;
+  session.entries = withoutLiveActivity(session.entries ?? [], turnId);
+  session.entryCount = session.entries.length;
+  session.updatedAt = latestIso(session.updatedAt, timestamp);
+}
+
+function terminalStatusFromConvertedEvent(item) {
+  const raw = item?.payload?.params?.turn?.status
+    ?? item?.payload?.params?.status
+    ?? item?.payload?.status
+    ?? '';
+  const normalized = normalizeDesktopTurnStatus(raw);
+  if (isTerminalActivityStatus(normalized)) {
+    return normalized;
+  }
+  if (item?.failed === true || item?.type === 'codex.turn.failed') {
+    return 'failed';
+  }
+  return 'completed';
+}
+
+function runtimeStateFromDesktopThread(thread) {
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const latest = [...turns].reverse().find((turn) => String(turn?.status ?? '').trim().length > 0);
+  if (!latest) {
+    return '';
+  }
+  const mapped = normalizeDesktopTurnStatus(latest.status);
+  if (mapped) {
+    return mapped;
+  }
+  const status = String(latest.status ?? '').trim().toLowerCase().replace(/[-_ ]/g, '');
+  if (status === 'inprogress' || status === 'running' || status === 'active') {
     return 'running';
   }
-  if (live === 'completed' || desktop === 'completed') {
+  return '';
+}
+
+function normalizeDesktopTurnStatus(status) {
+  const value = String(status ?? '').trim().toLowerCase().replace(/[-_ ]/g, '');
+  if (value === 'failed' || value === 'error') {
+    return 'failed';
+  }
+  if (value === 'interrupted' || value === 'cancelled' || value === 'canceled' || value === 'aborted') {
+    return 'interrupted';
+  }
+  if (value === 'completed' || value === 'complete' || value === 'success' || value === 'succeeded') {
     return 'completed';
   }
-  return live || desktop || 'idle';
+  return '';
+}
+
+function mergeActivityState(liveSession, desktopSession) {
+  const live = activityStateCandidate(liveSession, 'app-server-live');
+  const desktop = activityStateCandidate(desktopSession, 'session-file');
+  const chosen = chooseActivityState(live, desktop);
+  return {
+    status: chosen.status || 'idle',
+    source: chosen.source || 'unknown',
+    updatedAt: chosen.updatedAt || latestIso(live.updatedAt, desktop.updatedAt)
+  };
+}
+
+function activityStateCandidate(session, fallbackSource) {
+  const status = normalizeActivityStatus(session.runtimeState ?? session.activityStatus);
+  const explicitUpdatedAt = session.runtimeUpdatedAt || session.activityUpdatedAt || '';
+  return {
+    status,
+    source: session.runtimeSource || session.activitySource || fallbackSource,
+    updatedAt: explicitUpdatedAt || session.updatedAt || '',
+    explicitUpdatedAt
+  };
+}
+
+function chooseActivityState(left, right) {
+  if (!left.status) {
+    return right;
+  }
+  if (!right.status) {
+    return left;
+  }
+  if (left.status === right.status) {
+    return newerActivityState(left, right);
+  }
+
+  const leftTerminal = isTerminalActivityStatus(left.status);
+  const rightTerminal = isTerminalActivityStatus(right.status);
+  const leftRunning = isRunningActivityStatus(left.status);
+  const rightRunning = isRunningActivityStatus(right.status);
+  const leftIdle = left.status === 'idle';
+  const rightIdle = right.status === 'idle';
+
+  if ((leftTerminal && rightRunning) || (rightTerminal && leftRunning)) {
+    const terminal = leftTerminal ? left : right;
+    const running = leftRunning ? left : right;
+    if (isActivityStateNewerByMoreThan(running, terminal, 3000)) {
+      return running;
+    }
+    return terminal;
+  }
+
+  if ((leftRunning && rightIdle) || (rightRunning && leftIdle)) {
+    const running = leftRunning ? left : right;
+    const idle = leftIdle ? left : right;
+    if (!idle.explicitUpdatedAt) {
+      return running;
+    }
+    return newerActivityState(running, idle);
+  }
+
+  return newerActivityState(left, right);
+}
+
+function newerActivityState(left, right) {
+  const leftMs = Date.parse(left.updatedAt || '');
+  const rightMs = Date.parse(right.updatedAt || '');
+  if (Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs !== rightMs) {
+    return leftMs > rightMs ? left : right;
+  }
+  if (Number.isFinite(leftMs) && !Number.isFinite(rightMs)) {
+    return left;
+  }
+  if (!Number.isFinite(leftMs) && Number.isFinite(rightMs)) {
+    return right;
+  }
+  const leftPriority = activityStatusPriority(left.status);
+  const rightPriority = activityStatusPriority(right.status);
+  return leftPriority >= rightPriority ? left : right;
+}
+
+function isActivityStateNewerByMoreThan(candidate, baseline, thresholdMs) {
+  const candidateMs = Date.parse(candidate.updatedAt || '');
+  const baselineMs = Date.parse(baseline.updatedAt || '');
+  return Number.isFinite(candidateMs) && Number.isFinite(baselineMs) && candidateMs - baselineMs > thresholdMs;
+}
+
+function activityStatusPriority(status) {
+  if (status === 'failed') {
+    return 50;
+  }
+  if (status === 'interrupted') {
+    return 45;
+  }
+  if (status === 'completed') {
+    return 40;
+  }
+  if (status === 'waiting_approval') {
+    return 30;
+  }
+  if (status === 'running') {
+    return 20;
+  }
+  if (status === 'idle') {
+    return 10;
+  }
+  return 0;
+}
+
+function isTerminalActivityStatus(status) {
+  return status === 'completed' || status === 'failed' || status === 'interrupted';
+}
+
+function isRunningActivityStatus(status) {
+  return status === 'running' || status === 'waiting_approval';
 }
 
 function normalizeActivityStatus(value) {
   const status = String(value ?? '').trim().toLowerCase();
-  if (status === 'running' || status === 'completed' || status === 'idle') {
+  if (status === 'running' || status === 'waiting_approval' || status === 'interrupted' || status === 'failed' || status === 'completed' || status === 'idle') {
     return status;
+  }
+  return '';
+}
+
+function terminalReasonForStatus(status) {
+  const normalized = normalizeActivityStatus(status);
+  if (normalized === 'completed' || normalized === 'interrupted' || normalized === 'failed') {
+    return normalized;
   }
   return '';
 }
@@ -730,6 +1091,32 @@ function withoutLiveActivity(entries, turnId = null) {
     }
     return entry.turnId && entry.turnId !== turnId;
   });
+}
+
+function preserveClientNoticeEntries(existing, snapshot) {
+  if (!existing?.entries?.length) {
+    return snapshot;
+  }
+  const notices = existing.entries.filter((entry) => entry.type === 'codex_client_notice');
+  if (notices.length === 0) {
+    return snapshot;
+  }
+  const entries = [...(snapshot.entries ?? [])];
+  for (const notice of notices) {
+    const duplicate = entries.some((entry) => {
+      return entry.type === notice.type
+        && entry.role === notice.role
+        && entry.text === notice.text;
+    });
+    if (!duplicate) {
+      entries.push(notice);
+    }
+  }
+  return {
+    ...snapshot,
+    entries,
+    entryCount: entries.length
+  };
 }
 
 function formatRelativeTime(updatedAtMs) {

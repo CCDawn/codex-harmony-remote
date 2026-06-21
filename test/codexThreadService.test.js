@@ -178,6 +178,23 @@ test('CodexThreadService prefers desktop sidebar sessions when available', async
 
 test('CodexThreadService preserves desktop running status when live snapshot is idle', async () => {
   const client = new FakeAppServerClient();
+  client.request = async (method, params) => {
+    client.calls.push({ method, params });
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          name: '设置',
+          cwd: 'C:\\work',
+          turns: [{
+            id: 'turn-1',
+            status: 'inProgress'
+          }]
+        }
+      };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  };
   const sessions = {
     async listSessions() {
       return [{
@@ -191,6 +208,7 @@ test('CodexThreadService preserves desktop running status when live snapshot is 
         activitySource: 'session-file',
         activityStatus: 'running',
         activityUpdatedAt: '2026-05-30T08:24:09.016Z',
+        terminalReason: 'interrupted',
         pinned: false,
         detailAvailable: true
       }];
@@ -208,6 +226,7 @@ test('CodexThreadService preserves desktop running status when live snapshot is 
     activitySource: 'app-server-live',
     activityStatus: 'idle',
     activityUpdatedAt: '',
+    terminalReason: 'interrupted',
     detailAvailable: true,
     entries: [],
     entryCount: 0
@@ -218,6 +237,117 @@ test('CodexThreadService preserves desktop running status when live snapshot is 
   assert.equal(listed[0].id, '019e-thread');
   assert.equal(listed[0].activityStatus, 'running');
   assert.equal(listed[0].activityUpdatedAt, '2026-05-30T08:24:09.016Z');
+  assert.equal(listed[0].terminalReason, '');
+});
+
+test('CodexThreadService lets completed live task state override stale desktop running snapshot', async () => {
+  const client = new FakeAppServerClient();
+  const sessions = {
+    async listSessions() {
+      return [{
+        id: '019e-thread',
+        title: '设置',
+        updatedAt: '2026-06-16T18:24:36.949Z',
+        relativeTime: '刚刚',
+        projectRoot: 'C:\\work',
+        projectLabel: 'work',
+        source: 'desktop-sidebar',
+        activitySource: 'session-file',
+        activityStatus: 'running',
+        activityUpdatedAt: '2026-06-16T18:24:36.949Z',
+        runtimeState: 'running',
+        runtimeSource: 'session-file',
+        runtimeUpdatedAt: '2026-06-16T18:24:36.949Z',
+        canInterrupt: true,
+        pinned: false,
+        detailAvailable: true
+      }];
+    }
+  };
+  const service = new CodexThreadService({ client, sessions });
+  service.liveSessions.set('019e-thread', {
+    id: '019e-thread',
+    title: '设置',
+    updatedAt: '2026-06-16T18:24:37.200Z',
+    relativeTime: '刚刚',
+    projectRoot: 'C:\\work',
+    projectLabel: 'work',
+    source: 'app-server-live',
+    activitySource: 'app-server-live',
+    activityStatus: 'completed',
+    activityUpdatedAt: '2026-06-16T18:24:37.200Z',
+    runtimeState: 'completed',
+    runtimeSource: 'app-server-live',
+    runtimeUpdatedAt: '2026-06-16T18:24:37.200Z',
+    canInterrupt: false,
+    detailAvailable: true,
+    entries: [],
+    entryCount: 0
+  });
+
+  const listed = await service.listThreads({ limit: 10 });
+
+  assert.equal(listed[0].id, '019e-thread');
+  assert.equal(listed[0].activityStatus, 'completed');
+  assert.equal(listed[0].runtimeState, 'completed');
+  assert.equal(listed[0].canInterrupt, false);
+  assert.equal(listed[0].terminalReason, 'completed');
+});
+
+test('CodexThreadService refreshes stale running desktop list entries before returning summaries', async () => {
+  const client = new FakeAppServerClient();
+  client.request = async (method, params) => {
+    client.calls.push({ method, params });
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          name: '设置',
+          cwd: 'C:\\work',
+          updatedAt: Date.parse('2026-06-19T14:40:39.000Z') / 1000,
+          turns: [{
+            id: 'turn-1',
+            status: 'completed',
+            completedAt: Date.parse('2026-06-19T14:40:39.000Z') / 1000
+          }]
+        }
+      };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  };
+  const sessions = {
+    async listSessions() {
+      return [{
+        id: '019e-thread',
+        title: '设置',
+        updatedAt: '2026-06-19T14:40:38.000Z',
+        relativeTime: '刚刚',
+        projectRoot: 'C:\\work',
+        projectLabel: 'work',
+        source: 'desktop-sidebar',
+        activitySource: 'session-file',
+        activityStatus: 'running',
+        activityUpdatedAt: '2026-06-19T14:40:38.000Z',
+        runtimeState: 'running',
+        runtimeSource: 'session-file',
+        runtimeUpdatedAt: '2026-06-19T14:40:38.000Z',
+        canInterrupt: true,
+        pinned: false,
+        detailAvailable: true
+      }];
+    }
+  };
+  const service = new CodexThreadService({ client, sessions });
+
+  const listed = await service.listThreads({ limit: 10 });
+
+  assert.equal(client.calls.some((call) => call.method === 'thread/read' && call.params.threadId === '019e-thread'), true);
+  assert.equal(listed[0].id, '019e-thread');
+  assert.equal(listed[0].activityStatus, 'completed');
+  assert.equal(listed[0].runtimeState, 'completed');
+  assert.equal(listed[0].canInterrupt, false);
+  assert.equal(listed[0].terminalReason, 'completed');
+  assert.equal(listed[0].activitySource, 'desktop-thread-read');
 });
 
 test('CodexThreadService reads existing thread detail from local rollout before stale app-server snapshot', async () => {
@@ -279,6 +409,196 @@ test('CodexThreadService reads existing thread detail from local rollout before 
     '我来按日志链路查，不靠猜'
   ]);
   assert.equal(client.calls.some((call) => call.method === 'thread/read'), false);
+});
+
+test('CodexThreadService overlays live terminal state on stale local running detail', async () => {
+  const client = new FakeAppServerClient();
+  const sessions = {
+    async getSession() {
+      return {
+        id: '019e-thread',
+        title: '测试会话',
+        updatedAt: '2026-06-19T07:47:59.000Z',
+        relativeTime: '刚刚',
+        projectRoot: 'C:\\work',
+        projectLabel: 'work',
+        source: 'desktop-sidebar',
+        activitySource: 'session-file',
+        activityStatus: 'running',
+        activityUpdatedAt: '2026-06-19T07:47:59.000Z',
+        runtimeState: 'running',
+        runtimeSource: 'session-file',
+        runtimeUpdatedAt: '2026-06-19T07:47:59.000Z',
+        canInterrupt: true,
+        detailAvailable: true,
+        filePath: 'C:\\Users\\agent\\.codex\\sessions\\rollout.jsonl',
+        entries: [{
+          timestamp: '2026-06-19T07:47:59.000Z',
+          type: 'live_activity',
+          role: 'system',
+          text: '正在返回内容'
+        }],
+        entryCount: 1
+      };
+    },
+    async getSessionSync() {
+      return {
+        id: '019e-thread',
+        title: '测试会话',
+        updatedAt: '2026-06-19T07:47:59.000Z',
+        source: 'desktop-sidebar',
+        activityStatus: 'running',
+        runtimeState: 'running',
+        canInterrupt: true,
+        detailAvailable: true,
+        entries: [{
+          timestamp: '2026-06-19T07:47:59.000Z',
+          type: 'live_activity',
+          role: 'system',
+          text: '正在返回内容'
+        }],
+        sync: { mode: 'recent', source: 'session-file' }
+      };
+    }
+  };
+  const service = new CodexThreadService({ client, sessions });
+  service.liveSessions.set('019e-thread', {
+    id: '019e-thread',
+    title: '测试会话',
+    updatedAt: '2026-06-19T07:48:00.000Z',
+    source: 'app-server-live',
+    activitySource: 'app-server-live',
+    activityStatus: 'interrupted',
+    activityUpdatedAt: '2026-06-19T07:48:00.000Z',
+    runtimeState: 'interrupted',
+    runtimeSource: 'app-server-live',
+    runtimeUpdatedAt: '2026-06-19T07:48:00.000Z',
+    canInterrupt: false,
+    terminalReason: 'interrupted',
+    entries: []
+  });
+
+  const detail = await service.getThread('019e-thread', { tail: 20 });
+  const sync = await service.syncThread('019e-thread', { limit: 20 });
+
+  for (const view of [detail, sync]) {
+    assert.equal(view.activityStatus, 'interrupted');
+    assert.equal(view.runtimeState, 'interrupted');
+    assert.equal(view.canInterrupt, false);
+    assert.equal(view.terminalReason, 'interrupted');
+    assert.equal(view.entries.some((entry) => entry.type === 'live_activity'), false);
+  }
+});
+
+test('CodexThreadService keeps newer local running state over stale live terminal snapshot', async () => {
+  const client = new FakeAppServerClient();
+  client.request = async (method, params) => {
+    client.calls.push({ method, params });
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          name: '测试会话',
+          cwd: 'C:\\work',
+          turns: [{
+            id: 'turn-1',
+            status: 'inProgress'
+          }]
+        }
+      };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  };
+  const sessions = {
+    async getSession() {
+      return {
+        id: '019e-thread',
+        title: '测试会话',
+        updatedAt: '2026-06-19T09:07:10.000Z',
+        relativeTime: '刚刚',
+        projectRoot: 'C:\\work',
+        projectLabel: 'work',
+        source: 'desktop-sidebar',
+        activitySource: 'session-file',
+        activityStatus: 'running',
+        activityUpdatedAt: '2026-06-19T09:07:10.000Z',
+        runtimeState: 'running',
+        runtimeSource: 'session-file',
+        runtimeUpdatedAt: '2026-06-19T09:07:10.000Z',
+        canInterrupt: true,
+        detailAvailable: true,
+        entries: [{
+          timestamp: '2026-06-19T09:07:10.000Z',
+          type: 'live_activity',
+          role: 'system',
+          text: '正在返回内容'
+        }],
+        entryCount: 1
+      };
+    }
+  };
+  const service = new CodexThreadService({ client, sessions });
+  service.liveSessions.set('019e-thread', {
+    id: '019e-thread',
+    title: '测试会话',
+    updatedAt: '2026-06-19T08:34:18.000Z',
+    source: 'app-server-live',
+    activitySource: 'app-server-live',
+    activityStatus: 'interrupted',
+    activityUpdatedAt: '2026-06-19T08:34:18.000Z',
+    runtimeState: 'interrupted',
+    runtimeSource: 'app-server-live',
+    runtimeUpdatedAt: '2026-06-19T08:34:18.000Z',
+    canInterrupt: false,
+    terminalReason: 'interrupted',
+    entries: []
+  });
+
+  const detail = await service.getThread('019e-thread', { tail: 20 });
+
+  assert.equal(detail.activityStatus, 'running');
+  assert.equal(detail.runtimeState, 'running');
+  assert.equal(detail.canInterrupt, true);
+  assert.equal(detail.entries.at(-1).type, 'live_activity');
+});
+
+test('CodexThreadService refreshes desktop terminal state when local rollout is still running after bridge restart', async () => {
+  const client = new FakeAppServerClient();
+  const sessions = {
+    async getSession() {
+      return {
+        id: '019e-thread',
+        title: '测试会话',
+        updatedAt: '2026-06-19T07:47:59.000Z',
+        source: 'desktop-sidebar',
+        activitySource: 'session-file',
+        activityStatus: 'running',
+        activityUpdatedAt: '2026-06-19T07:47:59.000Z',
+        runtimeState: 'running',
+        runtimeSource: 'session-file',
+        runtimeUpdatedAt: '2026-06-19T07:47:59.000Z',
+        canInterrupt: true,
+        detailAvailable: true,
+        entries: [{
+          timestamp: '2026-06-19T07:47:59.000Z',
+          type: 'live_activity',
+          role: 'system',
+          text: '正在返回内容'
+        }],
+        entryCount: 1
+      };
+    }
+  };
+  const service = new CodexThreadService({ client, sessions });
+
+  const detail = await service.getThread('019e-thread', { tail: 20 });
+
+  assert.equal(detail.activityStatus, 'completed');
+  assert.equal(detail.runtimeState, 'completed');
+  assert.equal(detail.canInterrupt, false);
+  assert.equal(detail.terminalReason, 'completed');
+  assert.equal(detail.entries.some((entry) => entry.type === 'live_activity'), false);
+  assert.equal(client.calls.some((call) => call.method === 'thread/read'), true);
 });
 
 test('CodexThreadService accepts nested app-server notification ids and generic reasoning deltas', async () => {
@@ -392,6 +712,42 @@ test('CodexThreadService keeps one bottom live activity while work changes from 
   assert.equal(streamingSession.entries.at(-1), liveEntries[0]);
   assert.equal(liveEntries[0].liveKind, 'command');
   assert.equal(liveEntries[0].text, '正在执行命令');
+});
+
+test('CodexThreadService surfaces app-server auth errors as client notice entries', async () => {
+  const client = new FakeAppServerClient();
+  const service = new CodexThreadService({
+    client,
+    projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work' }],
+    autoOpenDesktop: false
+  });
+
+  const result = await service.startThread({ projectId: 'probe', prompt: '继续' });
+  await client.waitForRequest('turn/start');
+
+  client.emit('notification', {
+    method: 'error',
+    params: {
+      threadId: '019e-thread',
+      turnId: 'turn-1',
+      statusCode: 401,
+      error: {
+        code: 'unauthorized',
+        message: 'Unauthorized'
+      }
+    }
+  });
+
+  await until(() => service.getRun(result.run.id).status === 'failed');
+  const failed = service.getRun(result.run.id);
+  const notice = failed.session.entries.find((entry) => entry.type === 'codex_client_notice');
+
+  assert.equal(failed.status, 'failed');
+  assert.ok(notice);
+  assert.equal(notice.liveKind, 'auth');
+  assert.match(notice.text, /Codex 鉴权失败/);
+  const noticeEvent = failed.events.find((event) => event.payload?.notice);
+  assert.match(noticeEvent.payload.notice.title, /鉴权/);
 });
 
 test('CodexThreadService blocks deleting a running thread and clears local snapshots after deletion', async () => {

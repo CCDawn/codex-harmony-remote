@@ -145,6 +145,51 @@ test('DesktopScriptBridge connect replaces the active script after reinjection',
   assert.equal(bridge.snapshot().currentSessionId, '019e-new');
 });
 
+test('DesktopScriptBridge reports unhealthy auth for tokenless live host', () => {
+  const bridge = new DesktopScriptBridge({ pollTimeoutMs: 10 });
+
+  bridge.connect({
+    scriptId: 'script-tokenless',
+    currentSessionId: '019e-target',
+    tokenPresent: false
+  }, { replace: true });
+  let snapshot = bridge.snapshot({ authRequired: true });
+  assert.equal(snapshot.online, true);
+  assert.equal(snapshot.scriptAuth.required, true);
+  assert.equal(snapshot.scriptAuth.scriptTokenPresent, false);
+  assert.equal(snapshot.scriptAuth.healthy, false);
+
+  bridge.connect({
+    scriptId: 'script-tokened',
+    currentSessionId: '019e-target',
+    tokenPresent: true
+  }, { replace: true });
+  snapshot = bridge.snapshot({ authRequired: true });
+  assert.equal(snapshot.scriptAuth.scriptTokenPresent, true);
+  assert.equal(snapshot.scriptAuth.healthy, true);
+});
+
+test('DesktopScriptBridge clears stale unauthorized state after tokened live host connects', () => {
+  const bridge = new DesktopScriptBridge({ pollTimeoutMs: 10 });
+
+  bridge.recordUnauthorized('/desktop/script/connect');
+  let snapshot = bridge.snapshot({ authRequired: true });
+  assert.equal(snapshot.scriptAuth.recentUnauthorized, true);
+  assert.equal(snapshot.scriptAuth.healthy, false);
+
+  bridge.connect({
+    scriptId: 'script-tokened',
+    currentSessionId: '019e-target',
+    tokenPresent: true
+  }, { replace: true });
+
+  snapshot = bridge.snapshot({ authRequired: true });
+  assert.equal(snapshot.scriptAuth.scriptTokenPresent, true);
+  assert.equal(snapshot.scriptAuth.recentUnauthorized, false);
+  assert.equal(snapshot.scriptAuth.healthy, true);
+  assert.equal(snapshot.scriptAuth.unauthorizedCount, 1);
+});
+
 test('DesktopScriptBridge marks command channel degraded after app-server timeout', async () => {
   const bridge = new DesktopScriptBridge({
     requestTimeoutMs: 10,

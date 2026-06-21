@@ -43,6 +43,10 @@ interface FailedSessionMessage {
   error: string;
   createdAt: string;
   retrying: boolean;
+  retryCount: number;
+  retryLimit: number;
+  autoRetryEnabled: boolean;
+  nextRetryAt: string;
 }
 
 interface FailedSessionMessageRecordInput {
@@ -223,6 +227,10 @@ struct Index {
   private taskSessionById: Record<string, string> = {};
   private latestTaskIdBySessionId: Record<string, string> = {};
   private pendingSessionSendsByTaskId: Record<string, PendingSessionSend> = {};
+  private failedSessionRetryTimersById: Record<string, number> = {};
+  private canceledFailedSessionRetryIds: string[] = [];
+  private failedSessionAutoRetryLimit: number = 5;
+  private failedSessionAutoRetryDelayMs: number = 1800;
   private sessionActivityStatusById: Record<string, string> = {};
   private sessionUpdatedAtById: Record<string, string> = {};
   private clearedRunningSessionUpdatedAtById: Record<string, string> = {};
@@ -1494,9 +1502,9 @@ struct Index {
         .height(32)
         .backgroundColor(message.retrying ? '#8A95A3' : '#14853D')
         .borderRadius(16)
-        .enabled(!message.retrying && !this.isBusy)
+        .enabled(this.canRetryFailedSessionMessage(message))
         .onClick(() => {
-          void this.retryFailedSessionMessage(message);
+          void this.retryFailedSessionMessage(message, 'manual');
         })
 
       Row({ space: 6 }) {
@@ -1505,7 +1513,7 @@ struct Index {
             Text(this.failedSessionMessageTimeText(message))
               .fontSize(9)
               .fontColor('#B42318')
-            Text(message.retrying ? '重试中' : '发送失败')
+            Text(this.failedSessionMessageStatusText(message))
               .fontSize(10)
               .fontColor('#B42318')
               .fontWeight(FontWeight.Regular)
@@ -1568,9 +1576,9 @@ struct Index {
             .backgroundColor('#FFFFFF')
             .border({ width: 1, color: '#DDE3EA' })
             .borderRadius(14)
-            .enabled(!message.retrying)
+            .enabled(true)
             .onClick(() => {
-              this.removeFailedSessionMessage(message.id);
+              this.cancelFailedSessionAutoRetry(message.id);
             })
         }
         .justifyContent(FlexAlign.Center)
@@ -3120,7 +3128,7 @@ struct Index {
       });
       if (sent) {
         if (retryFailedMessageId.length > 0) {
-          this.removeFailedSessionMessage(retryFailedMessageId);
+          this.updateFailedSessionMessage(retryFailedMessageId, true, '消息已重新提交，等待 Codex 确认');
         }
         return true;
       }
@@ -3197,7 +3205,7 @@ struct Index {
       });
       if (sent) {
         if (retryFailedMessageId.length > 0) {
-          this.removeFailedSessionMessage(retryFailedMessageId);
+          this.updateFailedSessionMessage(retryFailedMessageId, true, '消息已重新提交，等待 Codex 确认');
         }
         return true;
       }
@@ -3703,10 +3711,17 @@ struct Index {
 
   private rememberFailedSessionMessageAfterSendFailure(input: FailedSessionMessageRecordInput): void {
     if (input.failedId.length > 0) {
+      if (this.isFailedSessionRetryCanceled(input.failedId)) {
+        this.clearFailedSessionRetryTimer(input.failedId);
+        this.log('info', 'session.message.failed.retry_canceled_ignore_failure', `failedId=${input.failedId}; sessionId=${input.sessionId}; error=${input.error}`);
+        return;
+      }
       this.updateFailedSessionMessage(input.failedId, false, input.error);
+      this.scheduleFailedSessionAutoRetry(input.failedId, 'updated_failure');
       return;
     }
     const id = `failed-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    this.removeCanceledFailedSessionRetryId(id);
     const failed: FailedSessionMessage = {
       id,
       sessionId: input.sessionId,
@@ -3716,7 +3731,11 @@ struct Index {
       images: input.images.slice(),
       error: input.error,
       createdAt: new Date().toISOString(),
-      retrying: false
+      retrying: false,
+      retryCount: 0,
+      retryLimit: this.failedSessionAutoRetryLimit,
+      autoRetryEnabled: true,
+      nextRetryAt: ''
     };
     this.failedSessionMessages = [
       ...this.failedSessionMessages,
@@ -3724,8 +3743,9 @@ struct Index {
     ];
     this.sessionMessage = '';
     this.pendingSessionImages = [];
-    this.message = '发送失败，已保留消息，可点旁边按钮重试';
+    this.message = '发送失败，已保留消息，将自动重传，点 X 可取消';
     this.log('warn', 'session.message.failed.remembered', `failedId=${id}; sessionId=${input.sessionId}; isNew=${input.isNewSession}; images=${input.images.length}; error=${input.error}`);
+    this.scheduleFailedSessionAutoRetry(id, 'new_failure');
     this.scrollSessionToBottom(80);
   }
 
@@ -3756,9 +3776,39 @@ struct Index {
     if (!pending) {
       return;
     }
+    if (pending.retryFailedMessageId.length > 0 && this.isFailedSessionRetryCanceled(pending.retryFailedMessageId)) {
+      this.clearPendingSessionSend(task.id);
+      this.log('info', 'session.message.failed.retry_canceled_ignore_terminal', `taskId=${task.id}; failedId=${pending.retryFailedMessageId}; status=${task.status}`);
+      return;
+    }
     if (task.status === 'completed') {
+      if (pending.retryFailedMessageId.length > 0) {
+        this.removeFailedSessionMessage(pending.retryFailedMessageId);
+      }
       this.clearPendingSessionSend(task.id);
       return;
+    }
+    if (pending.retryFailedMessageId.length > 0) {
+      const canonicalCandidate: FailedSessionMessage = {
+        id: pending.retryFailedMessageId,
+        sessionId: pending.sessionId,
+        isNewSession: pending.isNewSession,
+        projectId: pending.projectId,
+        text: pending.text,
+        images: pending.images,
+        error: '',
+        createdAt: task.createdAt,
+        retrying: false,
+        retryCount: 0,
+        retryLimit: this.failedSessionAutoRetryLimit,
+        autoRetryEnabled: true,
+        nextRetryAt: ''
+      };
+      if (this.failedSessionMessageHasCanonicalEntry(canonicalCandidate)) {
+        this.removeFailedSessionMessage(pending.retryFailedMessageId);
+        this.clearPendingSessionSend(task.id);
+        return;
+      }
     }
     const error = task.status === 'failed'
       ? this.taskFailureMessage(task)
@@ -3788,6 +3838,160 @@ struct Index {
     return 'Codex 没有确认接收这条消息';
   }
 
+  private isFailedSessionRetryCanceled(failedId: string): boolean {
+    return failedId.length > 0 && this.canceledFailedSessionRetryIds.indexOf(failedId) >= 0;
+  }
+
+  private removeCanceledFailedSessionRetryId(failedId: string): void {
+    if (failedId.length === 0 || this.canceledFailedSessionRetryIds.indexOf(failedId) < 0) {
+      return;
+    }
+    this.canceledFailedSessionRetryIds = this.canceledFailedSessionRetryIds.filter((id: string) => id !== failedId);
+  }
+
+  private canRetryFailedSessionMessage(message: FailedSessionMessage): boolean {
+    return !message.retrying && !this.isBusy && !this.isFailedSessionRetryCanceled(message.id);
+  }
+
+  private failedSessionMessageStatusText(message: FailedSessionMessage): string {
+    if (message.retrying) {
+      return '重试中';
+    }
+    if (!message.autoRetryEnabled || this.isFailedSessionRetryCanceled(message.id)) {
+      return '发送失败';
+    }
+    if (message.retryCount >= message.retryLimit) {
+      return `发送失败 · 已重试 ${message.retryCount}/${message.retryLimit}`;
+    }
+    return `发送失败 · 将自动重试 ${message.retryCount}/${message.retryLimit}`;
+  }
+
+  private failedSessionRetryDelayMs(message: FailedSessionMessage): number {
+    const attempt = Math.max(0, message.retryCount);
+    return this.failedSessionAutoRetryDelayMs * Math.min(4, attempt + 1);
+  }
+
+  private forgetFailedSessionRetryTimer(failedId: string): void {
+    if (!this.failedSessionRetryTimersById[failedId]) {
+      return;
+    }
+    const next: Record<string, number> = {};
+    Object.keys(this.failedSessionRetryTimersById).forEach((id: string) => {
+      if (id !== failedId) {
+        next[id] = this.failedSessionRetryTimersById[id];
+      }
+    });
+    this.failedSessionRetryTimersById = next;
+  }
+
+  private clearFailedSessionRetryTimer(failedId: string): void {
+    const timer = this.failedSessionRetryTimersById[failedId];
+    if (timer !== undefined && timer >= 0) {
+      clearInterval(timer);
+    }
+    this.forgetFailedSessionRetryTimer(failedId);
+  }
+
+  private updateFailedSessionMessageNextRetryAt(failedId: string, nextRetryAt: string): void {
+    this.failedSessionMessages = this.failedSessionMessages.map((message: FailedSessionMessage) => {
+      if (message.id !== failedId) {
+        return message;
+      }
+      return {
+        id: message.id,
+        sessionId: message.sessionId,
+        isNewSession: message.isNewSession,
+        projectId: message.projectId,
+        text: message.text,
+        images: message.images,
+        error: message.error,
+        createdAt: message.createdAt,
+        retrying: message.retrying,
+        retryCount: message.retryCount,
+        retryLimit: message.retryLimit,
+        autoRetryEnabled: message.autoRetryEnabled,
+        nextRetryAt
+      };
+    });
+  }
+
+  private scheduleFailedSessionAutoRetry(failedId: string, source: string): void {
+    const message = this.failedSessionMessages.find((item: FailedSessionMessage) => item.id === failedId);
+    if (!message || !message.autoRetryEnabled || message.retrying || this.isFailedSessionRetryCanceled(failedId)) {
+      return;
+    }
+    if (message.retryCount >= message.retryLimit) {
+      this.log('warn', 'session.message.failed.retry_limit_reached', `failedId=${failedId}; source=${source}; retryCount=${message.retryCount}; retryLimit=${message.retryLimit}`);
+      return;
+    }
+    this.clearFailedSessionRetryTimer(failedId);
+    const delayMs = this.failedSessionRetryDelayMs(message);
+    this.updateFailedSessionMessageNextRetryAt(failedId, new Date(Date.now() + delayMs).toISOString());
+    this.failedSessionRetryTimersById[failedId] = setTimeout(() => {
+      this.forgetFailedSessionRetryTimer(failedId);
+      void this.autoRetryFailedSessionMessage(failedId);
+    }, delayMs);
+    this.log('info', 'session.message.failed.retry_scheduled', `failedId=${failedId}; source=${source}; retryCount=${message.retryCount}; retryLimit=${message.retryLimit}; delayMs=${delayMs}`);
+  }
+
+  private beginFailedSessionRetryAttempt(failedId: string, source: string): FailedSessionMessage | null {
+    const message = this.failedSessionMessages.find((item: FailedSessionMessage) => item.id === failedId);
+    if (!message || message.retrying || this.isFailedSessionRetryCanceled(failedId)) {
+      return null;
+    }
+    if (message.retryCount >= message.retryLimit) {
+      this.updateFailedSessionMessage(failedId, false, `自动重试已达到上限 ${message.retryLimit} 次，请手动重试或取消`);
+      this.log('warn', 'session.message.failed.retry_limit_blocked', `failedId=${failedId}; source=${source}; retryCount=${message.retryCount}; retryLimit=${message.retryLimit}`);
+      return null;
+    }
+    this.clearFailedSessionRetryTimer(failedId);
+    const attempt: FailedSessionMessage = {
+      id: message.id,
+      sessionId: message.sessionId,
+      isNewSession: message.isNewSession,
+      projectId: message.projectId,
+      text: message.text,
+      images: message.images.slice(),
+      error: message.error,
+      createdAt: message.createdAt,
+      retrying: true,
+      retryCount: message.retryCount + 1,
+      retryLimit: message.retryLimit,
+      autoRetryEnabled: source !== 'manual' ? message.autoRetryEnabled : true,
+      nextRetryAt: ''
+    };
+    this.failedSessionMessages = this.failedSessionMessages.map((item: FailedSessionMessage) => item.id === failedId ? attempt : item);
+    this.log('info', 'session.message.failed.retry_attempt', `failedId=${failedId}; source=${source}; retryCount=${attempt.retryCount}; retryLimit=${attempt.retryLimit}`);
+    return attempt;
+  }
+
+  private failedSessionMessageNeedsRetry(failedId: string): boolean {
+    const message = this.failedSessionMessages.find((item: FailedSessionMessage) => item.id === failedId);
+    return !!message && !message.retrying && message.autoRetryEnabled && !this.isFailedSessionRetryCanceled(failedId) && message.retryCount < message.retryLimit && !this.failedSessionMessageHasCanonicalEntry(message);
+  }
+
+  private async autoRetryFailedSessionMessage(failedId: string): Promise<void> {
+    if (!this.failedSessionMessageNeedsRetry(failedId)) {
+      this.log('info', 'session.message.failed.auto_retry_skipped', `failedId=${failedId}`);
+      return;
+    }
+    const message = this.failedSessionMessages.find((item: FailedSessionMessage) => item.id === failedId);
+    if (!message) {
+      return;
+    }
+    await this.retryFailedSessionMessage(message, 'auto');
+  }
+
+  private cancelFailedSessionAutoRetry(failedId: string): void {
+    this.clearFailedSessionRetryTimer(failedId);
+    if (this.canceledFailedSessionRetryIds.indexOf(failedId) < 0) {
+      this.canceledFailedSessionRetryIds = this.canceledFailedSessionRetryIds.concat([failedId]);
+    }
+    this.removeFailedSessionMessage(failedId);
+    this.message = '已取消失败消息重传';
+    this.log('info', 'session.message.failed.retry_canceled', `failedId=${failedId}`);
+  }
+
   private updateFailedSessionMessage(failedId: string, retrying: boolean, error: string = ''): void {
     this.failedSessionMessages = this.failedSessionMessages.map((message: FailedSessionMessage) => {
       if (message.id !== failedId) {
@@ -3802,12 +4006,17 @@ struct Index {
         images: message.images,
         error: error.length > 0 ? error : message.error,
         createdAt: message.createdAt,
-        retrying
+        retrying,
+        retryCount: message.retryCount,
+        retryLimit: message.retryLimit,
+        autoRetryEnabled: message.autoRetryEnabled,
+        nextRetryAt: retrying ? '' : message.nextRetryAt
       };
     });
   }
 
   private removeFailedSessionMessage(failedId: string): void {
+    this.clearFailedSessionRetryTimer(failedId);
     const before = this.failedSessionMessages.length;
     this.failedSessionMessages = this.failedSessionMessages.filter((message: FailedSessionMessage) => message.id !== failedId);
     if (this.failedSessionMessages.length < before) {
@@ -3815,27 +4024,33 @@ struct Index {
     }
   }
 
-  private async retryFailedSessionMessage(message: FailedSessionMessage): Promise<void> {
-    if (message.retrying || this.isBusy) {
+  private async retryFailedSessionMessage(message: FailedSessionMessage, source: string = 'manual'): Promise<void> {
+    if (this.isBusy && source === 'manual') {
+      return;
+    }
+    const attempt = this.beginFailedSessionRetryAttempt(message.id, source);
+    if (attempt === null) {
       return;
     }
     if (!message.isNewSession && (this.selectedSession === null || this.selectedSession.id !== message.sessionId)) {
       this.message = '请先回到这条失败消息所属会话后再重试';
+      this.updateFailedSessionMessage(attempt.id, false, this.message);
+      this.scheduleFailedSessionAutoRetry(attempt.id, 'wrong_session');
       return;
     }
     const previousText = this.sessionMessage;
     const previousImages = this.pendingSessionImages.slice();
-    this.updateFailedSessionMessage(message.id, true);
-    this.sessionMessage = message.text;
-    this.pendingSessionImages = message.images.slice();
-    this.log('info', 'session.message.failed.retry', `failedId=${message.id}; sessionId=${message.sessionId}; isNew=${message.isNewSession}; images=${message.images.length}`);
-    const ok = message.isNewSession
-      ? await this.sendNewSessionMessage(message.id)
-      : await this.sendMessageToSelectedSession(message.id);
+    this.sessionMessage = attempt.text;
+    this.pendingSessionImages = attempt.images.slice();
+    this.log('info', 'session.message.failed.retry', `failedId=${attempt.id}; source=${source}; sessionId=${attempt.sessionId}; isNew=${attempt.isNewSession}; images=${attempt.images.length}`);
+    const ok = attempt.isNewSession
+      ? await this.sendNewSessionMessage(attempt.id)
+      : await this.sendMessageToSelectedSession(attempt.id);
     if (!ok) {
       this.sessionMessage = previousText;
       this.pendingSessionImages = previousImages;
-      this.updateFailedSessionMessage(message.id, false, this.message);
+      this.updateFailedSessionMessage(attempt.id, false, this.message);
+      this.scheduleFailedSessionAutoRetry(attempt.id, 'retry_failed');
     }
   }
 
@@ -7334,6 +7549,7 @@ struct Index {
     if (sessionId.length === 0) {
       return [];
     }
+    this.pruneResolvedFailedSessionMessages();
     return this.failedSessionMessages.filter((message: FailedSessionMessage) => message.sessionId === sessionId);
   }
 
@@ -7349,7 +7565,7 @@ struct Index {
       return [];
     }
     const entries: CodexSessionEntry[] = [];
-    if (task.prompt.trim().length > 0 && !this.taskBlocksDesktopConversation(task)) {
+    if (task.status !== 'failed' && task.prompt.trim().length > 0 && !this.taskBlocksDesktopConversation(task) && !this.taskIsFailedMessageRetry(task)) {
       entries.push({
         timestamp: task.createdAt,
         type: 'live_user_message',
@@ -7391,6 +7607,48 @@ struct Index {
     }
     return sync.desktopLive === false
       && (sync.status === 'desktop_live_required' || sync.status === 'desktop_live_unavailable');
+  }
+
+  private taskIsFailedMessageRetry(task: BridgeTask): boolean {
+    const pending = this.pendingSessionSendsByTaskId[task.id];
+    return !!pending && pending.retryFailedMessageId.length > 0;
+  }
+
+  private pruneResolvedFailedSessionMessages(): void {
+    const resolvedIds: string[] = [];
+    this.failedSessionMessages.forEach((message: FailedSessionMessage) => {
+      if (this.failedSessionMessageHasCanonicalEntry(message)) {
+        resolvedIds.push(message.id);
+      }
+    });
+    if (resolvedIds.length === 0) {
+      return;
+    }
+    resolvedIds.forEach((failedId: string) => {
+      this.clearFailedSessionRetryTimer(failedId);
+    });
+    this.failedSessionMessages = this.failedSessionMessages.filter((message: FailedSessionMessage) => resolvedIds.indexOf(message.id) < 0);
+    this.log('info', 'session.message.failed.pruned_resolved', `failedIds=${resolvedIds.join(',')}`);
+  }
+
+  private normalizedFailedMessageText(text: string): string {
+    return this.visibleSessionText(text).replace(/\s+/g, ' ').trim();
+  }
+
+  private failedSessionMessageHasCanonicalEntry(message: FailedSessionMessage): boolean {
+    const expected = this.normalizedFailedMessageText(message.text);
+    if (expected.length === 0) {
+      return false;
+    }
+    const entries = message.isNewSession
+      ? this.currentTaskLiveEntries()
+      : (this.selectedSession?.entries ?? []);
+    return entries.some((entry: CodexSessionEntry) => {
+      if (entry.role !== 'user') {
+        return false;
+      }
+      return this.normalizedFailedMessageText(entry.text) === expected;
+    });
   }
 
   private sessionEntriesContain(entries: CodexSessionEntry[], candidate: CodexSessionEntry): boolean {

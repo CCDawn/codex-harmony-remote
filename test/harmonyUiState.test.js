@@ -376,29 +376,43 @@ test('live activity is rendered as one stable bottom conversation entry', () => 
 });
 
 test('failed session messages render in the conversation with a left retry button', () => {
+  const sourceText = source();
   const panelBody = methodBody('SessionConversationPanel()');
   const cardBody = methodBody('FailedSessionMessageCard(message: FailedSessionMessage)');
   const rememberBody = methodBody('rememberFailedSessionMessageAfterSendFailure(input: FailedSessionMessageRecordInput): void');
-  const retryBody = methodBody('retryFailedSessionMessage(message: FailedSessionMessage): Promise<void>');
+  const retryBody = methodBody('retryFailedSessionMessage(message: FailedSessionMessage, source: string = \'manual\'): Promise<void>');
+  const visibleFailedBody = methodBody('visibleFailedSessionMessages(): FailedSessionMessage[]');
 
   assert.match(panelBody, /ForEach\(this\.visibleFailedSessionMessages\(\)/);
   assert.match(rememberBody, /this\.failedSessionMessages = \[/);
+  assert.match(rememberBody, /retryLimit: this\.failedSessionAutoRetryLimit/);
+  assert.match(rememberBody, /this\.scheduleFailedSessionAutoRetry\(id, 'new_failure'\)/);
+  assert.match(rememberBody, /this\.scheduleFailedSessionAutoRetry\(input\.failedId, 'updated_failure'\)/);
   assert.match(rememberBody, /this\.sessionMessage = ''/);
   assert.match(rememberBody, /this\.pendingSessionImages = \[\]/);
 
   const blankIndex = cardBody.indexOf('Blank()');
-  const retryIndex = cardBody.indexOf('retryFailedSessionMessage(message)');
-  const bubbleIndex = cardBody.indexOf("Text(message.retrying ? '重试中' : '发送失败')");
+  const retryIndex = cardBody.indexOf("retryFailedSessionMessage(message, 'manual')");
+  const bubbleIndex = cardBody.indexOf('failedSessionMessageStatusText(message)');
   assert.ok(blankIndex >= 0 && retryIndex > blankIndex, 'retry button should appear after the right-aligning blank');
   assert.ok(bubbleIndex > retryIndex, 'retry button should appear to the left of the failed message bubble');
   assert.match(cardBody, /backgroundColor\(message\.retrying \? '#8A95A3' : '#14853D'\)/);
+  assert.match(cardBody, /cancelFailedSessionAutoRetry\(message\.id\)/);
   assert.doesNotMatch(cardBody, /failed_message_repair/);
   assert.doesNotMatch(cardBody, /repairDesktopLiveFromPhone\('failed_message'\)/);
 
-  assert.match(retryBody, /this\.sessionMessage = message\.text/);
-  assert.match(retryBody, /this\.pendingSessionImages = message\.images\.slice\(\)/);
-  assert.match(retryBody, /sendMessageToSelectedSession\(message\.id\)/);
-  assert.match(retryBody, /sendNewSessionMessage\(message\.id\)/);
+  assert.match(sourceText, /private failedSessionAutoRetryLimit: number = 5/);
+  assert.match(sourceText, /private scheduleFailedSessionAutoRetry\(failedId: string, source: string\): void/);
+  assert.match(sourceText, /private async autoRetryFailedSessionMessage\(failedId: string\): Promise<void>/);
+  assert.match(sourceText, /private cancelFailedSessionAutoRetry\(failedId: string\): void/);
+  assert.match(retryBody, /beginFailedSessionRetryAttempt\(message\.id, source\)/);
+  assert.match(retryBody, /this\.sessionMessage = attempt\.text/);
+  assert.match(retryBody, /this\.pendingSessionImages = attempt\.images\.slice\(\)/);
+  assert.match(retryBody, /sendMessageToSelectedSession\(attempt\.id\)/);
+  assert.match(retryBody, /sendNewSessionMessage\(attempt\.id\)/);
+  assert.match(retryBody, /this\.scheduleFailedSessionAutoRetry\(attempt\.id, 'retry_failed'\)/);
+  assert.match(visibleFailedBody, /pruneResolvedFailedSessionMessages/);
+  assert.match(sourceText, /private failedSessionMessageHasCanonicalEntry/);
 });
 
 test('pending session sends become retryable chat messages when the bridge task fails', () => {

@@ -24,6 +24,10 @@ export class DesktopScriptBridge extends EventEmitter {
     this.notifications = [];
     this.nextRequestId = 1;
     this.nextFetchRequestId = 1;
+    this.scriptTokenPresent = null;
+    this.unauthorizedCount = 0;
+    this.lastUnauthorizedAt = 0;
+    this.lastUnauthorizedRoute = '';
   }
 
   isOnline() {
@@ -113,12 +117,20 @@ export class DesktopScriptBridge extends EventEmitter {
     };
   }
 
-  snapshot() {
+  snapshot(options = {}) {
+    const authRequired = options.authRequired === true;
+    const online = this.isOnline();
+    const recentUnauthorized = this.lastUnauthorizedAt > 0 && Date.now() - this.lastUnauthorizedAt < 120000;
+    const scriptAuthHealthy = !authRequired
+      || (
+        (!online || this.scriptTokenPresent === true)
+        && !recentUnauthorized
+      );
     return {
       ok: true,
-      online: this.isOnline(),
+      online,
       scriptId: this.scriptId,
-      currentSessionId: this.isOnline() ? this.currentSessionId : null,
+      currentSessionId: online ? this.currentSessionId : null,
       lastSeenAt: this.lastSeenAt > 0 ? new Date(this.lastSeenAt).toISOString() : null,
       pendingCommandCount: this.pendingCommands.length,
       pendingResponseCount: this.pendingResponses.size,
@@ -130,11 +142,20 @@ export class DesktopScriptBridge extends EventEmitter {
       lastCommandResponseAt: this.lastCommandResponseAt > 0 ? new Date(this.lastCommandResponseAt).toISOString() : null,
       lastCommandFailureAt: this.lastCommandFailureAt > 0 ? new Date(this.lastCommandFailureAt).toISOString() : null,
       lastCommandFailureMessage: this.lastCommandFailureMessage || null,
+      scriptAuth: {
+        required: authRequired,
+        scriptTokenPresent: this.scriptTokenPresent === true,
+        healthy: scriptAuthHealthy,
+        recentUnauthorized,
+        unauthorizedCount: this.unauthorizedCount,
+        lastUnauthorizedAt: this.lastUnauthorizedAt > 0 ? new Date(this.lastUnauthorizedAt).toISOString() : null,
+        lastUnauthorizedRoute: this.lastUnauthorizedRoute || null
+      },
       checkedAt: new Date().toISOString()
     };
   }
 
-  connect({ scriptId, currentSessionId }, options = {}) {
+  connect({ scriptId, currentSessionId, tokenPresent }, options = {}) {
     const replace = options.replace ?? false;
     const nextScriptId = normalizeString(scriptId) || this.scriptId || `script-${Date.now()}`;
     if (this.scriptId && nextScriptId !== this.scriptId && this.isOnline() && !replace) {
@@ -159,26 +180,34 @@ export class DesktopScriptBridge extends EventEmitter {
     }
     this.scriptId = nextScriptId;
     this.currentSessionId = normalizeSessionId(currentSessionId);
+    if (tokenPresent !== undefined) {
+      this.scriptTokenPresent = tokenPresent === true;
+      if (this.scriptTokenPresent) {
+        this.lastUnauthorizedAt = 0;
+        this.lastUnauthorizedRoute = '';
+      }
+    }
     this.lastSeenAt = Date.now();
     return {
       ok: true,
       scriptId: this.scriptId,
       hostId: this.hostId,
       currentSessionId: this.currentSessionId,
+      tokenPresent: this.scriptTokenPresent === true,
       checkedAt: new Date().toISOString()
     };
   }
 
-  updateStatus({ scriptId, currentSessionId }) {
-    const connected = this.connect({ scriptId, currentSessionId });
+  updateStatus({ scriptId, currentSessionId, tokenPresent }) {
+    const connected = this.connect({ scriptId, currentSessionId, tokenPresent });
     if (connected.stale) {
       return connected;
     }
     return this.getStatus('');
   }
 
-  async poll({ scriptId, currentSessionId }) {
-    const connected = this.connect({ scriptId, currentSessionId });
+  async poll({ scriptId, currentSessionId, tokenPresent }) {
+    const connected = this.connect({ scriptId, currentSessionId, tokenPresent });
     if (connected.stale) {
       await delay(this.pollTimeoutMs);
       return [];
@@ -218,8 +247,8 @@ export class DesktopScriptBridge extends EventEmitter {
     });
   }
 
-  receiveMessages({ scriptId, currentSessionId, messages = [] }) {
-    const connected = this.connect({ scriptId, currentSessionId });
+  receiveMessages({ scriptId, currentSessionId, tokenPresent, messages = [] }) {
+    const connected = this.connect({ scriptId, currentSessionId, tokenPresent });
     if (connected.stale) {
       return { ok: false, stale: true, received: 0 };
     }
@@ -240,6 +269,7 @@ export class DesktopScriptBridge extends EventEmitter {
     }
     this.scriptId = null;
     this.currentSessionId = null;
+    this.scriptTokenPresent = null;
     this.lastSeenAt = 0;
     this.pendingCommands = [];
     for (const poll of this.activePolls.values()) {
@@ -249,8 +279,17 @@ export class DesktopScriptBridge extends EventEmitter {
     this.pendingResponses.clear();
     this.pendingFetchResponses.clear();
     this.notifications = [];
+    this.unauthorizedCount = 0;
+    this.lastUnauthorizedAt = 0;
+    this.lastUnauthorizedRoute = '';
     this.resetCommandCircuit();
     return { ok: true, checkedAt: new Date().toISOString() };
+  }
+
+  recordUnauthorized(route) {
+    this.unauthorizedCount += 1;
+    this.lastUnauthorizedAt = Date.now();
+    this.lastUnauthorizedRoute = normalizeString(route);
   }
 
   receiveMessage(message) {

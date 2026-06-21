@@ -239,8 +239,16 @@ function Wait-DesktopScriptOnline {
   while ((Get-Date) -lt $deadline) {
     try {
       $lastStatus = Invoke-BridgeJson -Url "$Url/desktop/script/status" -Token $Token
-      if ($lastStatus.bridge.online -eq $true) {
+      $scriptAuth = $lastStatus.bridge.scriptAuth
+      $authHealthy = if ($null -eq $scriptAuth) { $true } else { [bool]$scriptAuth.healthy }
+      if ($lastStatus.bridge.online -eq $true -and $authHealthy) {
         return $lastStatus
+      }
+      if ($lastStatus.bridge.online -eq $true -and -not $authHealthy) {
+        $lastStatus = @{
+          error = 'desktop script bridge auth unhealthy'
+          bridge = $lastStatus.bridge
+        }
       }
     } catch {
       $lastStatus = @{ error = $_.Exception.Message }

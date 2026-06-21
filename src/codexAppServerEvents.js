@@ -1,5 +1,6 @@
 import { sanitize } from './codexProtocolUtils.js';
 import { createLiveActivityEntry, normalizeLiveActivityKind } from './codexLiveActivity.js';
+import { classifyCodexClientNotice, createCodexClientNoticeEntry } from './codexClientNotices.js';
 
 export class CodexAppServerEventConverter {
   constructor() {
@@ -30,12 +31,15 @@ export class CodexAppServerEventConverter {
 
     if (method === 'turn/completed') {
       const status = String(params?.turn?.status ?? params?.status ?? 'completed');
+      const notice = status === 'failed' ? classifyCodexClientNotice(params, { source: 'turn/completed' }) : null;
       events.push({
         type: status === 'failed' ? 'codex.turn.failed' : 'codex.turn.completed',
-        entry: systemEntry(status === 'failed' ? extractError(params) : 'Codex 已完成本轮回复'),
+        entry: notice
+          ? createCodexClientNoticeEntry(params, { notice })
+          : systemEntry(status === 'failed' ? extractError(params) : 'Codex 已完成本轮回复'),
         terminal: true,
         failed: status === 'failed',
-        payload: sanitize(message)
+        payload: notice ? { ...sanitize(message), notice } : sanitize(message)
       });
     }
 
@@ -149,16 +153,30 @@ export class CodexAppServerEventConverter {
     }
 
     if (method === 'error') {
+      const notice = classifyCodexClientNotice(params, { source: 'app-server/error' });
       events.push({
         type: 'codex.error',
-        entry: systemEntry(extractError(params)),
+        entry: notice
+          ? createCodexClientNoticeEntry(params, { notice })
+          : systemEntry(extractError(params)),
         terminal: true,
         failed: true,
-        payload: sanitize(message)
+        payload: notice ? { ...sanitize(message), notice } : sanitize(message)
       });
     }
 
     if (events.length === 0 && method) {
+      const notice = classifyCodexClientNotice(message, { source: method });
+      if (notice) {
+        events.push({
+          type: notice.severity === 'info' ? 'codex.client_notice' : 'codex.client_error',
+          entry: createCodexClientNoticeEntry(message, { notice }),
+          terminal: notice.severity === 'error',
+          failed: notice.severity === 'error',
+          payload: { ...sanitize(message), notice }
+        });
+        return events;
+      }
       events.push({
         type: 'codex.notification',
         payload: sanitize(message)

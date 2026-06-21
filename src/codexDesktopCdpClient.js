@@ -42,6 +42,19 @@ export class CodexDesktopCdpClient {
     return this.withCdpReconnectRetry(operation, { retries: isRetryableHostCommand(command) ? 1 : 0 });
   }
 
+  async fetchAuthenticatedPath(urlPath, options = {}) {
+    const operation = async () => {
+      await this.ensureConnected();
+      const result = await this.evaluate(authenticatedPathFetchExpression(urlPath, options), options.timeoutMs ?? this.timeoutMs);
+      if (result?.requestOk !== true) {
+        const statusText = result?.status ? `HTTP ${result.status}: ` : '';
+        throw new Error(`${statusText}${result?.error ?? 'Codex 桌面已登录态请求失败'}`);
+      }
+      return result.body;
+    };
+    return this.withCdpReconnectRetry(operation, { retries: 1 });
+  }
+
   async probe() {
     return this.request('thread/list', {
       limit: 1,
@@ -485,6 +498,80 @@ function hostFetchExpression(command, params) {
   }).catch((error) => {
     cleanup();
     resolve({ ok: false, error: String(error), command, requestId });
+  });
+}))()
+`;
+}
+
+function authenticatedPathFetchExpression(urlPath, options = {}) {
+  const method = String(options.method ?? 'GET').toUpperCase();
+  const headers = {
+    'OAI-Language': String(options.language ?? 'zh-CN'),
+    originator: 'Codex Desktop',
+    ...(options.headers && typeof options.headers === 'object' ? options.headers : {})
+  };
+  const body = options.body === undefined ? null : JSON.stringify(options.body);
+  const timeoutMs = Math.max(1000, Number.parseInt(String(options.timeoutMs ?? process.env.CODEX_DESKTOP_FETCH_TIMEOUT_MS ?? '10000'), 10) || 10000);
+  return `
+(() => new Promise((resolve) => {
+  if (!window.electronBridge || typeof window.electronBridge.sendMessageFromView !== 'function') {
+    resolve({ requestOk: false, error: 'Codex 桌面 fetch 通道不可用' });
+    return;
+  }
+  const requestId = 'desktop-auth-fetch-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+  const timeout = setTimeout(() => {
+    cleanup();
+    resolve({ requestOk: false, error: '等待 Codex 桌面用量接口响应超时', requestId });
+  }, ${timeoutMs});
+  const handler = (event) => {
+    const data = event.data;
+    if (!data || data.type !== 'fetch-response' || data.requestId !== requestId) {
+      return;
+    }
+    cleanup();
+    if (data.responseType === 'success') {
+      let body = null;
+      try {
+        body = data.bodyJsonString ? JSON.parse(data.bodyJsonString) : null;
+      } catch {
+        resolve({ requestOk: false, status: data.status, error: 'Codex 桌面返回了非 JSON 数据', requestId });
+        return;
+      }
+      if (Number(data.status) >= 200 && Number(data.status) < 300) {
+        resolve({ requestOk: true, status: data.status, body, requestId });
+        return;
+      }
+      resolve({
+        requestOk: false,
+        status: data.status,
+        body,
+        error: body?.error?.message || body?.message || data.bodyJsonString || 'Codex 用量接口返回错误',
+        requestId
+      });
+      return;
+    }
+    resolve({
+      requestOk: false,
+      status: data.status,
+      error: data.error || data.bodyJsonString || 'Codex 桌面 fetch 请求失败',
+      requestId
+    });
+  };
+  const cleanup = () => {
+    clearTimeout(timeout);
+    window.removeEventListener('message', handler);
+  };
+  window.addEventListener('message', handler);
+  window.electronBridge.sendMessageFromView({
+    type: 'fetch',
+    requestId,
+    method: ${JSON.stringify(method)},
+    url: ${JSON.stringify(urlPath)},
+    headers: ${JSON.stringify(headers)}${body === null ? '' : `,
+    body: ${JSON.stringify(body)}`}
+  }).catch((error) => {
+    cleanup();
+    resolve({ requestOk: false, error: String(error), requestId });
   });
 }))()
 `;

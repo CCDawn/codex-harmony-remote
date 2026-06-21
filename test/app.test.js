@@ -9,7 +9,7 @@ import { MockCodexAdapter } from '../src/mockCodexAdapter.js';
 import { DiagnosticLogger } from '../src/diagnosticLogger.js';
 import { CodexSessionStore } from '../src/codexSessions.js';
 import { desktopScriptBridge } from '../src/desktopScriptBridge.js';
-import { extractAccountUsageFromDesktopSnapshot } from '../src/codexAccountUsage.js';
+import { extractAccountUsageFromDesktopSnapshot, extractAccountUsageFromUsageApi } from '../src/codexAccountUsage.js';
 
 function createTestConfig() {
   const sessionSettingsById = new Map();
@@ -192,12 +192,12 @@ test('interrupts a running desktop-backed task through the task API', async () =
     assert.equal(interrupted.task.status, 'running');
     assert.equal(interrupted.task.interruptRequested, true);
     assert.equal(interrupted.task.interruptDispatching, true);
+    assert.equal(interrupted.task.interruptState, 'dispatching');
     const finalTask = await waitForTaskStatus(store, created.task.id, 'interrupted');
     assert.equal(finalTask.error, '已中断当前会话');
-    assert.deepEqual(adapter.interrupted, {
-      threadId: '019e-interrupt-thread',
-      turnId: 'turn-interrupt-1'
-    });
+    assert.equal(adapter.interrupted.threadId, '019e-interrupt-thread');
+    assert.equal(adapter.interrupted.turnId, 'turn-interrupt-1');
+    assert.equal(adapter.interrupted.status, 'interrupted');
     assert.ok(store.getTask(created.task.id).events.some((event) => event.type === 'task.interrupted'));
   } finally {
     server.close();
@@ -250,12 +250,12 @@ test('interrupts a running task by Codex session id', async () => {
     assert.equal(interrupted.run.status, 'running');
     assert.equal(interrupted.run.interruptRequested, true);
     assert.equal(interrupted.run.interruptDispatching, true);
+    assert.equal(interrupted.run.interruptState, 'dispatching');
     const finalTask = await waitForTaskStatus(store, created.task.id, 'interrupted');
     assert.equal(finalTask.error, '已中断当前会话');
-    assert.deepEqual(adapter.interrupted, {
-      threadId: '019e-interrupt-thread',
-      turnId: 'turn-interrupt-1'
-    });
+    assert.equal(adapter.interrupted.threadId, '019e-interrupt-thread');
+    assert.equal(adapter.interrupted.turnId, 'turn-interrupt-1');
+    assert.equal(adapter.interrupted.status, 'interrupted');
   } finally {
     server.close();
   }
@@ -294,6 +294,8 @@ test('acknowledges slow Codex interrupts before desktop dispatch finishes', asyn
     const interrupted = await interruptResponse.json();
     assert.equal(interrupted.task.status, 'running');
     assert.equal(interrupted.task.interruptRequested, true);
+    assert.equal(interrupted.task.interruptDispatching, true);
+    assert.equal(interrupted.task.interruptState, 'dispatching');
     await until(() => adapter.interruptStarted);
     assert.equal(adapter.interruptStarted, true);
     assert.equal(adapter.interrupted, null);
@@ -301,17 +303,74 @@ test('acknowledges slow Codex interrupts before desktop dispatch finishes', asyn
     adapter.releaseInterrupt();
     const finalTask = await waitForTaskStatus(store, created.task.id, 'interrupted');
     assert.equal(finalTask.error, '已中断当前会话');
-    assert.deepEqual(adapter.interrupted, {
-      threadId: '019e-interrupt-thread',
-      turnId: 'turn-interrupt-1'
-    });
+    assert.equal(adapter.interrupted.threadId, '019e-interrupt-thread');
+    assert.equal(adapter.interrupted.turnId, 'turn-interrupt-1');
+    assert.equal(adapter.interrupted.status, 'interrupted');
   } finally {
     server.close();
   }
 });
 
-test('confirms fast interrupt dispatch failures for mobile callers', async () => {
+test('does not report a completed task as interrupted when desktop interrupt confirmation arrives late', async () => {
   const config = createTestConfig();
+  const adapter = new CompletingBeforeInterruptAdapter();
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const createResponse = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        prompt: '中断确认迟到任务'
+      })
+    });
+    assert.equal(createResponse.status, 202);
+    const created = await createResponse.json();
+    await until(() => Boolean(store.getTask(created.task.id)?.activeCodexTurnId));
+
+    const interruptResponse = await fetch(`${baseUrl}/tasks/${created.task.id}/interrupt?confirm=1&confirmTimeoutMs=30`, {
+      method: 'POST'
+    });
+    assert.equal(interruptResponse.status, 200);
+    const interrupted = await interruptResponse.json();
+    assert.equal(interrupted.task.status, 'running');
+    assert.equal(interrupted.task.interruptState, 'dispatching');
+    await until(() => adapter.interruptStarted);
+
+    adapter.releaseRun();
+    const completed = await waitForTaskStatus(store, created.task.id, 'completed');
+    assert.equal(completed.error, null);
+
+    adapter.releaseInterrupt();
+    await until(() => store.getTask(created.task.id).events.some((event) => event.type === 'task.interrupt.late_confirm_ignored'));
+    const finalTask = store.getTask(created.task.id);
+    assert.equal(finalTask.status, 'completed');
+    assert.equal(finalTask.interruptDispatching, false);
+    assert.equal(finalTask.interruptRequested, false);
+  } finally {
+    server.close();
+  }
+});
+
+test('recovers a failed mobile interrupt when desktop later reports the same turn was aborted', async () => {
+  const config = createTestConfig();
+  let reconcileStatus = 'running';
+  const reconcileCalls = [];
+  config.interruptReconciler = async (request) => {
+    reconcileCalls.push(request);
+    return {
+      status: reconcileStatus,
+      reason: reconcileStatus === 'interrupted' ? 'turn_aborted' : 'desktop_in_progress',
+      turnId: request.activeTurnId,
+      observedAt: new Date().toISOString()
+    };
+  };
+  config.interruptReconcileTimeoutMs = 1000;
+  config.interruptReconcilePollMs = 25;
   const adapter = new FailingInterruptAdapter();
   const { server, store } = createApp({ config, adapter });
   server.listen(0, '127.0.0.1');
@@ -338,11 +397,114 @@ test('confirms fast interrupt dispatch failures for mobile callers', async () =>
     const interrupted = await interruptResponse.json();
 
     assert.equal(interrupted.task.status, 'running');
-    assert.equal(interrupted.task.interruptRequested, false);
+    assert.equal(interrupted.task.interruptRequested, true);
     assert.equal(interrupted.task.interruptDispatching, false);
-    assert.equal(interrupted.task.interruptError, 'Codex 桌面 CDP 连接错误');
-    assert.equal(interrupted.task.error, '中断失败：Codex 桌面 CDP 连接错误');
-    assert.equal(interrupted.task.latestEvent.type, 'task.interrupt.failed');
+    assert.equal(interrupted.task.interruptState, 'reconciling');
+    assert.equal(interrupted.task.interruptError, null);
+    assert.equal(interrupted.task.error, null);
+    assert.equal(interrupted.task.latestEvent.type, 'task.interrupt.reconcile_polled');
+
+    const duplicateResponse = await fetch(`${baseUrl}/tasks/${created.task.id}/interrupt?confirm=1`, {
+      method: 'POST'
+    });
+    assert.equal(duplicateResponse.status, 200);
+    assert.ok(store.getTask(created.task.id).events.some((event) => event.type === 'task.interrupt.duplicate_ignored'));
+
+    reconcileStatus = 'interrupted';
+    const finalTask = await waitForTaskStatus(store, created.task.id, 'interrupted');
+    assert.equal(finalTask.interruptError, null);
+    assert.equal(finalTask.lastInterruptFailure, null);
+    assert.ok(reconcileCalls.some((call) => call.threadId === '019e-interrupt-thread' && call.activeTurnId === 'turn-interrupt-1'));
+    assert.ok(finalTask.events.some((event) => event.type === 'task.interrupt.reconcile_confirmed'));
+  } finally {
+    server.close();
+  }
+});
+
+test('does not confirm a failed interrupt from weak thread-level interrupted state', async () => {
+  const config = createTestConfig();
+  config.interruptReconciler = async () => ({
+    status: 'interrupted',
+    reason: 'desktop_session_interrupted',
+    message: '2026-06-19T08:00:59.000Z'
+  });
+  config.interruptReconcileTimeoutMs = 40;
+  config.interruptReconcilePollMs = 25;
+  const adapter = new FailingInterruptAdapter();
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const createResponse = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        prompt: '测试弱中断确认'
+      })
+    });
+    assert.equal(createResponse.status, 202);
+    const created = await createResponse.json();
+    await until(() => Boolean(store.getTask(created.task.id)?.activeCodexTurnId));
+
+    const interruptResponse = await fetch(`${baseUrl}/tasks/${created.task.id}/interrupt?confirm=1`, {
+      method: 'POST'
+    });
+    assert.equal(interruptResponse.status, 200);
+    const interrupted = await interruptResponse.json();
+
+    assert.equal(interrupted.task.status, 'running');
+    assert.notEqual(interrupted.task.interruptState, 'confirmed');
+    assert.notEqual(interrupted.task.status, 'interrupted');
+    await until(() => store.getTask(created.task.id).events.some((event) => event.type === 'task.interrupt.recoverable_failed'));
+    const finalTask = store.getTask(created.task.id);
+    assert.equal(finalTask.status, 'running');
+    assert.equal(finalTask.interruptState, undefined);
+    assert.ok(finalTask.events.some((event) => event.type === 'task.interrupt.weak_confirm_ignored'));
+    assert.equal(finalTask.events.some((event) => event.type === 'task.interrupted'), false);
+  } finally {
+    server.close();
+  }
+});
+
+test('keeps failed interrupt dispatch recoverable when no desktop reconciliation channel is available', async () => {
+  const config = createTestConfig();
+  config.interruptReconciler = false;
+  const adapter = new FailingInterruptAdapter();
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const createResponse = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        prompt: '无法中断的长任务'
+      })
+    });
+    assert.equal(createResponse.status, 202);
+    const created = await createResponse.json();
+    await until(() => Boolean(store.getTask(created.task.id)?.activeCodexTurnId));
+
+    const interruptResponse = await fetch(`${baseUrl}/tasks/${created.task.id}/interrupt?confirm=1`, {
+      method: 'POST'
+    });
+    assert.equal(interruptResponse.status, 200);
+    const interrupted = await interruptResponse.json();
+
+    assert.equal(interrupted.task.status, 'running');
+    assert.equal(interrupted.task.interruptRequested, true);
+    assert.equal(interrupted.task.interruptDispatching, false);
+    assert.equal(interrupted.task.interruptState, 'recoverable_failed');
+    assert.equal(interrupted.task.interruptError, null);
+    assert.equal(interrupted.task.lastInterruptFailure, 'Codex 桌面 CDP 连接错误');
+    assert.equal(interrupted.task.error, null);
+    assert.equal(interrupted.task.latestEvent.type, 'task.interrupt.recoverable_failed');
   } finally {
     server.close();
   }
@@ -1217,6 +1379,111 @@ test('requires token when CODEX_BRIDGE_TOKEN is set', async () => {
   }
 });
 
+test('desktop script status exposes bridge token auth diagnostics', async () => {
+  const previous = process.env.CODEX_BRIDGE_TOKEN;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    desktopScriptBridge.reset();
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const rejected = await fetch(`${baseUrl}/desktop/script/connect`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        scriptId: 'tokenless-script',
+        currentSessionId: '019e-test-session'
+      })
+    });
+    assert.equal(rejected.status, 401);
+
+    const status = await fetch(`${baseUrl}/desktop/script/status`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(status.status, 200);
+    const body = await status.json();
+    assert.equal(body.bridge.scriptAuth.required, true);
+    assert.equal(body.bridge.scriptAuth.healthy, false);
+    assert.equal(body.bridge.scriptAuth.unauthorizedCount, 1);
+    assert.equal(body.bridge.scriptAuth.lastUnauthorizedRoute, '/desktop/script/connect');
+  } finally {
+    desktopScriptBridge.reset();
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previous);
+  }
+});
+
+test('system link status degrades when desktop script bridge auth is failing but CDP is ready', async () => {
+  const previous = process.env.CODEX_BRIDGE_TOKEN;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  const config = createTestConfig();
+  config.sessions = {
+    async listSessions() {
+      return [{ id: '019e-test-session' }];
+    }
+  };
+  config.linkRelayProbeProvider = async () => ({
+    ok: true,
+    severity: 'ok',
+    message: 'relay ok'
+  });
+  config.linkHdcProbeProvider = async () => ({
+    ok: true,
+    severity: 'ok',
+    message: 'hdc ok'
+  });
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: true,
+        status: sessionId ? 'verified' : 'ready',
+        currentSessionId: sessionId || null,
+        targetSessionId: sessionId,
+        sessionVerified: Boolean(sessionId),
+        transport: 'cdp',
+        message: 'CDP ready'
+      };
+    },
+    async run() {
+      throw new Error('should not create task');
+    }
+  };
+  const { server } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    desktopScriptBridge.reset();
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const rejected = await fetch(`${baseUrl}/desktop/script/poll`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scriptId: 'tokenless-script' })
+    });
+    assert.equal(rejected.status, 401);
+
+    const status = await fetch(`${baseUrl}/system/link/status?sessionId=019e-test-session`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(status.status, 200);
+    const body = await status.json();
+    assert.equal(body.link.desktop.desktopLive, true);
+    assert.equal(body.link.desktop.sessionVerified, true);
+    assert.equal(body.link.severity, 'degraded');
+    assert.equal(body.link.recommendedAction, 'reconnect_desktop_script');
+    assert.equal(body.link.script.scriptAuth.healthy, false);
+    assert.match(body.link.message, /脚本桥认证异常/);
+  } finally {
+    desktopScriptBridge.reset();
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previous);
+  }
+});
+
 test('redacts query tokens from bridge request logs', async () => {
   const previousToken = process.env.CODEX_BRIDGE_TOKEN;
   const previousLogDir = process.env.CODEX_BRIDGE_LOG_DIR;
@@ -1425,6 +1692,65 @@ test('exposes official Codex thread API for new phone conversations', async () =
   }
 });
 
+test('exposes Codex thread sync API with file cursors', async () => {
+  const config = createTestConfig();
+  const seen = {};
+  config.threadService = {
+    async listThreads() {
+      return [];
+    },
+    async syncThread(threadId, params) {
+      seen.threadId = threadId;
+      seen.params = params;
+      return {
+        id: threadId,
+        title: '同步会话',
+        updatedAt: '2026-06-16T00:00:00Z',
+        detailAvailable: true,
+        filePath: 'C:\\sessions\\rollout.jsonl',
+        entries: [{
+          timestamp: '2026-06-16T00:00:01Z',
+          type: 'event_msg',
+          role: 'assistant',
+          text: '增量回复',
+          syncId: '10:20:assistant:event_msg:0',
+          syncStartOffset: 10,
+          syncEndOffset: 20
+        }],
+        entryCount: 1,
+        sync: {
+          mode: 'after',
+          source: 'session-file',
+          filePath: 'C:\\sessions\\rollout.jsonl',
+          fileSize: 20,
+          fileUpdatedAt: '2026-06-16T00:00:01Z',
+          cursorStart: '10',
+          cursorEnd: '20',
+          hasMoreBefore: true,
+          hasMoreAfter: false,
+          entryCount: 1
+        }
+      };
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/threads/019e-sync-thread/sync?limit=40&after=123`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(seen.threadId, '019e-sync-thread');
+    assert.deepEqual(seen.params, { limit: '40', after: '123', before: '' });
+    assert.equal(body.session.sync.cursorEnd, '20');
+    assert.equal(body.session.entries[0].text, '增量回复');
+  } finally {
+    server.close();
+  }
+});
+
 test('persists per-session reasoning effort settings', async () => {
   const config = createTestConfig();
   config.defaultReasoningEffortProvider = async () => 'xhigh';
@@ -1575,6 +1901,41 @@ test('does not classify context usage or prose urls as account usage', () => {
   assert.deepEqual(usage.items, []);
 });
 
+test('does not classify session text and API documentation URLs as account usage', () => {
+  const usage = extractAccountUsageFromDesktopSnapshot({
+    title: 'Codex',
+    location: 'app://codex/thread',
+    accountContext: true,
+    lines: [
+      '置顶 agent论文与项目管理 1 天 Codex 远程部署 / 鸿蒙远程操作 对齐智谱套餐抢购需求 2 天',
+      'developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs/'
+    ]
+  }, { checkedAt: '2026-06-14T00:00:00.000Z' });
+
+  assert.equal(usage.ok, false);
+  assert.equal(usage.status, 'unavailable');
+  assert.equal(usage.source, 'codex_desktop_usage_panel');
+  assert.deepEqual(usage.items, []);
+});
+
+test('does not classify OpenAI help article titles as account usage', () => {
+  const usage = extractAccountUsageFromDesktopSnapshot({
+    title: 'Codex',
+    location: 'app://codex/thread',
+    accountContext: true,
+    lines: [
+      'Using Credits for Flexible Usage',
+      'Using Codex with your ChatGPT plan',
+      'help.openai.com/en/articles/12642688-using-credits-for-flexible-usage-in-chatgpt-freegopluspro',
+      'help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan'
+    ]
+  }, { checkedAt: '2026-06-14T00:00:00.000Z' });
+
+  assert.equal(usage.ok, false);
+  assert.equal(usage.status, 'unavailable');
+  assert.deepEqual(usage.items, []);
+});
+
 test('classifies Codex account usage only when account UI context is present', () => {
   const usage = extractAccountUsageFromDesktopSnapshot({
     title: 'Codex',
@@ -1589,8 +1950,69 @@ test('classifies Codex account usage only when account UI context is present', (
 
   assert.equal(usage.ok, true);
   assert.equal(usage.status, 'available');
+  assert.equal(usage.source, 'codex_desktop_usage_panel');
   assert.equal(usage.planName, 'Codex Pro plan');
   assert.equal(usage.balanceText, 'Remaining credits 88%');
+});
+
+test('extracts real Codex account usage from the authenticated desktop usage API', () => {
+  const usage = extractAccountUsageFromUsageApi({
+    plan_type: 'pro',
+    credits: {
+      has_credits: true,
+      unlimited: false,
+      balance: '123.45'
+    },
+    spend_control: {
+      individual_limit: {
+        used_percent: 12,
+        remaining_percent: 88,
+        used: '12',
+        limit: '100',
+        reset_at: '2026-06-30T16:00:00.000Z'
+      }
+    },
+    rate_limit: {
+      primary_window: {
+        used_percent: 20,
+        limit_window_seconds: 18000,
+        reset_at: '2026-06-17T18:00:00.000Z'
+      },
+      secondary_window: {
+        used_percent: 40,
+        limit_window_seconds: 604800,
+        reset_at: '2026-06-24T18:00:00.000Z'
+      }
+    },
+    additional_rate_limits: [{
+      limit_name: 'gpt-5.5-codex',
+      rate_limit: {
+        primary_window: {
+          used_percent: 70,
+          limit_window_seconds: 86400,
+          reset_at: '2026-06-18T18:00:00.000Z'
+        }
+      }
+    }]
+  }, { checkedAt: '2026-06-17T00:00:00.000Z' });
+
+  assert.equal(usage.ok, true);
+  assert.equal(usage.source, 'codex_desktop_authenticated_usage_api');
+  assert.equal(usage.planName, 'Pro');
+  assert.equal(usage.items.some((item) => item.label === '月度限制' && item.value.includes('剩余 88%')), true);
+  assert.equal(usage.items.some((item) => item.label === '5小时限制' && item.value.includes('已用 20%')), true);
+  assert.equal(usage.items.some((item) => item.label === '每周限制' && item.value.includes('剩余 60%')), true);
+  assert.equal(usage.items.some((item) => item.label === 'gpt-5.5-codex' && item.value.includes('已用 70%')), true);
+  assert.equal(usage.items.some((item) => item.kind === 'balance' && item.value === '余额 123.45'), true);
+});
+
+test('reports unavailable when the authenticated usage API has no usable fields', () => {
+  const usage = extractAccountUsageFromUsageApi({}, { checkedAt: '2026-06-17T00:00:00.000Z' });
+
+  assert.equal(usage.ok, false);
+  assert.equal(usage.status, 'unavailable');
+  assert.equal(usage.source, 'codex_desktop_authenticated_usage_api');
+  assert.deepEqual(usage.items, []);
 });
 
 test('sends existing phone thread messages through the desktop-backed task path', async () => {
@@ -1817,7 +2239,7 @@ test('rejects existing phone thread messages without a session fingerprint', asy
   }
 });
 
-test('queues existing phone thread messages and reports desktop verification failure in task status', async () => {
+test('rejects existing phone thread messages before creating a task when desktop is not verified', async () => {
   const config = createTestConfig();
   config.threadService = new FakeThreadService();
   config.sessions = new FakeSessionVerifier();
@@ -1862,19 +2284,69 @@ test('queues existing phone thread messages and reports desktop verification fai
     });
 
     const body = await response.json();
-    assert.equal(response.status, 202);
-    assert.equal(body.run.codexSessionId, '019e-test-session');
-    assert.equal(store.listTasks().length, 1);
+    assert.equal(response.status, 503);
+    assert.match(body.error, /桌面端未确认当前会话/);
+    assert.equal(body.desktop.targetSessionId, '019e-test-session');
+    assert.equal(body.desktop.required, 'desktop_live_verified_session');
+    assert.equal(body.preflight.canSend, false);
+    assert.equal(body.preflight.recommendedAction, 'soft_recover_live_host');
+    assert.equal(store.listTasks().length, 0);
     assert.equal(config.threadService.sentMessages.length, 0);
-    const task = await waitForTaskStatus(store, body.run.id, 'failed');
-    assert.match(task.error, /桌面端未确认当前会话/);
     assert.equal(adapter.checkedSessionId, '019e-test-session');
   } finally {
     server.close();
   }
 });
 
-test('returns an existing phone thread task before slow desktop verification finishes', async () => {
+test('rejects existing phone thread messages when desktop live is on a different session', async () => {
+  const config = createTestConfig();
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: true,
+        status: 'unverified',
+        message: '桌面当前会话不是手机目标会话',
+        currentSessionId: '019e-other-session',
+        targetSessionId: sessionId,
+        sessionVerified: false
+      };
+    },
+    async run() {
+      throw new Error('should not run when desktop session is mismatched');
+    }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '继续',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 409);
+    assert.match(body.error, /桌面端未确认当前会话/);
+    assert.equal(body.preflight.recommendedAction, 'sync_session');
+    assert.equal(body.preflight.currentSessionId, '019e-other-session');
+    assert.equal(body.preflight.targetSessionId, '019e-test-session');
+    assert.equal(store.listTasks().length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('waits for desktop verification before creating an existing phone thread task', async () => {
   const config = createTestConfig();
   config.threadService = new FakeThreadService();
   config.sessions = new FakeSessionVerifier();
@@ -1916,8 +2388,8 @@ test('returns an existing phone thread task before slow desktop verification fin
 
   try {
     const baseUrl = `http://127.0.0.1:${server.address().port}`;
-    const startedAt = Date.now();
-    const response = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+    let resolved = false;
+    const responsePromise = fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -1925,15 +2397,20 @@ test('returns an existing phone thread task before slow desktop verification fin
         text: '继续',
         sessionFingerprint: testSessionFingerprint()
       })
+    }).then((response) => {
+      resolved = true;
+      return response;
     });
-    const elapsedMs = Date.now() - startedAt;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(resolved, false);
+    assert.equal(store.listTasks().length, 0);
+    releaseVerification();
+    const response = await responsePromise;
     const body = await response.json();
 
     assert.equal(response.status, 202);
     assert.equal(body.run.codexSessionId, '019e-test-session');
-    assert.equal(elapsedMs < 1000, true);
-    assert.equal(store.getTask(body.run.id).status, 'running');
-    releaseVerification();
+    assert.match(store.getTask(body.run.id).status, /^(running|completed)$/);
     await waitForTaskStatus(store, body.run.id, 'completed');
   } finally {
     server.close();
@@ -2081,12 +2558,13 @@ test('reports soft recovery failure without running an existing phone thread tas
     });
     const body = await response.json();
 
-    assert.equal(response.status, 202);
-    assert.equal(body.run.codexSessionId, '019e-test-session');
-    const task = await waitForTaskStatus(store, body.run.id, 'failed');
+    assert.equal(response.status, 503);
+    assert.match(body.error, /桌面端未确认当前会话/);
+    assert.equal(body.preflight.recommendedAction, 'desktop_cdp_restart_required');
+    assert.equal(body.preflight.requiresHardRecovery, true);
+    assert.match(body.preflight.recoveryError, /软恢复已停止/);
+    assert.equal(store.listTasks().length, 0);
     assert.equal(recoverCalled, true);
-    assert.match(task.error, /桌面端未确认当前会话/);
-    assert.match(task.verifiedDesktopStatus.recoveryError, /软恢复已停止/);
   } finally {
     server.close();
   }
@@ -2627,6 +3105,66 @@ test('system link status reports HDC degradation without blocking desktop sessio
   }
 });
 
+test('system link status treats local HDC shell readiness as usable even when public relay pairing is idle', async () => {
+  const config = createTestConfig();
+  config.sessions = {
+    async listSessions() {
+      return [{ id: '019e-test-session', title: 'Test Session' }];
+    }
+  };
+  config.linkRelayProbeProvider = async () => ({
+    ok: true,
+    bridgeOnline: true,
+    hdcActive: false,
+    phoneWaiting: false,
+    pcWaiting: false,
+    message: '公网 bridge 正常，无线 HDC 未配对'
+  });
+  config.linkHdcProbeProvider = async () => ({
+    ok: true,
+    proxyListening: true,
+    connected: true,
+    shellReady: true,
+    message: 'HDC proxy 已连接且 shell 可用'
+  });
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: true,
+        status: 'verified',
+        message: '桌面实时通道已连接',
+        currentSessionId: sessionId,
+        targetSessionId: sessionId,
+        sessionVerified: true
+      };
+    },
+    async run() {
+      throw new Error('should not create task');
+    }
+  };
+
+  const { server } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/system/link/status?sessionId=019e-test-session`);
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.link.severity, 'ok');
+    assert.equal(body.link.ok, true);
+    assert.equal(body.link.recommendedAction, 'none');
+    assert.equal(body.link.hdc.localHdcUsable, true);
+    assert.equal(body.link.relay.publicRelayPaired, false);
+    assert.equal(body.link.relay.publicRelayRecoverable, true);
+  } finally {
+    server.close();
+  }
+});
+
 test('system link recover refuses to auto-restart Codex when CDP requires hard recovery', async () => {
   const config = createTestConfig();
   let recovered = false;
@@ -2840,7 +3378,9 @@ class InterruptibleAdapter {
   async interrupt({ task, emit }) {
     this.interrupted = {
       threadId: task.codexSessionId,
-      turnId: task.activeCodexTurnId
+      turnId: task.activeCodexTurnId,
+      status: 'interrupted',
+      observedAt: new Date().toISOString()
     };
     emit('codex.app_server.turn.interrupted', this.interrupted);
     this.releaseRun?.();
@@ -2861,6 +3401,50 @@ class SlowInterruptibleAdapter extends InterruptibleAdapter {
       this.releaseInterrupt = resolve;
     });
     return super.interrupt({ task, emit });
+  }
+}
+
+class CompletingBeforeInterruptAdapter extends InterruptibleAdapter {
+  constructor() {
+    super();
+    this.interruptStarted = false;
+    this.releaseInterrupt = null;
+    this.releaseRun = null;
+  }
+
+  async run({ emit }) {
+    emit('codex.app_server.thread.ready', {
+      threadId: '019e-interrupt-thread'
+    });
+    emit('codex.app_server.turn.started', {
+      turn: {
+        id: 'turn-interrupt-1'
+      }
+    });
+    await new Promise((resolve) => {
+      this.releaseRun = resolve;
+    });
+    return {
+      summary: 'completed before late interrupt confirmation',
+      changedFiles: [],
+      tests: [],
+      exitCode: 0
+    };
+  }
+
+  async interrupt({ task, emit }) {
+    this.interruptStarted = true;
+    await new Promise((resolve) => {
+      this.releaseInterrupt = resolve;
+    });
+    this.interrupted = {
+      threadId: task.codexSessionId,
+      turnId: task.activeCodexTurnId,
+      status: 'interrupted',
+      observedAt: new Date().toISOString()
+    };
+    emit('codex.app_server.turn.interrupted', this.interrupted);
+    return { ok: true };
   }
 }
 

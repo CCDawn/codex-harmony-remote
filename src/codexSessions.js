@@ -6,13 +6,15 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createLiveActivityEntry } from './codexLiveActivity.js';
+import { classifyCodexClientNotice, createCodexClientNoticeEntry } from './codexClientNotices.js';
 import { normalizeModelId, normalizeReasoningEffort } from './sessionSettingsStore.js';
 
 const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex');
 const MAX_VISIBLE_MESSAGE_LENGTH = 20000;
 const ACTIVITY_TAIL_BYTES = 1024 * 1024;
+const SESSION_DETAIL_FULL_READ_LIMIT_BYTES = 32 * 1024 * 1024;
+const SESSION_DETAIL_TAIL_BYTES = 8 * 1024 * 1024;
 const RECENT_ASSISTANT_PROGRESS_WINDOW_MS = 10 * 60 * 1000;
-const TOOL_OUTPUT_SETTLE_WINDOW_MS = 15 * 1000;
 
 export class CodexSessionStore {
   constructor(options = {}) {
@@ -22,6 +24,11 @@ export class CodexSessionStore {
     this.stateDbPath = path.join(this.codexHome, 'state_5.sqlite');
     this.sessionsRoot = path.join(this.codexHome, 'sessions');
     this.mobileImagesDir = options.mobileImagesDir ?? path.join(process.cwd(), 'logs', 'mobile-images');
+    this.sessionDetailFullReadLimitBytes = positiveNumber(
+      options.sessionDetailFullReadLimitBytes,
+      SESSION_DETAIL_FULL_READ_LIMIT_BYTES
+    );
+    this.sessionDetailTailBytes = positiveNumber(options.sessionDetailTailBytes, SESSION_DETAIL_TAIL_BYTES);
   }
 
   async listSessions({ limit = 50, query = '' } = {}) {
@@ -73,6 +80,7 @@ export class CodexSessionStore {
         const fileUpdatedAtMs = Number(fileInfo?.updatedAtMs ?? 0);
         const updatedAtMs = fileUpdatedAtMs > 0 ? fileUpdatedAtMs : desktopUpdatedAtMs;
         const activity = summarizeSessionActivity(fileInfo?.path ?? '');
+        const runtime = createSessionRuntimeSnapshot(activity, fileUpdatedAtMs > 0 ? 'session-file' : 'desktop-sidebar');
         return {
           id,
           title,
@@ -82,9 +90,10 @@ export class CodexSessionStore {
           projectRoot,
           projectLabel: projectRoot.length > 0 ? projectLabelForRoot(projectRoot, sidebarState.workspaceLabels) : '未归类',
           source: 'desktop-sidebar',
-          activitySource: fileUpdatedAtMs > 0 ? 'session-file' : 'desktop-sidebar',
-          activityStatus: activity.status,
-          activityUpdatedAt: activity.updatedAt,
+          activitySource: runtime.runtimeSource,
+          activityStatus: runtime.runtimeState,
+          activityUpdatedAt: runtime.runtimeUpdatedAt,
+          ...runtime,
           lastVisibleRole: activity.lastVisibleRole,
           pinned: sidebarState.pinnedThreadIds.has(id),
           hasUserEvent: Number(row.has_user_event ?? 0) === 1,
@@ -143,6 +152,14 @@ export class CodexSessionStore {
         projectRoot: '',
         projectLabel: '未归类',
         source: 'session-index',
+        activitySource: 'unknown',
+        activityStatus: 'idle',
+        activityUpdatedAt: '',
+        runtimeState: 'idle',
+        runtimeSource: 'unknown',
+        runtimeUpdatedAt: '',
+        canInterrupt: false,
+        terminalReason: '',
         pinned: false,
         detailAvailable: true
       }));
@@ -218,27 +235,157 @@ export class CodexSessionStore {
       };
     }
 
-    const lines = await readAllLines(filePath);
+    const lines = await readSessionDetailLines(filePath, {
+      fullReadLimitBytes: this.sessionDetailFullReadLimitBytes,
+      tailBytes: this.sessionDetailTailBytes
+    });
     const records = parseSessionRecordLines(lines);
     const visibleTail = clampLimit(tail, 200);
-    const parsedEntries = parseSessionRecords(records, { mobileImagesDir: this.mobileImagesDir });
     const stat = await fs.stat(filePath).catch(() => null);
     const activity = summarizeActivityRecords(records, {
       fileUpdatedAtMs: Number(stat?.mtimeMs ?? 0)
     });
+    const activeTurnStartedAt = latestVisibleUserTimestamp(records, { mobileImagesDir: this.mobileImagesDir });
+    const parsedEntries = parseSessionRecords(records, {
+      mobileImagesDir: this.mobileImagesDir,
+      pendingToolCallsActive: activity.status === 'running',
+      pendingToolCallsActiveAfter: activeTurnStartedAt
+    });
+    const hasDetailActivity = activity.updatedAt.length > 0 || activity.status !== 'idle';
     const liveActivity = activity.status === 'running'
-      ? summarizeLiveActivityFromRecords(records, { threadId: sessionId })
+      ? summarizeLiveActivityFromRecords(records, { threadId: sessionId, afterTimestamp: activeTurnStartedAt })
       : null;
     const entries = appendLiveActivityEntry(parsedEntries.slice(-visibleTail), liveActivity);
+    const effectiveActivity = hasDetailActivity
+      ? activity
+      : {
+          status: summary.runtimeState ?? summary.activityStatus ?? activity.status,
+          updatedAt: summary.runtimeUpdatedAt ?? summary.activityUpdatedAt ?? activity.updatedAt,
+          terminalReason: summary.terminalReason ?? activity.terminalReason ?? ''
+        };
+    const runtime = createSessionRuntimeSnapshot(
+      effectiveActivity,
+      hasDetailActivity ? 'session-file' : (summary.runtimeSource ?? summary.activitySource ?? 'unknown')
+    );
     return {
       ...summary,
-      activityStatus: summary.activityStatus ?? activity.status,
-      activityUpdatedAt: summary.activityUpdatedAt ?? activity.updatedAt,
-      lastVisibleRole: summary.lastVisibleRole ?? activity.lastVisibleRole,
+      activityStatus: runtime.runtimeState,
+      activityUpdatedAt: runtime.runtimeUpdatedAt,
+      ...runtime,
+      lastVisibleRole: hasDetailActivity ? activity.lastVisibleRole : (summary.lastVisibleRole ?? activity.lastVisibleRole),
       detailAvailable: true,
       filePath,
       entries,
       entryCount: entries.length
+    };
+  }
+
+  async getSessionSync(sessionId, { limit = 80, after = '', before = '' } = {}) {
+    if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+      const error = new Error('Invalid Codex session id');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const sessions = await this.listSessions({ limit: 1000 });
+    const summary = sessions.find((candidate) => candidate.id === sessionId) ?? {
+      id: sessionId,
+      title: '未命名会话',
+      updatedAt: '',
+      detailAvailable: false
+    };
+    const filePath = await this.findSessionFile(sessionId);
+    if (!filePath) {
+      return {
+        ...summary,
+        filePath: '',
+        detailAvailable: false,
+        entries: [{
+          timestamp: new Date().toISOString(),
+          type: 'missing_session_file',
+          role: 'system',
+          text: '这个会话仍在 Codex 桌面侧栏数据库中，但本地会话文件已经不存在或已被归档，暂时无法在手机端读取历史内容。'
+        }],
+        entryCount: 1,
+        sync: createEmptySessionSync({ mode: 'missing' })
+      };
+    }
+
+    const pageLimit = clampLimit(limit, 200);
+    const afterOffset = parseSyncOffset(after);
+    const beforeOffset = parseSyncOffset(before);
+    const mode = afterOffset !== null ? 'after' : (beforeOffset !== null ? 'before' : 'recent');
+    let page = await readSessionSyncLinePage(filePath, {
+      mode,
+      limit: pageLimit,
+      afterOffset,
+      beforeOffset,
+      fullReadLimitBytes: this.sessionDetailFullReadLimitBytes,
+      tailBytes: this.sessionDetailTailBytes
+    });
+    if (mode === 'recent') {
+      page = await expandRecentSyncPageToUserAnchor(filePath, page, {
+        limit: pageLimit,
+        tailBytes: this.sessionDetailTailBytes,
+        fullReadLimitBytes: this.sessionDetailFullReadLimitBytes,
+        mobileImagesDir: this.mobileImagesDir
+      });
+    }
+    const records = parseSessionRecordLineEntries(page.lineEntries);
+    const activity = summarizeActivityRecords(records, {
+      fileUpdatedAtMs: Number(page.stat?.mtimeMs ?? 0)
+    });
+    const fullActivity = mode === 'after'
+      ? summarizeSessionActivity(filePath)
+      : activity;
+    const activeTurnStartedAt = latestVisibleUserTimestamp(records, { mobileImagesDir: this.mobileImagesDir });
+    const parsedEntries = parseSessionRecords(records, {
+      mobileImagesDir: this.mobileImagesDir,
+      pendingToolCallsActive: mode !== 'before' && fullActivity.status === 'running',
+      pendingToolCallsActiveAfter: activeTurnStartedAt
+    });
+    const visibleEntries = trimEntriesForSyncPage(parsedEntries, pageLimit, mode);
+    const hasTrimmedAfterEntries = mode === 'after' && parsedEntries.length > visibleEntries.length;
+    const hasDetailActivity = fullActivity.updatedAt.length > 0 || fullActivity.status !== 'idle';
+    const liveActivity = mode !== 'before' && fullActivity.status === 'running'
+      ? summarizeLiveActivityFromRecords(records, { threadId: sessionId, afterTimestamp: activeTurnStartedAt })
+      : null;
+    const entries = mode === 'before'
+      ? visibleEntries
+      : appendLiveActivityEntry(visibleEntries, liveActivity);
+    const sync = createSessionSync({
+      mode,
+      filePath,
+      stat: page.stat,
+      lineEntries: page.lineEntries,
+      entries,
+      afterOffset,
+      beforeOffset,
+      hasMoreBefore: page.hasMoreBefore,
+      hasMoreAfter: page.hasMoreAfter || hasTrimmedAfterEntries
+    });
+    const effectiveActivity = hasDetailActivity
+      ? fullActivity
+      : {
+          status: summary.runtimeState ?? summary.activityStatus ?? fullActivity.status,
+          updatedAt: summary.runtimeUpdatedAt ?? summary.activityUpdatedAt ?? fullActivity.updatedAt,
+          terminalReason: summary.terminalReason ?? fullActivity.terminalReason ?? ''
+        };
+    const runtime = createSessionRuntimeSnapshot(
+      effectiveActivity,
+      hasDetailActivity ? 'session-file' : (summary.runtimeSource ?? summary.activitySource ?? 'unknown')
+    );
+    return {
+      ...summary,
+      activityStatus: runtime.runtimeState,
+      activityUpdatedAt: runtime.runtimeUpdatedAt,
+      ...runtime,
+      lastVisibleRole: hasDetailActivity ? fullActivity.lastVisibleRole : (summary.lastVisibleRole ?? fullActivity.lastVisibleRole),
+      detailAvailable: true,
+      filePath,
+      entries,
+      entryCount: entries.length,
+      sync
     };
   }
 
@@ -555,6 +702,14 @@ async function readJsonl(filePath) {
   return records;
 }
 
+function positiveNumber(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 async function readDesktopSidebarState(filePath) {
   let parsed = {};
   try {
@@ -733,6 +888,7 @@ function summarizeSessionActivity(filePath) {
     return {
       status: 'idle',
       updatedAt: '',
+      terminalReason: '',
       lastVisibleRole: ''
     };
   }
@@ -747,9 +903,40 @@ function summarizeSessionActivity(filePath) {
     return {
       status: 'idle',
       updatedAt: '',
+      terminalReason: '',
       lastVisibleRole: ''
     };
   }
+}
+
+function createSessionRuntimeSnapshot(activity = {}, source = 'unknown') {
+  const runtimeState = normalizeSessionRuntimeState(activity.status);
+  return {
+    runtimeState,
+    runtimeSource: String(source || 'unknown'),
+    runtimeUpdatedAt: String(activity.updatedAt ?? ''),
+    canInterrupt: runtimeState === 'running',
+    terminalReason: normalizeTerminalReason(activity.terminalReason, runtimeState)
+  };
+}
+
+function normalizeSessionRuntimeState(status) {
+  const normalized = String(status ?? '').trim().toLowerCase();
+  if (normalized === 'running' || normalized === 'waiting_approval' || normalized === 'interrupted' || normalized === 'failed' || normalized === 'completed') {
+    return normalized;
+  }
+  return 'idle';
+}
+
+function normalizeTerminalReason(reason, runtimeState) {
+  const normalized = String(reason ?? '').trim().toLowerCase();
+  if (normalized === 'completed' || normalized === 'interrupted' || normalized === 'failed') {
+    return normalized;
+  }
+  if (runtimeState === 'completed' || runtimeState === 'interrupted' || runtimeState === 'failed') {
+    return runtimeState;
+  }
+  return '';
 }
 
 function summarizeActivityRecords(records, options = {}) {
@@ -805,27 +992,18 @@ function summarizeActivityRecords(records, options = {}) {
       }
     }
   }
-  const lastTerminalAt = latestTimestamp(lastTaskCompleteAt, lastAssistantFinalAt, lastTurnAbortedAt);
+  const terminal = latestTerminalRecord([
+    { status: 'completed', at: lastTaskCompleteAt },
+    { status: 'completed', at: lastAssistantFinalAt },
+    { status: 'interrupted', at: lastTurnAbortedAt }
+  ]);
+  const lastTerminalAt = terminal?.at ?? '';
   const taskIsOpen = lastTaskStartedAt && (!lastTerminalAt || lastTaskStartedAt > lastTerminalAt);
   if (taskIsOpen) {
     const lastOpenActivityAt = latestTimestamp(lastWorkStartedAt, lastAssistantProgressAt, lastVisibleAt);
     const outputIsLatestOpenActivity = lastToolOutputAt
       && lastToolOutputAt >= lastOpenActivityAt
       && (!lastTerminalAt || lastToolOutputAt > lastTerminalAt);
-    if (outputIsLatestOpenActivity && !isRecentToolOutputSettling(lastToolOutputAt, options)) {
-      if (lastAssistantProgressAt && (!lastUserAt || lastAssistantProgressAt > lastUserAt)) {
-        return {
-          status: 'completed',
-          updatedAt: lastToolOutputAt,
-          lastVisibleRole
-        };
-      }
-      return {
-        status: 'idle',
-        updatedAt: lastToolOutputAt,
-        lastVisibleRole
-      };
-    }
     const taskActivityAt = outputIsLatestOpenActivity
       ? lastToolOutputAt
       : latestTimestamp(lastTaskStartedAt, lastAssistantProgressAt, lastWorkStartedAt);
@@ -833,6 +1011,7 @@ function summarizeActivityRecords(records, options = {}) {
       return {
         status: 'running',
         updatedAt: taskActivityAt,
+        terminalReason: '',
         lastVisibleRole
       };
     }
@@ -847,6 +1026,20 @@ function summarizeActivityRecords(records, options = {}) {
     return {
       status: 'running',
       updatedAt: lastAssistantProgressAt,
+      terminalReason: '',
+      lastVisibleRole
+    };
+  }
+  const lastPostTerminalActivityAt = latestTimestamp(lastAssistantProgressAt, lastWorkStartedAt, lastToolOutputAt);
+  if (
+    lastTerminalAt &&
+    lastPostTerminalActivityAt > lastTerminalAt &&
+    isRecentAssistantProgress(lastPostTerminalActivityAt, options)
+  ) {
+    return {
+      status: 'running',
+      updatedAt: lastPostTerminalActivityAt,
+      terminalReason: '',
       lastVisibleRole
     };
   }
@@ -854,30 +1047,41 @@ function summarizeActivityRecords(records, options = {}) {
     return {
       status: 'running',
       updatedAt: lastAssistantProgressAt,
+      terminalReason: '',
       lastVisibleRole
     };
   }
   if (lastTerminalAt) {
     return {
-      status: 'completed',
+      status: terminal.status,
       updatedAt: lastTerminalAt,
+      terminalReason: terminal.status,
       lastVisibleRole
     };
   }
   return {
     status: 'idle',
     updatedAt: lastVisibleAt,
+    terminalReason: '',
     lastVisibleRole
   };
 }
 
-function isRecentToolOutputSettling(timestamp, options = {}) {
-  const outputMs = Date.parse(timestamp || '');
-  if (!Number.isFinite(outputMs)) {
-    return false;
+function latestTerminalRecord(candidates) {
+  let latest = null;
+  for (const candidate of candidates) {
+    const at = String(candidate.at ?? '');
+    if (!at) {
+      continue;
+    }
+    if (!latest || at > latest.at) {
+      latest = {
+        status: String(candidate.status ?? 'completed'),
+        at
+      };
+    }
   }
-  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
-  return nowMs - outputMs >= 0 && nowMs - outputMs <= TOOL_OUTPUT_SETTLE_WINDOW_MS;
+  return latest;
 }
 
 function isRecentAssistantProgress(timestamp, options = {}) {
@@ -948,6 +1152,166 @@ async function readAllLines(filePath) {
   return raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
 }
 
+async function readAllLineEntries(filePath) {
+  const buffer = await fs.readFile(filePath);
+  return splitBufferLineEntries(buffer, 0);
+}
+
+async function readSessionDetailLines(filePath, options = {}) {
+  const fullReadLimitBytes = positiveNumber(options.fullReadLimitBytes, SESSION_DETAIL_FULL_READ_LIMIT_BYTES);
+  const tailBytes = positiveNumber(options.tailBytes, SESSION_DETAIL_TAIL_BYTES);
+  const stat = await fs.stat(filePath);
+  if (stat.size <= fullReadLimitBytes) {
+    return readAllLines(filePath);
+  }
+
+  const bytesToRead = Math.min(stat.size, tailBytes);
+  const startsInMiddle = stat.size > bytesToRead;
+  const raw = readFileTail(filePath, bytesToRead);
+  const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (startsInMiddle && lines.length > 0) {
+    lines.shift();
+  }
+  return lines;
+}
+
+async function readSessionSyncLinePage(filePath, options = {}) {
+  const stat = await fs.stat(filePath);
+  const mode = options.mode ?? 'recent';
+  const limit = clampLimit(options.limit, 200);
+  const fullReadLimitBytes = positiveNumber(options.fullReadLimitBytes, SESSION_DETAIL_FULL_READ_LIMIT_BYTES);
+  const tailBytes = positiveNumber(options.tailBytes, SESSION_DETAIL_TAIL_BYTES);
+
+  if (mode === 'after') {
+    const afterOffset = Math.min(Math.max(0, Number(options.afterOffset ?? 0)), stat.size);
+    const lineEntries = await readLineEntriesAfterOffset(filePath, afterOffset, stat.size);
+    return {
+      stat,
+      lineEntries,
+      hasMoreBefore: afterOffset > 0,
+      hasMoreAfter: false
+    };
+  }
+
+  if (mode === 'before') {
+    const beforeOffset = Math.min(Math.max(0, Number(options.beforeOffset ?? stat.size)), stat.size);
+    const lineEntries = await readLineEntriesBeforeOffset(filePath, beforeOffset, {
+      tailBytes,
+      fullReadLimitBytes,
+      limit
+    });
+    return {
+      stat,
+      lineEntries,
+      hasMoreBefore: lineEntries.length > 0 ? lineEntries[0].startOffset > 0 : beforeOffset > 0,
+      hasMoreAfter: beforeOffset < stat.size
+    };
+  }
+
+  if (stat.size <= fullReadLimitBytes) {
+    const allEntries = await readAllLineEntries(filePath);
+    const lineEntries = allEntries.slice(-Math.max(limit * 8, limit + 40));
+    return {
+      stat,
+      lineEntries,
+      hasMoreBefore: lineEntries.length > 0 && lineEntries[0].startOffset > 0,
+      hasMoreAfter: false
+    };
+  }
+
+  const bytesToRead = Math.min(stat.size, Math.min(tailBytes, Math.max(256 * 1024, limit * 64 * 1024)));
+  const startOffset = Math.max(0, stat.size - bytesToRead);
+  const buffer = Buffer.alloc(bytesToRead);
+  const handle = await fs.open(filePath, 'r');
+  try {
+    await handle.read(buffer, 0, bytesToRead, startOffset);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  const lineEntries = splitBufferLineEntries(buffer, startOffset);
+  if (startOffset > 0 && lineEntries.length > 0) {
+    lineEntries.shift();
+  }
+  return {
+    stat,
+    lineEntries: lineEntries.slice(-Math.max(limit * 8, limit + 40)),
+    hasMoreBefore: lineEntries.length > 0 ? lineEntries[0].startOffset > 0 : startOffset > 0,
+    hasMoreAfter: false
+  };
+}
+
+async function readLineEntriesAfterOffset(filePath, afterOffset, fileSize) {
+  if (!Number.isFinite(afterOffset) || afterOffset >= fileSize) {
+    return [];
+  }
+  const byteLength = fileSize - afterOffset;
+  const buffer = Buffer.alloc(byteLength);
+  const handle = await fs.open(filePath, 'r');
+  try {
+    await handle.read(buffer, 0, byteLength, afterOffset);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  return splitBufferLineEntries(buffer, afterOffset);
+}
+
+async function readLineEntriesBeforeOffset(filePath, beforeOffset, options = {}) {
+  if (!Number.isFinite(beforeOffset) || beforeOffset <= 0) {
+    return [];
+  }
+  const fullReadLimitBytes = positiveNumber(options.fullReadLimitBytes, SESSION_DETAIL_FULL_READ_LIMIT_BYTES);
+  const tailBytes = positiveNumber(options.tailBytes, SESSION_DETAIL_TAIL_BYTES);
+  const limit = clampLimit(options.limit, 200);
+  const bytesToRead = beforeOffset <= fullReadLimitBytes
+    ? beforeOffset
+    : Math.min(beforeOffset, Math.min(tailBytes, Math.max(256 * 1024, limit * 64 * 1024)));
+  const startOffset = Math.max(0, beforeOffset - bytesToRead);
+  const buffer = Buffer.alloc(bytesToRead);
+  const handle = await fs.open(filePath, 'r');
+  try {
+    await handle.read(buffer, 0, bytesToRead, startOffset);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  const lineEntries = splitBufferLineEntries(buffer, startOffset)
+    .filter((entry) => entry.endOffset <= beforeOffset);
+  if (startOffset > 0 && lineEntries.length > 0) {
+    lineEntries.shift();
+  }
+  return lineEntries.slice(-Math.max(limit * 8, limit + 40));
+}
+
+function splitBufferLineEntries(buffer, startOffset) {
+  const entries = [];
+  let lineStart = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    if (buffer[index] !== 0x0a) {
+      continue;
+    }
+    const lineEnd = index > lineStart && buffer[index - 1] === 0x0d ? index - 1 : index;
+    const line = buffer.toString('utf8', lineStart, lineEnd);
+    if (line.trim().length > 0) {
+      entries.push({
+        line,
+        startOffset: startOffset + lineStart,
+        endOffset: startOffset + index + 1
+      });
+    }
+    lineStart = index + 1;
+  }
+  if (lineStart < buffer.length) {
+    const line = buffer.toString('utf8', lineStart);
+    if (line.trim().length > 0) {
+      entries.push({
+        line,
+        startOffset: startOffset + lineStart,
+        endOffset: startOffset + buffer.length
+      });
+    }
+  }
+  return entries;
+}
+
 function parseSessionLines(lines, options = {}) {
   return parseSessionRecords(parseSessionRecordLines(lines), options);
 }
@@ -966,19 +1330,255 @@ function parseSessionRecordLines(lines) {
   return records;
 }
 
+function parseSessionRecordLineEntries(lineEntries) {
+  const records = [];
+  for (const entry of lineEntries) {
+    let record = null;
+    try {
+      record = JSON.parse(entry.line);
+    } catch {
+      continue;
+    }
+    Object.defineProperty(record, '__syncStartOffset', {
+      value: entry.startOffset,
+      enumerable: false
+    });
+    Object.defineProperty(record, '__syncEndOffset', {
+      value: entry.endOffset,
+      enumerable: false
+    });
+    records.push(record);
+  }
+  return records;
+}
+
 function parseSessionRecords(records, options = {}) {
   const entries = [];
-  for (const record of records) {
+  for (const [recordIndex, record] of records.entries()) {
     const summarized = summarizeRecord(record, options);
     const recordEntries = Array.isArray(summarized) ? summarized : [summarized];
-    for (const entry of recordEntries) {
+    for (const [entryIndex, entry] of recordEntries.entries()) {
       if (!entry) {
         continue;
       }
-      entries.push(entry);
+      entries.push(decorateSessionEntrySync(entry, record, recordIndex, entryIndex));
     }
   }
-  return compactToolStatusRuns(dedupeAdjacentMessages(entries));
+  const assignedEntries = assignSessionEntrySyncIds(compactToolStatusRuns(dedupeAdjacentMessages(entries), {
+    pendingToolCallsActive: options.pendingToolCallsActive !== false,
+    pendingToolCallsActiveAfter: options.pendingToolCallsActiveAfter ?? ''
+  }));
+  return dedupeStableSyncIdEntries(assignedEntries);
+}
+
+function decorateSessionEntrySync(entry, record, recordIndex, entryIndex) {
+  const startOffset = Number(record.__syncStartOffset);
+  const endOffset = Number(record.__syncEndOffset);
+  if (!Number.isFinite(startOffset) || !Number.isFinite(endOffset)) {
+    return entry;
+  }
+  return {
+    ...entry,
+    syncStartOffset: startOffset,
+    syncEndOffset: endOffset,
+    syncRecordIndex: recordIndex,
+    syncEntryIndex: entryIndex
+  };
+}
+
+function assignSessionEntrySyncIds(entries) {
+  return entries.map((entry, index) => {
+    if (entry.syncId) {
+      return entry;
+    }
+    const startOffset = Number(entry.syncStartOffset);
+    const endOffset = Number(entry.syncEndOffset);
+    if (Number.isFinite(startOffset) && Number.isFinite(endOffset)) {
+      return {
+        ...entry,
+        syncId: `${startOffset}:${endOffset}:${entry.role}:${entry.type}:${entry.itemId ?? entry.syncEntryIndex ?? index}`
+      };
+    }
+    const hash = crypto.createHash('sha1')
+      .update(`${entry.timestamp}|${entry.role}|${entry.type}|${entry.itemId ?? ''}|${entry.text ?? ''}`)
+      .digest('hex')
+      .slice(0, 16);
+    return {
+      ...entry,
+      syncId: `entry:${hash}`
+    };
+  });
+}
+
+function dedupeStableSyncIdEntries(entries) {
+  const deduped = [];
+  const indexes = new Map();
+  for (const entry of entries) {
+    const syncId = String(entry.syncId ?? '');
+    if (!syncId.startsWith('generated-image:')) {
+      deduped.push(entry);
+      continue;
+    }
+    const existingIndex = indexes.get(syncId);
+    if (existingIndex === undefined) {
+      indexes.set(syncId, deduped.length);
+      deduped.push(entry);
+      continue;
+    }
+    const preferred = preferredGeneratedImageEntry(deduped[existingIndex], entry);
+    if (preferred === entry) {
+      deduped.splice(existingIndex, 1);
+      for (const [key, index] of indexes.entries()) {
+        if (index > existingIndex) {
+          indexes.set(key, index - 1);
+        }
+      }
+      indexes.set(syncId, deduped.length);
+      deduped.push(entry);
+      continue;
+    }
+    deduped[existingIndex] = preferred;
+  }
+  return deduped;
+}
+
+function preferredGeneratedImageEntry(left, right) {
+  const leftRank = visibleMessageSourceRank(left);
+  const rightRank = visibleMessageSourceRank(right);
+  if (rightRank > leftRank) {
+    return right;
+  }
+  if (rightRank === leftRank && String(right.text ?? '').length >= String(left.text ?? '').length) {
+    return right;
+  }
+  return left;
+}
+
+function trimEntriesForSyncPage(entries, limit, mode) {
+  const max = clampLimit(limit, 200);
+  if (mode === 'recent') {
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      if (entries[index]?.role !== 'user') {
+        continue;
+      }
+      const anchored = entries.slice(index);
+      if (anchored.length <= max * 2) {
+        return anchored;
+      }
+      const recent = entries.slice(-(max - 1));
+      return [entries[index], ...recent];
+    }
+    return entries.slice(-max);
+  }
+  if (entries.length <= max) {
+    return entries;
+  }
+  return mode === 'after' ? entries.slice(0, max) : entries.slice(-max);
+}
+
+async function expandRecentSyncPageToUserAnchor(filePath, page, options = {}) {
+  let lineEntries = page.lineEntries ?? [];
+  if (!page.hasMoreBefore || hasVisibleUserLineEntry(lineEntries, options)) {
+    return page;
+  }
+
+  const limit = clampLimit(options.limit, 200);
+  const baseTailBytes = positiveNumber(options.tailBytes, SESSION_DETAIL_TAIL_BYTES);
+  const maxAttempts = 6;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const firstOffset = Number(lineEntries[0]?.startOffset ?? 0);
+    if (!Number.isFinite(firstOffset) || firstOffset <= 0) {
+      break;
+    }
+    const older = await readLineEntriesBeforeOffset(filePath, firstOffset, {
+      tailBytes: baseTailBytes * (2 ** attempt),
+      fullReadLimitBytes: options.fullReadLimitBytes,
+      limit
+    });
+    if (older.length === 0) {
+      continue;
+    }
+    lineEntries = mergeLineEntryPages(older, lineEntries);
+    if (hasVisibleUserLineEntry(lineEntries, options)) {
+      break;
+    }
+  }
+
+  return {
+    ...page,
+    lineEntries,
+    hasMoreBefore: lineEntries.length > 0 ? lineEntries[0].startOffset > 0 : page.hasMoreBefore
+  };
+}
+
+function mergeLineEntryPages(left, right) {
+  const seen = new Set();
+  const merged = [];
+  for (const entry of [...left, ...right]) {
+    const key = `${entry.startOffset}:${entry.endOffset}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged.sort((a, b) => Number(a.startOffset) - Number(b.startOffset));
+}
+
+function hasVisibleUserLineEntry(lineEntries, options = {}) {
+  return latestVisibleUserTimestamp(parseSessionRecordLineEntries(lineEntries), options).length > 0;
+}
+
+function createSessionSync({ mode, filePath, stat, lineEntries, entries, afterOffset = null, beforeOffset = null, hasMoreBefore = false, hasMoreAfter = false }) {
+  const visibleEntries = entries.filter((entry) => entry.type !== 'live_activity');
+  const firstVisible = visibleEntries.find((entry) => Number.isFinite(Number(entry.syncStartOffset)));
+  const lastVisible = [...visibleEntries].reverse().find((entry) => Number.isFinite(Number(entry.syncEndOffset)));
+  const fileSize = Number(stat?.size ?? 0);
+  const cursorStart = Number(firstVisible?.syncStartOffset);
+  const cursorEnd = Number(lastVisible?.syncEndOffset);
+  const fallbackStart = lineEntries.length > 0 ? Number(lineEntries[0].startOffset) : (beforeOffset ?? afterOffset ?? fileSize);
+  const fallbackEnd = lineEntries.length > 0 ? Number(lineEntries.at(-1).endOffset) : (afterOffset ?? beforeOffset ?? fileSize);
+  return {
+    mode,
+    source: 'session-file',
+    filePath,
+    fileSize,
+    snapshotFileSize: fileSize,
+    pageDirection: mode,
+    fileUpdatedAt: new Date(Number(stat?.mtimeMs ?? 0)).toISOString(),
+    cursorStart: String(Number.isFinite(cursorStart) ? cursorStart : fallbackStart),
+    cursorEnd: String(mode === 'after' && visibleEntries.length === 0
+      ? Math.max(fileSize, Number(afterOffset ?? 0))
+      : (Number.isFinite(cursorEnd) ? cursorEnd : fallbackEnd)),
+    hasMoreBefore: Boolean((hasMoreBefore || (Number.isFinite(cursorStart) ? cursorStart > 0 : fallbackStart > 0))
+      && (Number.isFinite(cursorStart) ? cursorStart > 0 : fallbackStart > 0)),
+    hasMoreAfter: Boolean(hasMoreAfter),
+    entryCount: entries.length
+  };
+}
+
+function createEmptySessionSync({ mode = 'empty' } = {}) {
+  return {
+    mode,
+    source: 'session-file',
+    filePath: '',
+    fileSize: 0,
+    fileUpdatedAt: '',
+    cursorStart: '0',
+    cursorEnd: '0',
+    hasMoreBefore: false,
+    hasMoreAfter: false,
+    entryCount: 0
+  };
+}
+
+function parseSyncOffset(value) {
+  const text = String(value ?? '').trim();
+  if (text.length === 0) {
+    return null;
+  }
+  const parsed = Number.parseInt(text, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function appendLiveActivityEntry(entries, liveActivity) {
@@ -991,7 +1591,12 @@ function appendLiveActivityEntry(entries, liveActivity) {
 
 function summarizeLiveActivityFromRecords(records, options = {}) {
   let latest = null;
+  const afterTimestamp = String(options.afterTimestamp ?? '');
   for (const record of records) {
+    const timestamp = String(record.timestamp ?? '');
+    if (afterTimestamp.length > 0 && timestamp.length > 0 && timestamp < afterTimestamp) {
+      continue;
+    }
     const entry = summarizeLiveActivityRecord(record, options);
     if (entry) {
       latest = entry;
@@ -1110,6 +1715,9 @@ function dedupeAdjacentMessages(entries) {
       previous.timestamp = merged.timestamp;
       previous.type = merged.type;
       previous.text = merged.text;
+      if (Number.isFinite(Number(entry.syncEndOffset))) {
+        previous.syncEndOffset = entry.syncEndOffset;
+      }
       continue;
     }
     deduped.push(entry);
@@ -1117,14 +1725,14 @@ function dedupeAdjacentMessages(entries) {
   return deduped;
 }
 
-function compactToolStatusRuns(entries) {
+function compactToolStatusRuns(entries, options = {}) {
   const compacted = [];
   let toolRun = [];
   const flushToolRun = () => {
     if (toolRun.length === 0) {
       return;
     }
-    const summarized = summarizeToolRun(toolRun);
+    const summarized = summarizeToolRun(toolRun, options);
     if (summarized) {
       compacted.push(summarized);
     }
@@ -1143,7 +1751,7 @@ function compactToolStatusRuns(entries) {
   return compacted;
 }
 
-function summarizeToolRun(entries) {
+function summarizeToolRun(entries, options = {}) {
   if (entries.length === 0) {
     return null;
   }
@@ -1159,10 +1767,56 @@ function summarizeToolRun(entries) {
       timestamp: last.timestamp,
       type: 'tool_result',
       role: 'tool',
-      text: details.length > 0 ? `${summary}\n\n${details}` : summary
+      text: details.length > 0 ? `${summary}\n\n${details}` : summary,
+      syncStartOffset: entries[0].syncStartOffset,
+      syncEndOffset: last.syncEndOffset
     };
   }
+  if (!shouldKeepPendingToolRunActive(last, options)) {
+    return summarizeStalePendingToolRun(entries);
+  }
   return last;
+}
+
+function shouldKeepPendingToolRunActive(lastEntry, options = {}) {
+  if (options.pendingToolCallsActive === false) {
+    return false;
+  }
+  const activeAfter = String(options.pendingToolCallsActiveAfter ?? '');
+  if (activeAfter.length === 0) {
+    return true;
+  }
+  const timestamp = String(lastEntry?.timestamp ?? '');
+  return timestamp.length === 0 || timestamp >= activeAfter;
+}
+
+function summarizeStalePendingToolRun(entries) {
+  const last = entries.at(-1);
+  if (!last || last.type !== 'tool_call') {
+    return last ?? null;
+  }
+  const command = commandFromToolCallText(last.text);
+  const detail = command.length > 0 ? `\n\n${command}` : '';
+  return {
+    ...last,
+    type: 'tool_result',
+    role: 'tool',
+    text: `命令未返回，已停止跟踪${detail}`
+  };
+}
+
+function latestVisibleUserTimestamp(records, options = {}) {
+  let latest = '';
+  for (const record of records) {
+    const summarized = summarizeRecord(record, options);
+    const entries = Array.isArray(summarized) ? summarized : [summarized];
+    for (const entry of entries) {
+      if (entry?.role === 'user' && String(entry.timestamp ?? '').length > 0) {
+        latest = String(entry.timestamp);
+      }
+    }
+  }
+  return latest;
 }
 
 function isCompletedToolResultEntry(entry) {
@@ -1229,14 +1883,18 @@ function isDuplicateVisibleMessage(left, right) {
   if (leftText === rightText) {
     return true;
   }
-  if (left.timestamp && right.timestamp && left.timestamp === right.timestamp) {
+  if (isDuplicateMessageSourcePair(left, right) && areMessageTimestampsClose(left.timestamp, right.timestamp)) {
     return leftText.includes(rightText) || rightText.includes(leftText);
   }
   return false;
 }
 
 function mergeVisibleMessages(left, right) {
-  const richer = String(right.text ?? '').length > String(left.text ?? '').length ? right : left;
+  const leftTextLength = String(left.text ?? '').length;
+  const rightTextLength = String(right.text ?? '').length;
+  const richer = rightTextLength > leftTextLength
+    ? right
+    : (rightTextLength === leftTextLength && visibleMessageSourceRank(right) > visibleMessageSourceRank(left) ? right : left);
   return {
     timestamp: right.timestamp || left.timestamp,
     type: richer.type || right.type || left.type,
@@ -1245,13 +1903,50 @@ function mergeVisibleMessages(left, right) {
 }
 
 function normalizeMessageForDedupe(value) {
-  return String(value ?? '').replace(/\s+/g, ' ').trim();
+  return stripDedupeOnlyBlocks(value).replace(/\s+/g, ' ').trim();
+}
+
+function stripDedupeOnlyBlocks(value) {
+  return String(value ?? '')
+    .replace(/<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>/gi, '')
+    .replace(/<citation_entries>[\s\S]*?<\/citation_entries>/gi, '')
+    .replace(/<rollout_ids>[\s\S]*?<\/rollout_ids>/gi, '');
+}
+
+function isDuplicateMessageSourcePair(left, right) {
+  if (left.type === right.type) {
+    return false;
+  }
+  return visibleMessageSourceRank(left) > 0 && visibleMessageSourceRank(right) > 0;
+}
+
+function visibleMessageSourceRank(entry) {
+  if (entry.type === 'response_item') {
+    return 2;
+  }
+  if (entry.type === 'event_msg') {
+    return 1;
+  }
+  return 0;
+}
+
+function areMessageTimestampsClose(leftTimestamp, rightTimestamp) {
+  const left = Date.parse(String(leftTimestamp ?? ''));
+  const right = Date.parse(String(rightTimestamp ?? ''));
+  if (!Number.isFinite(left) || !Number.isFinite(right)) {
+    return false;
+  }
+  return Math.abs(left - right) <= 2000;
 }
 
 function summarizeRecord(record, options = {}) {
   const timestamp = String(record.timestamp ?? '');
   const type = String(record.type ?? 'unknown');
   const payload = record.payload ?? {};
+  const noticeEntry = summarizeCodexClientNoticeRecord(record, options);
+  if (noticeEntry) {
+    return noticeEntry;
+  }
 
   if (type === 'event_msg' && payload.type === 'user_message') {
     const text = extractTextElements(payload);
@@ -1285,6 +1980,10 @@ function summarizeRecord(record, options = {}) {
       role: 'assistant',
       text: truncate(visibleText, MAX_VISIBLE_MESSAGE_LENGTH)
     };
+  }
+
+  if (type === 'event_msg' && payload.type === 'image_generation_end') {
+    return createGeneratedImageEntry({ timestamp, type, payload, options });
   }
 
   if (type === 'response_item') {
@@ -1333,9 +2032,41 @@ function summarizeRecord(record, options = {}) {
         text: summary || '正在思考'
       };
     }
+    if (itemType === 'image_generation_call') {
+      return createGeneratedImageEntry({ timestamp, type, payload, options });
+    }
   }
 
   return null;
+}
+
+function summarizeCodexClientNoticeRecord(record, options = {}) {
+  const timestamp = String(record.timestamp ?? '');
+  const type = String(record.type ?? '');
+  const payload = record.payload ?? {};
+  const payloadType = String(payload.type ?? payload.event ?? payload.kind ?? '');
+  const method = String(payload.method ?? record.method ?? payload.params?.method ?? '');
+  const sourceText = `${type} ${payloadType} ${method}`.toLowerCase();
+  const shouldInspect = /error|failed|failure|exception|status|notification|compaction|compact|client|app_server|desktop|rate|quota|capacity|auth/.test(sourceText)
+    || (type === 'response_item' && /error|status/.test(String(payload.type ?? '').toLowerCase()));
+  if (!shouldInspect) {
+    return null;
+  }
+  const notice = classifyCodexClientNotice({
+    ...payload,
+    method,
+    source: 'session-file',
+    payload
+  });
+  if (!notice) {
+    return null;
+  }
+  return createCodexClientNoticeEntry(payload, {
+    notice,
+    timestamp: timestamp || new Date().toISOString(),
+    threadId: options.threadId ?? '',
+    itemId: String(payload.id ?? payload.itemId ?? payload.item_id ?? method ?? '')
+  });
 }
 
 function isTurnAbortedRecord(record) {
@@ -1410,7 +2141,7 @@ function materializeImageItemForMobile(item, mobileImagesDir = '') {
   const base64 = String(item.base64 ?? '').trim();
   if (base64.length > 0) {
     const mimeType = String(item.mimeType ?? item.mime_type ?? 'image/png').trim() || 'image/png';
-    return materializeImageDataUrlForMobile(`data:${mimeType};base64,${base64}`, mobileImagesDir);
+    return materializeImageBase64ForMobile(base64, mobileImagesDir, { mimeType });
   }
   return '';
 }
@@ -1420,13 +2151,25 @@ function materializeImageDataUrlForMobile(imageUrl, mobileImagesDir = '') {
   if (!parsed) {
     return '';
   }
-  const bytes = Buffer.from(parsed.base64, 'base64');
+  return materializeImageBase64ForMobile(parsed.base64, mobileImagesDir, { extension: parsed.extension });
+}
+
+function materializeImageBase64ForMobile(base64, mobileImagesDir = '', options = {}) {
+  const normalizedBase64 = String(base64 ?? '').replace(/\s+/g, '');
+  if (normalizedBase64.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(normalizedBase64)) {
+    return '';
+  }
+  const bytes = Buffer.from(normalizedBase64, 'base64');
   if (bytes.length === 0 || bytes.length > 20 * 1024 * 1024) {
     return '';
   }
   const uploadDir = path.resolve(mobileImagesDir || path.join(process.cwd(), 'logs', 'mobile-images'));
   const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 24);
-  const filePath = path.join(uploadDir, `desktop-${hash}.${parsed.extension}`);
+  const extension = String(options.extension ?? '').trim()
+    || (String(options.mimeType ?? '').trim().length > 0 ? imageExtensionForMime(options.mimeType) : '')
+    || inferImageExtensionFromBytes(bytes)
+    || 'png';
+  const filePath = path.join(uploadDir, `desktop-${hash}.${extension}`);
   try {
     fsSync.mkdirSync(uploadDir, { recursive: true });
     if (!fsSync.existsSync(filePath)) {
@@ -1436,6 +2179,96 @@ function materializeImageDataUrlForMobile(imageUrl, mobileImagesDir = '') {
   } catch {
     return '';
   }
+}
+
+function summarizeGeneratedImage(payload, options = {}) {
+  const markdown = extractGeneratedImageMarkdown(payload, options.mobileImagesDir);
+  if (markdown.length === 0) {
+    return '';
+  }
+  return ['已生成图片', markdown].join('\n');
+}
+
+function createGeneratedImageEntry({ timestamp, type, payload, options = {} }) {
+  const generatedImage = summarizeGeneratedImage(payload, options);
+  if (!generatedImage) {
+    return null;
+  }
+  const identity = generatedImageSyncIdentity(payload, generatedImage);
+  return {
+    timestamp,
+    type,
+    role: 'assistant',
+    itemId: identity,
+    syncId: identity,
+    text: generatedImage
+  };
+}
+
+function generatedImageSyncIdentity(payload, markdown) {
+  const callId = String(payload?.id ?? payload?.call_id ?? payload?.callId ?? '').trim();
+  const imageKeys = [...String(markdown ?? '').matchAll(/desktop-([a-f0-9]{16,64})\.[a-z0-9]+/gi)]
+    .map((match) => match[1].toLowerCase());
+  const imageKey = imageKeys.length > 0 ? imageKeys.join('-') : crypto.createHash('sha1').update(String(markdown ?? '')).digest('hex').slice(0, 16);
+  return `generated-image:${callId || 'unknown'}:${imageKey}`;
+}
+
+function extractGeneratedImageMarkdown(payload, mobileImagesDir = '') {
+  const candidates = collectGeneratedImageCandidates(payload?.result);
+  const markdown = [];
+  for (const candidate of candidates) {
+    let rendered = '';
+    if (candidate.kind === 'data-url') {
+      rendered = materializeImageDataUrlForMobile(candidate.value, mobileImagesDir);
+    } else if (candidate.kind === 'base64') {
+      rendered = materializeImageBase64ForMobile(candidate.value, mobileImagesDir, { mimeType: candidate.mimeType });
+    }
+    if (rendered.length > 0 && !markdown.includes(rendered)) {
+      markdown.push(rendered);
+    }
+  }
+  return markdown.join('\n');
+}
+
+function collectGeneratedImageCandidates(value, mimeType = '') {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      return [];
+    }
+    if (/^data:image\//i.test(trimmed)) {
+      return [{ kind: 'data-url', value: trimmed, mimeType }];
+    }
+    if (looksLikeBase64Image(trimmed)) {
+      return [{ kind: 'base64', value: trimmed, mimeType }];
+    }
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectGeneratedImageCandidates(item, mimeType));
+  }
+  if (!value || typeof value !== 'object') {
+    return [];
+  }
+  const nextMimeType = String(value.mimeType ?? value.mime_type ?? value.media_type ?? value.content_type ?? mimeType ?? '');
+  const direct = [
+    value.image,
+    value.image_url,
+    value.imageUrl,
+    value.data,
+    value.base64,
+    value.b64_json,
+    value.result
+  ].flatMap((item) => collectGeneratedImageCandidates(item, nextMimeType));
+  return direct;
+}
+
+function looksLikeBase64Image(value) {
+  const text = String(value ?? '').replace(/\s+/g, '');
+  if (text.length < 16 || text.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) {
+    return false;
+  }
+  return /^(iVBORw0KGgo|\/9j\/|UklGR|R0lGOD)/.test(text) || text.length > 1024;
 }
 
 function materializeLocalImageForMobile(imagePath, mobileImagesDir = '') {
@@ -1531,6 +2364,25 @@ function imageExtensionForMime(mimeType) {
     return 'webp';
   }
   if (normalized === 'image/gif') {
+    return 'gif';
+  }
+  return 'png';
+}
+
+function inferImageExtensionFromBytes(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 4) {
+    return 'png';
+  }
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return 'png';
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'jpg';
+  }
+  if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') {
+    return 'webp';
+  }
+  if (bytes.length >= 6 && bytes.toString('ascii', 0, 3) === 'GIF') {
     return 'gif';
   }
   return 'png';

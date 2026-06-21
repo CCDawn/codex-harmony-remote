@@ -24,7 +24,9 @@ export async function collectLinkHealth({
     callProbe(() => hdcProbeProvider ? hdcProbeProvider({ relayConfig }) : probeHdcState(relayConfig), fallbackHdcStatus(relayConfig))
   ]);
 
-  const action = chooseLinkAction({ desktop, sessions, relay, hdc });
+  const normalizedRelay = normalizeRelayStatus(relay);
+  const normalizedHdc = normalizeHdcStatus(hdc);
+  const action = chooseLinkAction({ desktop, sessions, relay: normalizedRelay, hdc: normalizedHdc });
   const health = {
     ok: action.severity !== 'blocked',
     checkedAt,
@@ -38,8 +40,8 @@ export async function collectLinkHealth({
     },
     desktop,
     sessions,
-    relay,
-    hdc
+    relay: normalizedRelay,
+    hdc: normalizedHdc
   };
   await writeLinkHealthLog(logger, health);
   return health;
@@ -149,6 +151,8 @@ export async function probeRelayState(relayConfig) {
       phoneWaiting,
       pcWaiting,
       hdcActive,
+      publicRelayPaired: hdcActive || phoneWaiting || pcWaiting,
+      publicRelayRecoverable: bridgeOnline,
       phones,
       pendingPc,
       activeHdc,
@@ -199,6 +203,7 @@ export async function probeHdcState(relayConfig) {
     ok,
     severity: ok ? 'ok' : proxyListening || connected ? 'degraded' : 'blocked',
     target,
+    localHdcUsable: ok,
     proxyListening,
     hdcExists,
     connected,
@@ -314,6 +319,8 @@ function fallbackRelayStatus(relayConfig) {
     relayHost: relayConfig?.relayHost ?? '',
     relayPort: relayConfig?.relayPort ?? 0,
     deviceId: relayConfig?.deviceId ?? '',
+    publicRelayPaired: false,
+    publicRelayRecoverable: false,
     message: '公网 relay 未检测'
   };
 }
@@ -323,10 +330,36 @@ function fallbackHdcStatus(relayConfig) {
     ok: false,
     severity: 'degraded',
     target: `${relayConfig?.proxyHost ?? '127.0.0.1'}:${relayConfig?.proxyPort ?? 11078}`,
+    localHdcUsable: false,
     proxyListening: false,
     connected: false,
     shellReady: false,
     message: 'HDC 未检测'
+  };
+}
+
+function normalizeRelayStatus(relay = {}) {
+  const publicRelayPaired = relay.publicRelayPaired === true
+    || relay.hdcActive === true
+    || relay.phoneWaiting === true
+    || relay.pcWaiting === true;
+  const publicRelayRecoverable = relay.publicRelayRecoverable === true
+    || relay.bridgeOnline === true
+    || (relay.ok === true && relay.stateAvailable !== false);
+  return {
+    ...relay,
+    publicRelayPaired,
+    publicRelayRecoverable
+  };
+}
+
+function normalizeHdcStatus(hdc = {}) {
+  const localHdcUsable = hdc.localHdcUsable === true
+    || hdc.shellReady === true
+    || (hdc.ok === true && hdc.connected !== false);
+  return {
+    ...hdc,
+    localHdcUsable
   };
 }
 

@@ -1,4 +1,5 @@
 import { CodexDesktopCdpClient } from './codexDesktopCdpClient.js';
+import { classifyCodexClientNotice, formatCodexClientNoticeText } from './codexClientNotices.js';
 import { CodexSessionStore } from './codexSessions.js';
 import {
   buildSessionSnapshot,
@@ -34,12 +35,24 @@ export class CodexDesktopCdpAdapter {
       options.promptMissingRetryDelayMs ?? process.env.CODEX_BRIDGE_PROMPT_MISSING_RETRY_DELAY_MS ?? '1800',
       10
     );
+    this.postSubmitAckReconcileMs = Number.parseInt(
+      options.postSubmitAckReconcileMs ?? process.env.CODEX_BRIDGE_POST_SUBMIT_ACK_RECONCILE_MS ?? '8000',
+      10
+    );
     this.interruptTurnLookupTimeoutMs = Number.parseInt(
       options.interruptTurnLookupTimeoutMs ?? process.env.CODEX_BRIDGE_INTERRUPT_TURN_LOOKUP_TIMEOUT_MS ?? '5000',
       10
     );
     this.interruptTurnLookupIntervalMs = Number.parseInt(
       options.interruptTurnLookupIntervalMs ?? process.env.CODEX_BRIDGE_INTERRUPT_TURN_LOOKUP_INTERVAL_MS ?? '500',
+      10
+    );
+    this.interruptConfirmationTimeoutMs = Number.parseInt(
+      options.interruptConfirmationTimeoutMs ?? process.env.CODEX_BRIDGE_INTERRUPT_CONFIRMATION_TIMEOUT_MS ?? '1200',
+      10
+    );
+    this.interruptConfirmationIntervalMs = Number.parseInt(
+      options.interruptConfirmationIntervalMs ?? process.env.CODEX_BRIDGE_INTERRUPT_CONFIRMATION_INTERVAL_MS ?? '200',
       10
     );
     this.notificationSubscriptions = new Map();
@@ -178,28 +191,40 @@ export class CodexDesktopCdpAdapter {
             timeoutMs: Number.parseInt(process.env.CODEX_BRIDGE_CODEX_TIMEOUT_MS ?? '3600000', 10)
           });
 
-          emit('codex.app_server.turn.completed', sanitize(completed));
-          const finalState = await this.readFinalThreadState({
+          return this.completeDesktopTurnResult({
             thread,
             task,
             completed,
             sessionFileCursor,
             emit
           });
-
-          return {
-            summary: extractLatestAgentMessage(finalState.finalTurn) || summarizeTurnStatus(finalState.finalTurn),
-            changedFiles: extractChangedFiles(finalState.finalTurn),
-            tests: [],
-            session: finalState.session,
-            exitCode: 0,
-            desktopSync: {
-              status: 'desktop_live',
-              desktopLive: true,
-              mode: task.codexSessionId ? 'resume' : 'new'
-            }
-          };
         } catch (error) {
+          if (sessionFileCursor && isRecoverablePostSubmitAckError(error)) {
+            const accepted = await this.waitForPromptPersistenceAfterAckLoss({
+              cursor: sessionFileCursor,
+              threadId: thread.id,
+              prompt: task.prompt,
+              emit
+            });
+            if (accepted) {
+              const completed = await this.waitForDesktopTurnCompletion({
+                notifications,
+                threadId: thread.id,
+                turnId: '',
+                prompt: task.prompt,
+                sessionFileCursor,
+                emit,
+                timeoutMs: Number.parseInt(process.env.CODEX_BRIDGE_CODEX_TIMEOUT_MS ?? '3600000', 10)
+              });
+              return this.completeDesktopTurnResult({
+                thread,
+                task,
+                completed,
+                sessionFileCursor,
+                emit
+              });
+            }
+          }
           if (!isPhoneMessageNotPersistedError(error) || attempt >= maxAttempts) {
             throw error;
           }
@@ -221,6 +246,30 @@ export class CodexDesktopCdpAdapter {
     }
   }
 
+  async completeDesktopTurnResult({ thread, task, completed, sessionFileCursor, emit }) {
+    emit('codex.app_server.turn.completed', sanitize(completed));
+    const finalState = await this.readFinalThreadState({
+      thread,
+      task,
+      completed,
+      sessionFileCursor,
+      emit
+    });
+
+    return {
+      summary: extractLatestAgentMessage(finalState.finalTurn) || summarizeTurnStatus(finalState.finalTurn),
+      changedFiles: extractChangedFiles(finalState.finalTurn),
+      tests: [],
+      session: finalState.session,
+      exitCode: 0,
+      desktopSync: {
+        status: 'desktop_live',
+        desktopLive: true,
+        mode: task.codexSessionId ? 'resume' : 'new'
+      }
+    };
+  }
+
   async waitForPostSubmitCompactionToSettle({ threadId, notifications, attempt, emit }) {
     const signal = detectCompactionSignalFromNotifications(notifications);
     const delayMs = Math.min(10000, Math.max(250, this.promptMissingRetryDelayMs) * attempt);
@@ -238,22 +287,132 @@ export class CodexDesktopCdpAdapter {
 
   async interrupt({ task, emit }) {
     const threadId = task.codexSessionId || task.createdCodexSessionId;
-    const turnId = task.activeCodexTurnId || await this.waitForActiveTurnId(threadId, emit);
+    const resolved = task.activeCodexTurnId
+      ? { turnId: task.activeCodexTurnId, terminal: null }
+      : await this.resolveInterruptTarget(threadId, emit);
+    const turnId = resolved.turnId;
     if (!threadId || !turnId) {
       const error = new Error('当前回合还未进入可中断阶段，请稍后重试。');
       error.statusCode = 409;
       throw error;
     }
+    if (resolved.terminal) {
+      const status = resolved.terminal.status ?? '';
+      const eventType = isInterruptedTerminalStatus(status)
+        ? 'codex.app_server.turn.interrupted'
+        : 'codex.app_server.turn.already_terminal';
+      emit(eventType, sanitize({
+        threadId,
+        turnId,
+        status,
+        source: 'pre_interrupt_terminal_read',
+        message: '桌面回合已经结束，手机端按桌面终态收敛。'
+      }));
+      return {
+        ok: true,
+        accepted: true,
+        confirmed: true,
+        threadId,
+        turnId,
+        status,
+        response: null
+      };
+    }
     const response = await this.client.request('turn/interrupt', {
       threadId,
       turnId
     });
-    emit('codex.app_server.turn.interrupted', sanitize({
+    emit('codex.app_server.turn.interrupt_accepted', sanitize({
       threadId,
       turnId,
       response
     }));
-    return response;
+    const terminal = await this.waitForTurnTerminalAfterInterrupt(threadId, turnId, emit);
+    if (terminal) {
+      const eventType = isInterruptedTerminalStatus(terminal.status)
+        ? 'codex.app_server.turn.interrupted'
+        : 'codex.app_server.turn.already_terminal';
+      emit(eventType, sanitize({
+        threadId,
+        turnId,
+        status: terminal.status,
+        response
+      }));
+      return {
+        ok: true,
+        accepted: true,
+        confirmed: true,
+        threadId,
+        turnId,
+        status: terminal.status,
+        response
+      };
+    }
+    emit('codex.app_server.turn.interrupt_pending', sanitize({
+      threadId,
+      turnId,
+      response,
+      message: '桌面已接受中断请求，尚未确认回合结束。'
+    }));
+    return {
+      ok: true,
+      accepted: true,
+      confirmed: false,
+      threadId,
+      turnId,
+      response
+    };
+  }
+
+  async resolveInterruptTarget(threadId, emit) {
+    const snapshot = await this.readLatestInterruptableTurn(threadId, emit);
+    if (snapshot?.turnId) {
+      return snapshot;
+    }
+    const turnId = await this.waitForActiveTurnId(threadId, emit);
+    return { turnId, terminal: null };
+  }
+
+  async readLatestInterruptableTurn(threadId, emit) {
+    if (!threadId) {
+      return { turnId: '', terminal: null };
+    }
+    try {
+      const detail = await this.client.request('thread/read', {
+        threadId,
+        includeTurns: true
+      });
+      const turns = Array.isArray(detail?.thread?.turns) ? detail.thread.turns : [];
+      for (let index = turns.length - 1; index >= 0; index -= 1) {
+        const turn = turns[index];
+        const turnId = String(turn?.id ?? '');
+        if (!turnId) {
+          continue;
+        }
+        if (isDesktopRuntimeInProgress(turn?.status)) {
+          emit('codex.app_server.turn.active_found_for_interrupt', {
+            threadId,
+            turnId,
+            source: 'thread_read_snapshot'
+          });
+          return { turnId, terminal: null };
+        }
+        if (isTurnTerminalForInterrupt(turn?.status)) {
+          emit('codex.app_server.turn.terminal_found_for_interrupt', {
+            threadId,
+            turnId,
+            status: turn.status
+          });
+          return { turnId, terminal: turn };
+        }
+      }
+    } catch (error) {
+      emit('codex.app_server.turn.interrupt_target_lookup_failed', {
+        threadId,
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+    return { turnId: '', terminal: null };
   }
 
   async waitForActiveTurnId(threadId, emit) {
@@ -312,6 +471,46 @@ export class CodexDesktopCdpAdapter {
       });
     }
     return '';
+  }
+
+  async waitForTurnTerminalAfterInterrupt(threadId, turnId, emit) {
+    const timeoutMs = Math.max(0, this.interruptConfirmationTimeoutMs);
+    const intervalMs = Math.max(100, this.interruptConfirmationIntervalMs);
+    const startedAt = Date.now();
+    let attempt = 0;
+
+    do {
+      attempt += 1;
+      try {
+        const detail = await this.client.request('thread/read', {
+          threadId,
+          includeTurns: true
+        });
+        const turn = findTurn(detail.thread, turnId);
+        if (turn && isTurnTerminalForInterrupt(turn.status)) {
+          emit('codex.app_server.turn.interrupt_confirmed', {
+            threadId,
+            turnId,
+            status: turn.status,
+            attempt
+          });
+          return turn;
+        }
+      } catch (error) {
+        emit('codex.app_server.turn.interrupt_confirmation_failed', {
+          threadId,
+          turnId,
+          attempt,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        break;
+      }
+      await sleep(intervalMs);
+    } while (Date.now() - startedAt < timeoutMs);
+
+    return null;
   }
 
   markSafeToFallback(error, turnSubmitted) {
@@ -477,6 +676,8 @@ export class CodexDesktopCdpAdapter {
     let lastReadAt = 0;
     let lastFilePollAt = 0;
     let lastPollFailureMessage = '';
+    let latestOfficialTurnStatus = '';
+    let latestOfficialThreadStatus = '';
     let promptPersisted = false;
     const emitPromptPersisted = (source, extra = {}) => {
       if (promptPersisted) {
@@ -496,6 +697,22 @@ export class CodexDesktopCdpAdapter {
         const newNotifications = notifications.slice(observedNotificationCount);
         observedNotificationCount = notifications.length;
         lastActivityAt = Date.now();
+        const clientNotice = findCodexClientNoticeFromDesktopNotifications(newNotifications);
+        if (clientNotice) {
+          const eventType = clientNotice.notice.severity === 'info'
+            ? 'codex.desktop_live.client_notice'
+            : 'codex.desktop_live.client_error';
+          emit(eventType, {
+            threadId,
+            turnId,
+            method: clientNotice.message.method ?? '',
+            notice: clientNotice.notice,
+            message: clientNotice.notice.title
+          });
+          if (clientNotice.notice.severity === 'error') {
+            throw createCodexClientNoticeError(clientNotice.notice);
+          }
+        }
         const userMessage = findPromptUserMessageNotification(newNotifications, { threadId, turnId, prompt });
         if (userMessage) {
           emitPromptPersisted('notification', {
@@ -532,6 +749,8 @@ export class CodexDesktopCdpAdapter {
           turnId,
           prompt,
           emit,
+          officialTurnStatus: latestOfficialTurnStatus,
+          officialThreadStatus: latestOfficialThreadStatus,
           onActivity: (activity) => {
             const activityMs = Date.parse(String(activity?.timestamp ?? ''));
             if (!Number.isFinite(activityMs)) {
@@ -553,6 +772,8 @@ export class CodexDesktopCdpAdapter {
             includeTurns: true
           });
           const polledTurn = findTurn(detail.thread, turnId);
+          latestOfficialTurnStatus = normalizeDesktopRuntimeStatus(polledTurn?.status ?? '');
+          latestOfficialThreadStatus = normalizeDesktopRuntimeStatus(detail.thread?.status ?? '');
           if (turnHasPromptUserMessage(polledTurn, prompt)) {
             emitPromptPersisted('thread_read_poll');
           }
@@ -601,7 +822,9 @@ export class CodexDesktopCdpAdapter {
         threadId,
         turnId,
         prompt,
-        emit
+        emit,
+        officialTurnStatus: latestOfficialTurnStatus,
+        officialThreadStatus: latestOfficialThreadStatus
       });
       if (finalFileCompleted) {
         return finalFileCompleted;
@@ -610,7 +833,68 @@ export class CodexDesktopCdpAdapter {
     throw new Error('等待 Codex 桌面实时回合完成超时');
   }
 
-  async readCompletedTurnFromSessionFile({ cursor, threadId, turnId, prompt, emit, onActivity = null }) {
+  async readPromptPersistedFromSessionFile({ cursor, threadId, prompt, emit }) {
+    const records = typeof this.sessions.readSessionRecordsAfterCursor === 'function'
+      ? await this.sessions.readSessionRecordsAfterCursor(cursor)
+      : [];
+    const entries = records.length > 0
+      ? summarizeVisibleSessionRecords(records)
+      : typeof this.sessions.readSessionEntriesAfterCursor === 'function'
+        ? await this.sessions.readSessionEntriesAfterCursor(cursor)
+        : [];
+    if (entries.length === 0) {
+      return null;
+    }
+    const normalizedPrompt = normalizeMessageForMatch(prompt);
+    const entry = entries.find((item) => {
+      return item.role === 'user'
+        && messageMatchesPrompt(normalizeMessageForMatch(item.text), normalizedPrompt);
+    });
+    if (!entry) {
+      return null;
+    }
+    emit('codex.app_server.user_message.persisted', {
+      threadId,
+      source: 'session_file_after_ack_loss',
+      timestamp: entry.timestamp ?? '',
+      message: '手机消息已进入 Codex 官方会话，虽然桌面回执丢失。'
+    });
+    return entry;
+  }
+
+  async waitForPromptPersistenceAfterAckLoss({ cursor, threadId, prompt, emit }) {
+    const startedAt = Date.now();
+    const timeoutMs = Math.max(0, this.postSubmitAckReconcileMs);
+    do {
+      const persisted = await this.readPromptPersistedFromSessionFile({
+        cursor,
+        threadId,
+        prompt,
+        emit
+      });
+      if (persisted) {
+        emit('codex.app_server.turn.accepted_without_ack', {
+          threadId,
+          source: 'session-file',
+          message: 'Codex 桌面已接收手机消息，但 turn/start 成功回执丢失，继续跟随桌面会话状态。'
+        });
+        return true;
+      }
+      await sleep(300);
+    } while (Date.now() - startedAt < timeoutMs);
+    return false;
+  }
+
+  async readCompletedTurnFromSessionFile({
+    cursor,
+    threadId,
+    turnId,
+    prompt,
+    emit,
+    onActivity = null,
+    officialTurnStatus = '',
+    officialThreadStatus = ''
+  }) {
     const reportActivity = (timestamp, role, source = 'session-file') => {
       if (typeof onActivity !== 'function' || !timestamp) {
         return;
@@ -658,6 +942,9 @@ export class CodexDesktopCdpAdapter {
       prompt: normalizedPrompt,
       turnId
     });
+    const aborted = findTurnAbortedRecordAfterPrompt(records, {
+      prompt: normalizedPrompt
+    });
     const latestActivity = latestActivityRecordAfterPrompt(records, {
       prompt: normalizedPrompt
     });
@@ -693,6 +980,26 @@ export class CodexDesktopCdpAdapter {
       });
     }
 
+    if (aborted) {
+      reportActivity(aborted.timestamp, 'terminal', 'turn_aborted');
+      emit('codex.session_file.turn.interrupted', {
+        threadId,
+        filePath: cursor.filePath,
+        promptTimestamp: entries[promptIndex].timestamp,
+        interruptedTimestamp: aborted.timestamp,
+        turnId,
+        source: 'turn_aborted'
+      });
+      return buildSessionFileCompletedTurn({
+        threadId,
+        turnId,
+        filePath: cursor.filePath,
+        userText: entries[promptIndex].text,
+        assistantText: '本轮已在 Codex 桌面端中断。',
+        status: 'interrupted'
+      });
+    }
+
     if (!assistant) {
       return null;
     }
@@ -713,6 +1020,21 @@ export class CodexDesktopCdpAdapter {
           latestActivityTimestamp: latestActivity.timestamp,
           latestActivityRole: latestActivity.role,
           message: '助手回复后仍有工具或思考活动，继续保持运行态，等待真正完成。'
+        });
+        return null;
+      }
+      if (shouldBlockSessionFileSoftComplete(officialTurnStatus, officialThreadStatus)) {
+        emit('codex.session_file.turn.waiting_terminal', {
+          threadId,
+          filePath: cursor.filePath,
+          promptTimestamp: entries[promptIndex].timestamp,
+          assistantTimestamp: assistant.timestamp,
+          latestActivityTimestamp: latestActivity.timestamp,
+          latestActivityRole: latestActivity.role,
+          officialTurnStatus,
+          officialThreadStatus,
+          reason: 'official_turn_in_progress',
+          message: '官方 Codex 通道仍显示本轮运行中，阻止 session 文件软完成。'
         });
         return null;
       }
@@ -737,6 +1059,19 @@ export class CodexDesktopCdpAdapter {
     if (Number.isFinite(assistantStableMs)
       && this.softCompleteAfterAssistantStableMs >= 0
       && assistantStableMs >= this.softCompleteAfterAssistantStableMs) {
+      if (shouldBlockSessionFileSoftComplete(officialTurnStatus, officialThreadStatus)) {
+        emit('codex.session_file.turn.waiting_terminal', {
+          threadId,
+          filePath: cursor.filePath,
+          promptTimestamp: entries[promptIndex].timestamp,
+          assistantTimestamp: assistant.timestamp,
+          officialTurnStatus,
+          officialThreadStatus,
+          reason: 'official_turn_in_progress',
+          message: '官方 Codex 通道仍显示本轮运行中，阻止 session 文件软完成。'
+        });
+        return null;
+      }
       emit('codex.session_file.turn.soft_completed', {
         threadId,
         filePath: cursor.filePath,
@@ -1037,18 +1372,22 @@ function isRecoverableResumeError(error) {
   return /Codex 桌面 CDP (连接错误|连接已关闭|未连接)|连接 Codex 桌面 CDP (失败|超时)/.test(message);
 }
 
+function isRecoverablePostSubmitAckError(error) {
+  return isRecoverableResumeError(error);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildSessionFileCompletedTurn({ threadId, turnId, filePath = '', userText, assistantText }) {
+function buildSessionFileCompletedTurn({ threadId, turnId, filePath = '', userText, assistantText, status = 'completed' }) {
   return {
     threadId,
     source: 'session-file',
     filePath,
     turn: {
       id: turnId ?? `session-file-${Date.now()}`,
-      status: 'completed',
+      status,
       items: [{
         type: 'userMessage',
         content: [{ type: 'text', text: userText, text_elements: [] }]
@@ -1093,6 +1432,23 @@ function isPromptMissingFailureStatus(status) {
     || normalized === 'canceled';
 }
 
+function isTurnTerminalForInterrupt(status) {
+  const normalized = String(status ?? '').toLowerCase();
+  return normalized.length > 0
+    && normalized !== 'inprogress'
+    && normalized !== 'in_progress'
+    && normalized !== 'running'
+    && normalized !== 'queued';
+}
+
+function isInterruptedTerminalStatus(status) {
+  const normalized = String(status ?? '').toLowerCase().replace(/[-_ ]/g, '');
+  return normalized === 'interrupted'
+    || normalized === 'aborted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled';
+}
+
 function createPromptMissingAfterTurnEndError(status, options = {}) {
   const error = new Error(`Codex 桌面回合已${statusLabel(status)}，但手机消息没有写入官方会话。可能是模型正在压缩上下文或回合在写入前被中断，请在手机端点击重试。`);
   error.code = 'CODEX_PHONE_MESSAGE_NOT_PERSISTED';
@@ -1123,6 +1479,31 @@ function detectCompactionSignalFromNotifications(messages) {
     }
   }
   return '';
+}
+
+function findCodexClientNoticeFromDesktopNotifications(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return null;
+  }
+  for (const message of messages) {
+    const notice = classifyCodexClientNotice(message, {
+      source: `desktop-live/${message?.method ?? 'notification'}`
+    });
+    if (notice) {
+      return {
+        notice,
+        message: message ?? {}
+      };
+    }
+  }
+  return null;
+}
+
+function createCodexClientNoticeError(notice) {
+  const error = new Error(formatCodexClientNoticeText(notice));
+  error.code = 'CODEX_CLIENT_NOTICE';
+  error.notice = notice;
+  return error;
 }
 
 function findTokenInfo(value) {
@@ -1253,6 +1634,32 @@ function findTaskCompleteRecordAfterPrompt(records, { prompt, turnId }) {
   return null;
 }
 
+function findTurnAbortedRecordAfterPrompt(records, { prompt }) {
+  if (!Array.isArray(records) || records.length === 0) {
+    return null;
+  }
+
+  let afterPrompt = prompt.length === 0;
+  for (const record of records) {
+    if (isUserMessageRecord(record)) {
+      const text = normalizeMessageForMatch(extractRecordText(record));
+      if (isTurnAbortedText(text)) {
+        if (afterPrompt) {
+          return {
+            timestamp: String(record.timestamp ?? ''),
+            payload: record.payload ?? {}
+          };
+        }
+        continue;
+      }
+      if (messageMatchesPrompt(text, prompt)) {
+        afterPrompt = true;
+      }
+    }
+  }
+  return null;
+}
+
 function latestActivityRecordAfterPrompt(records, { prompt }) {
   if (!Array.isArray(records) || records.length === 0) {
     return { timestamp: '', role: '' };
@@ -1292,6 +1699,26 @@ function latestActivityByTimestamp(left, right) {
     return right;
   }
   return left;
+}
+
+function normalizeDesktopRuntimeStatus(status) {
+  if (status && typeof status === 'object') {
+    return normalizeDesktopRuntimeStatus(status.type ?? status.status ?? '');
+  }
+  return String(status ?? '').trim();
+}
+
+function isDesktopRuntimeInProgress(status) {
+  const normalized = normalizeDesktopRuntimeStatus(status).toLowerCase().replace(/[-_ ]/g, '');
+  return normalized === 'inprogress' || normalized === 'running' || normalized === 'active' || normalized === 'queued';
+}
+
+function isTurnAbortedText(value) {
+  return String(value ?? '').trim().startsWith('<turn_aborted>');
+}
+
+function shouldBlockSessionFileSoftComplete(officialTurnStatus, officialThreadStatus) {
+  return isDesktopRuntimeInProgress(officialTurnStatus) || isDesktopRuntimeInProgress(officialThreadStatus);
 }
 
 function activityRoleForRecord(record) {

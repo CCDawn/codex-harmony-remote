@@ -1,13 +1,26 @@
 import { createId } from './ids.js';
+import { classifyCodexClientNotice } from './codexClientNotices.js';
 import { normalizeModelId } from './sessionSettingsStore.js';
 
 export class TaskStore {
-  constructor({ projects, adapter, eventBus, logger, beforeRun = null }) {
+  constructor({
+    projects,
+    adapter,
+    eventBus,
+    logger,
+    beforeRun = null,
+    interruptReconciler = null,
+    interruptReconcileTimeoutMs = 30000,
+    interruptReconcilePollMs = 500
+  }) {
     this.projects = projects;
     this.adapter = adapter;
     this.eventBus = eventBus;
     this.logger = logger;
     this.beforeRun = beforeRun;
+    this.interruptReconciler = typeof interruptReconciler === 'function' ? interruptReconciler : null;
+    this.interruptReconcileTimeoutMs = Math.max(0, Number(interruptReconcileTimeoutMs) || 0);
+    this.interruptReconcilePollMs = Math.max(25, Number(interruptReconcilePollMs) || 500);
     this.tasks = new Map();
     this.approvals = new Map();
   }
@@ -58,7 +71,13 @@ export class TaskStore {
       activeCodexTurnId: null,
       interruptRequested: false,
       interruptDispatching: false,
-      interruptError: null
+      interruptError: null,
+      interruptOperationId: null,
+      interruptRequestedAt: null,
+      interruptReconcileUntil: null,
+      interruptRecovering: false,
+      interruptAttemptCount: 0,
+      lastInterruptFailure: null
     };
 
     this.tasks.set(task.id, task);
@@ -152,6 +171,12 @@ export class TaskStore {
       interruptRequested: false,
       interruptDispatching: false,
       interruptError: null,
+      interruptOperationId: null,
+      interruptRequestedAt: null,
+      interruptReconcileUntil: null,
+      interruptRecovering: false,
+      interruptAttemptCount: 0,
+      lastInterruptFailure: null,
       syntheticInterrupt: true
     };
     this.tasks.set(syntheticTask.id, syntheticTask);
@@ -172,8 +197,18 @@ export class TaskStore {
     if (!['queued', 'running', 'waiting_approval'].includes(task.status)) {
       return task;
     }
+    if (task.interruptDispatching === true || task.interruptRecovering === true) {
+      this.addEvent(taskId, 'task.interrupt.duplicate_ignored', {
+        reason: task.interruptDispatching === true ? 'dispatching' : 'reconciling'
+      });
+      return task;
+    }
     task.interruptRequested = true;
     task.interruptError = null;
+    task.lastInterruptFailure = null;
+    task.interruptRequestedAt = new Date().toISOString();
+    task.interruptOperationId = createId('interrupt');
+    task.interruptAttemptCount = Number(task.interruptAttemptCount ?? 0) + 1;
     if (!task.interruptDispatching) {
       task.interruptDispatching = true;
       this.addEvent(taskId, 'task.interrupt.requested', payload);
@@ -191,22 +226,86 @@ export class TaskStore {
       return;
     }
     try {
-      await this.adapter.interrupt({
+      const result = await this.adapter.interrupt({
         task,
         emit: (type, payload) => this.recordAdapterEvent(taskId, type, payload)
       });
       const latest = this.tasks.get(taskId);
-      if (latest) {
-        this.markTaskInterrupted(latest);
+      if (!latest) {
+        return;
       }
+      if (latest.status === 'interrupted') {
+        return;
+      }
+      if (!['queued', 'running', 'waiting_approval'].includes(latest.status)) {
+        latest.interruptDispatching = false;
+        latest.interruptRecovering = false;
+        latest.interruptRequested = false;
+        latest.interruptError = null;
+        this.addEvent(taskId, 'task.interrupt.late_confirm_ignored', { status: latest.status });
+        return;
+      }
+      if (result?.accepted === true && result?.confirmed === true) {
+        if (isStrongInterruptedOutcomeForTask(latest, result)) {
+          this.markTaskInterrupted(latest, result);
+          return;
+        }
+        if (isStrongCompletedOutcomeForTask(latest, result)) {
+          this.markTaskCompletedFromReconcile(latest, {
+            ...result,
+            reason: result.reason ?? 'desktop_turn_already_terminal'
+          });
+          return;
+        }
+        latest.interruptDispatching = false;
+        latest.interruptRequested = true;
+        latest.interruptRecovering = false;
+        latest.lastInterruptFailure = '桌面返回了中断终态，但无法确认它属于当前回合。';
+        this.addEvent(taskId, 'task.interrupt.weak_confirm_ignored', compactReconcileOutcome(result));
+        this.addEvent(taskId, 'task.interrupt.recoverable_failed', {
+          message: latest.lastInterruptFailure,
+          reason: 'weak_confirm'
+        });
+        return;
+      }
+      if (result?.accepted === true && result?.confirmed !== true) {
+        latest.interruptRequested = true;
+        latest.interruptDispatching = true;
+        latest.interruptRecovering = true;
+        latest.interruptError = null;
+        latest.lastInterruptFailure = null;
+        latest.interruptReconcileUntil = futureIso(this.interruptReconcileTimeoutMs);
+        this.addEvent(taskId, 'task.interrupt.accepted', {
+          message: '桌面已接受中断请求，正在等待回合结束确认。'
+        });
+        this.startInterruptReconciliation(taskId, { reason: 'accepted_without_confirmation' });
+        return;
+      }
+      latest.interruptDispatching = false;
+      latest.interruptRecovering = false;
+      latest.interruptRequested = true;
+      latest.interruptError = null;
+      latest.lastInterruptFailure = '桌面未返回可确认的中断结果。';
+      this.addEvent(taskId, 'task.interrupt.unconfirmed', {
+        reason: 'missing_confirmed_result'
+      });
+      this.addEvent(taskId, 'task.interrupt.recoverable_failed', {
+        message: latest.lastInterruptFailure
+      });
     } catch (error) {
       const latest = this.tasks.get(taskId);
       if (!latest) {
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
+      if (!['queued', 'running', 'waiting_approval'].includes(latest.status)) {
+        latest.interruptDispatching = false;
+        latest.interruptRecovering = false;
+        this.addEvent(taskId, 'task.interrupt.late_failed_ignored', { status: latest.status, message });
+        return;
+      }
       latest.interruptDispatching = false;
-      latest.interruptError = message;
+      latest.lastInterruptFailure = message;
       if (latest.status === 'interrupted') {
         return;
       }
@@ -217,10 +316,122 @@ export class TaskStore {
         this.addEvent(taskId, 'task.failed', { message: latest.error });
         return;
       }
-      latest.interruptRequested = false;
-      latest.error = `中断失败：${message}`;
-      this.addEvent(taskId, 'task.interrupt.failed', { message });
+      latest.interruptRequested = true;
+      latest.interruptRecovering = true;
+      latest.interruptError = null;
+      latest.error = null;
+      latest.interruptReconcileUntil = futureIso(this.interruptReconcileTimeoutMs);
+      this.addEvent(taskId, 'task.interrupt.reconcile_started', { message });
+      this.startInterruptReconciliation(taskId, { reason: 'dispatch_failed', message });
     }
+  }
+
+  startInterruptReconciliation(taskId, payload = {}) {
+    if (!this.interruptReconciler) {
+      void this.finishInterruptReconciliationWithoutProvider(taskId, payload);
+      return;
+    }
+    void this.reconcileInterruptUntilTerminal(taskId, payload);
+  }
+
+  async finishInterruptReconciliationWithoutProvider(taskId, payload = {}) {
+    const task = this.tasks.get(taskId);
+    if (!task || !['queued', 'running', 'waiting_approval'].includes(task.status)) {
+      return;
+    }
+    task.interruptDispatching = false;
+    task.interruptRecovering = false;
+    task.lastInterruptFailure = payload.message ?? task.lastInterruptFailure ?? '无法确认桌面中断状态';
+    task.interruptError = null;
+    task.error = null;
+    this.addEvent(taskId, 'task.interrupt.recoverable_failed', {
+      message: task.lastInterruptFailure,
+      reason: 'missing_reconciler'
+    });
+  }
+
+  async reconcileInterruptUntilTerminal(taskId, payload = {}) {
+    const startedAt = Date.now();
+    const timeoutMs = this.interruptReconcileTimeoutMs;
+    const deadline = startedAt + timeoutMs;
+    let lastOutcome = null;
+    do {
+      const task = this.tasks.get(taskId);
+      if (!task || !['queued', 'running', 'waiting_approval'].includes(task.status)) {
+        return;
+      }
+      const outcome = await this.reconcileInterruptOnce(task, payload).catch((error) => ({
+        status: 'unknown',
+        reason: 'reconciler_error',
+        message: error instanceof Error ? error.message : String(error)
+      }));
+      lastOutcome = outcome;
+      this.addEvent(taskId, 'task.interrupt.reconcile_polled', compactReconcileOutcome(outcome));
+      if (this.applyInterruptReconciliationOutcome(taskId, outcome)) {
+        return;
+      }
+      if (timeoutMs <= 0 || Date.now() >= deadline) {
+        break;
+      }
+      await sleep(Math.min(this.interruptReconcilePollMs, Math.max(0, deadline - Date.now())));
+    } while (Date.now() < deadline);
+
+    const latest = this.tasks.get(taskId);
+    if (!latest || !['queued', 'running', 'waiting_approval'].includes(latest.status)) {
+      return;
+    }
+    latest.interruptDispatching = false;
+    latest.interruptRecovering = false;
+    latest.interruptError = null;
+    latest.error = null;
+    latest.lastInterruptFailure = payload.message ?? latest.lastInterruptFailure ?? '未确认中断结果';
+    this.addEvent(taskId, 'task.interrupt.reconcile_timeout', {
+      message: latest.lastInterruptFailure,
+      lastOutcome: compactReconcileOutcome(lastOutcome)
+    });
+    this.addEvent(taskId, 'task.interrupt.recoverable_failed', {
+      message: latest.lastInterruptFailure
+    });
+  }
+
+  async reconcileInterruptOnce(task, payload = {}) {
+    const threadId = normalizeSessionId(task.codexSessionId || task.createdCodexSessionId);
+    const activeTurnId = String(task.activeCodexTurnId ?? '');
+    if (!threadId && !activeTurnId) {
+      return { status: 'unknown', reason: 'missing_thread_and_turn' };
+    }
+    return await this.interruptReconciler({
+      task: { ...task, events: task.events.slice() },
+      threadId,
+      activeTurnId,
+      reason: payload.reason ?? '',
+      message: payload.message ?? ''
+    });
+  }
+
+  applyInterruptReconciliationOutcome(taskId, outcome) {
+    const task = this.tasks.get(taskId);
+    if (!task || !outcome || typeof outcome !== 'object') {
+      return false;
+    }
+    const status = String(outcome.status ?? '');
+    if (status === 'interrupted') {
+      if (!isStrongInterruptedOutcomeForTask(task, outcome)) {
+        this.addEvent(taskId, 'task.interrupt.weak_confirm_ignored', compactReconcileOutcome(outcome));
+        return false;
+      }
+      this.markTaskInterrupted(task, outcome);
+      return true;
+    }
+    if (status === 'completed') {
+      if (!isStrongCompletedOutcomeForTask(task, outcome)) {
+        this.addEvent(taskId, 'task.interrupt.weak_confirm_ignored', compactReconcileOutcome(outcome));
+        return false;
+      }
+      this.markTaskCompletedFromReconcile(task, outcome);
+      return true;
+    }
+    return false;
   }
 
   async waitForInterruptDispatch(taskId, timeoutMs = 700) {
@@ -239,15 +450,22 @@ export class TaskStore {
     return this.tasks.get(taskId) ?? null;
   }
 
-  markTaskInterrupted(task) {
+  markTaskInterrupted(task, evidence = {}) {
     if (task.status === 'interrupted') {
       return task;
     }
     task.interruptDispatching = false;
+    task.interruptRecovering = false;
     task.interruptRequested = true;
     task.interruptError = null;
+    task.lastInterruptFailure = null;
     task.status = 'interrupted';
     task.error = '已中断当前会话';
+    this.addEvent(task.id, 'task.interrupt.reconcile_confirmed', {
+      status: 'interrupted',
+      reason: evidence.reason ?? '',
+      turnId: evidence.turnId ?? evidence.activeTurnId ?? ''
+    });
     this.addEvent(task.id, 'task.interrupted', { message: task.error });
     return task;
   }
@@ -343,20 +561,38 @@ export class TaskStore {
         requestApproval: (request) => this.createApproval(taskId, request)
       });
 
-      if (task.interruptRequested) {
-        this.markTaskInterrupted(task);
-      } else {
+      if (task.status === 'interrupted' || task.status === 'completed') {
+        return;
+      }
+      if (['queued', 'running', 'waiting_approval'].includes(task.status)) {
         task.status = 'completed';
         task.result = result;
         this.addEvent(taskId, 'task.completed', result);
       }
     } catch (error) {
-      if (task.interruptRequested) {
-        this.markTaskInterrupted(task);
+      if (task.status === 'completed') {
+        return;
+      }
+      if (task.status === 'interrupted') {
+        return;
+      }
+      if (task.interruptRequested && task.interruptDispatching && !task.interruptError) {
+        task.interruptDispatching = false;
+        task.interruptRecovering = false;
+        task.lastInterruptFailure = '任务结束时仍未确认中断是否成功。';
+        this.addEvent(taskId, 'task.interrupt.recoverable_failed', {
+          message: task.lastInterruptFailure,
+          reason: 'run_error_during_interrupt'
+        });
+      } else if (task.interruptRecovering === true && !task.interruptError) {
+        this.addEvent(taskId, 'task.error.deferred_during_interrupt_reconcile', {
+          message: error instanceof Error ? error.message : String(error)
+        });
       } else {
         task.status = 'failed';
         task.error = error.message;
-        this.addEvent(taskId, 'task.failed', { message: task.error });
+        const notice = error?.notice ?? classifyCodexClientNotice(error, { source: 'task.failed' });
+        this.addEvent(taskId, 'task.failed', notice ? { message: task.error, notice } : { message: task.error });
       }
     }
   }
@@ -388,7 +624,48 @@ export class TaskStore {
         task.activeCodexTurnId = turnId;
       }
     }
+    if (task
+      && (type === 'codex.app_server.turn.interrupted' || type === 'codex.session_file.turn.interrupted')
+      && ['queued', 'running', 'waiting_approval'].includes(task.status)) {
+      if (task.interruptRequested === true && isStrongInterruptedOutcomeForTask(task, payload)) {
+        this.markTaskInterrupted(task, {
+          ...payload,
+          reason: type
+        });
+      } else {
+        this.addEvent(taskId, 'task.interrupt.weak_confirm_ignored', {
+          status: 'interrupted',
+          reason: type,
+          turnId: extractTurnId(payload)
+        });
+      }
+    }
     return this.addEvent(taskId, type, payload);
+  }
+
+  markTaskCompletedFromReconcile(task, outcome = {}) {
+    if (task.status === 'completed') {
+      return task;
+    }
+    task.interruptDispatching = false;
+    task.interruptRecovering = false;
+    task.interruptRequested = false;
+    task.interruptError = null;
+    task.lastInterruptFailure = null;
+    task.status = 'completed';
+    task.error = null;
+    task.result = task.result ?? {
+      summary: '桌面会话已完成',
+      changedFiles: [],
+      tests: [],
+      exitCode: 0
+    };
+    this.addEvent(task.id, 'task.interrupt.reconcile_confirmed', {
+      status: 'completed',
+      reason: outcome.reason ?? ''
+    });
+    this.addEvent(task.id, 'task.completed', task.result);
+    return task;
   }
 
   createApproval(taskId, request) {
@@ -450,10 +727,83 @@ function extractTurnId(payload) {
   if (typeof payload.turn_id === 'string') {
     return payload.turn_id;
   }
+  if (typeof payload.activeTurnId === 'string') {
+    return payload.activeTurnId;
+  }
   if (payload.turn && typeof payload.turn === 'object' && typeof payload.turn.id === 'string') {
     return payload.turn.id;
   }
   return '';
+}
+
+function futureIso(timeoutMs) {
+  return new Date(Date.now() + Math.max(0, Number(timeoutMs) || 0)).toISOString();
+}
+
+function compactReconcileOutcome(outcome) {
+  if (!outcome || typeof outcome !== 'object') {
+    return { status: 'unknown', reason: 'empty_outcome' };
+  }
+  return {
+    status: String(outcome.status ?? 'unknown'),
+    reason: String(outcome.reason ?? ''),
+    message: String(outcome.message ?? '').slice(0, 300),
+    turnId: extractTurnId(outcome)
+  };
+}
+
+function isStrongInterruptedOutcomeForTask(task, outcome) {
+  return isStrongTerminalOutcomeForTask(task, outcome, isInterruptedInterruptStatus);
+}
+
+function isStrongCompletedOutcomeForTask(task, outcome) {
+  return isStrongTerminalOutcomeForTask(task, outcome, isCompletedInterruptStatus);
+}
+
+function isStrongTerminalOutcomeForTask(task, outcome, statusPredicate) {
+  if (!task || !outcome || typeof outcome !== 'object') {
+    return false;
+  }
+  const activeTurnId = String(task.activeCodexTurnId ?? '').trim();
+  if (!activeTurnId) {
+    return false;
+  }
+  const outcomeTurnId = extractTurnId(outcome);
+  if (outcomeTurnId !== activeTurnId) {
+    return false;
+  }
+  if (!statusPredicate(outcome.status ?? outcome.turn?.status ?? '')) {
+    return false;
+  }
+  const requestedAt = Date.parse(String(task.interruptRequestedAt ?? ''));
+  const observedAt = Date.parse(String(
+    outcome.observedAt
+      ?? outcome.interruptedAt
+      ?? outcome.completedAt
+      ?? outcome.updatedAt
+      ?? outcome.message
+      ?? ''
+  ));
+  return !Number.isFinite(requestedAt)
+    || !Number.isFinite(observedAt)
+    || observedAt >= requestedAt;
+}
+
+function isInterruptedInterruptStatus(status) {
+  const normalized = String(status ?? '').toLowerCase().replace(/[-_ ]/g, '');
+  return normalized === 'interrupted'
+    || normalized === 'aborted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled';
+}
+
+function isCompletedInterruptStatus(status) {
+  const normalized = String(status ?? '').toLowerCase().replace(/[-_ ]/g, '');
+  return normalized.length > 0
+    && normalized !== 'interrupted'
+    && normalized !== 'aborted'
+    && normalized !== 'cancelled'
+    && normalized !== 'canceled';
 }
 
 function normalizeSessionId(value) {

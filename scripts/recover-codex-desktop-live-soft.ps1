@@ -191,8 +191,13 @@ function Wait-DesktopScriptOnline {
     if ($probe.Ok) {
       $lastStatus = $probe.Value
       $bridge = Get-ObjectValue -Object $lastStatus -Name 'bridge' -Fallback $null
-      if ([bool](Get-ObjectValue -Object $bridge -Name 'online' -Fallback $false)) {
+      $scriptAuth = Get-ObjectValue -Object $bridge -Name 'scriptAuth' -Fallback $null
+      $authHealthy = [bool](Get-ObjectValue -Object $scriptAuth -Name 'healthy' -Fallback $true)
+      if ([bool](Get-ObjectValue -Object $bridge -Name 'online' -Fallback $false) -and $authHealthy) {
         return $lastStatus
+      }
+      if ([bool](Get-ObjectValue -Object $bridge -Name 'online' -Fallback $false) -and -not $authHealthy) {
+        $lastStatus = @{ error = 'desktop script bridge auth unhealthy'; bridge = $bridge }
       }
     } else {
       $lastStatus = @{ error = $probe.Error }

@@ -198,8 +198,13 @@ test('CodexSessionStore marks desktop commentary turns running until final compl
   const completed = sessions.find((session) => session.id === completedSessionId);
 
   assert.equal(running?.activityStatus, 'running');
+  assert.equal(running?.runtimeState, 'running');
+  assert.equal(running?.canInterrupt, true);
   assert.equal(running?.activityUpdatedAt, progressAt.toISOString());
   assert.equal(completed?.activityStatus, 'completed');
+  assert.equal(completed?.runtimeState, 'completed');
+  assert.equal(completed?.canInterrupt, false);
+  assert.equal(completed?.terminalReason, 'completed');
   assert.equal(completed?.activityUpdatedAt, completedAt.toISOString());
 });
 
@@ -522,9 +527,58 @@ test('CodexSessionStore treats turn_aborted markers as terminal control records'
   const session = sessions.find((candidate) => candidate.id === sessionId);
   const detail = await store.getSession(sessionId);
 
-  assert.equal(session?.activityStatus, 'completed');
+  assert.equal(session?.activityStatus, 'interrupted');
+  assert.equal(session?.runtimeState, 'interrupted');
+  assert.equal(session?.canInterrupt, false);
+  assert.equal(session?.terminalReason, 'interrupted');
   assert.equal(session?.activityUpdatedAt, abortedAt.toISOString());
   assert.equal(detail.entries.some((entry) => String(entry.text ?? '').includes('turn_aborted')), false);
+});
+
+test('CodexSessionStore verifies large rollout targets without reading the whole file', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-large-rollout-'));
+  const sessionId = '019e-large-rollout-target';
+  const abortedAt = '2026-06-15T11:46:46.341Z';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '超大会话', updated_at: abortedAt }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '15');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-06-15T19-40-00-${sessionId}.jsonl`);
+  const hugePrefix = JSON.stringify({
+    timestamp: '2026-06-15T11:40:00.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'x'.repeat(12000) }]
+    }
+  });
+  await fs.writeFile(rolloutPath, [
+    hugePrefix,
+    JSON.stringify({ timestamp: '2026-06-15T11:45:00.000Z', type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ timestamp: '2026-06-15T11:45:10.000Z', type: 'event_msg', payload: { type: 'user_message', message: '尾部消息仍可读取' } }),
+    JSON.stringify({ timestamp: abortedAt, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>' }] } }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({
+    codexHome,
+    sessionDetailFullReadLimitBytes: 256,
+    sessionDetailTailBytes: 4096
+  });
+  const detail = await store.getSession(sessionId, { tail: 10 });
+  const verified = await store.verifySessionTarget(sessionId, { filePath: rolloutPath });
+
+  assert.equal(detail.activityStatus, 'interrupted');
+  assert.equal(detail.runtimeState, 'interrupted');
+  assert.equal(detail.terminalReason, 'interrupted');
+  assert.equal(detail.activityUpdatedAt, abortedAt);
+  assert.equal(detail.entries.some((entry) => String(entry.text ?? '').includes('turn_aborted')), false);
+  assert.match(detail.entries.map((entry) => entry.text).join('\n'), /尾部消息仍可读取/);
+  assert.equal(verified.filePath, rolloutPath);
 });
 
 test('CodexSessionStore sorts sidebar sessions by rollout file activity', async () => {
@@ -688,7 +742,168 @@ test('CodexSessionStore appends one live activity for running rollout detail and
   assert.equal(completed.entries.some((entry) => entry.type === 'live_activity'), false);
 });
 
-test('CodexSessionStore stops running after a settled tool output tail', async () => {
+test('CodexSessionStore downgrades stale pending tool calls when the session is not running', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-stale-tool-call-'));
+  const sessionId = '019e-stale-pending-tool-call';
+  const now = Date.now();
+  const taskStartedAt = new Date(now - 30 * 60_000);
+  const userAt = new Date(now - 29 * 60_000);
+  const assistantAt = new Date(now - 28 * 60_000);
+  const toolCallAt = new Date(now - 27 * 60_000);
+
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '旧悬空命令', updated_at: toolCallAt.toISOString() }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '18');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-06-18T13-00-00-${sessionId}.jsonl`);
+  await fs.writeFile(rolloutPath, [
+    JSON.stringify({ timestamp: taskStartedAt.toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ timestamp: userAt.toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] } }),
+    JSON.stringify({ timestamp: assistantAt.toISOString(), type: 'event_msg', payload: { type: 'agent_message', message: '开始跑测试。', phase: 'commentary' } }),
+    JSON.stringify({ timestamp: toolCallAt.toISOString(), type: 'response_item', payload: { type: 'function_call', name: 'shell_command', call_id: 'call_hung', arguments: '{"command":"python -m pytest tests/test_team_workflow_orchestration_service.py"}' } }),
+    ''
+  ].join('\n'), 'utf8');
+  await fs.utimes(rolloutPath, toolCallAt, toolCallAt);
+
+  const store = new CodexSessionStore({ codexHome });
+  const session = await store.getSession(sessionId, { tail: 20 });
+
+  assert.equal(session.activityStatus, 'idle');
+  assert.equal(session.runtimeState, 'idle');
+  assert.equal(session.canInterrupt, false);
+  assert.equal(session.entries.some((entry) => entry.type === 'live_activity'), false);
+  assert.equal(session.entries.some((entry) => entry.type === 'tool_call'), false);
+  const staleTool = session.entries.find((entry) => entry.type === 'tool_result' && /命令未返回/.test(entry.text));
+  assert.ok(staleTool);
+  assert.match(staleTool.text, /python -m pytest/);
+});
+
+test('CodexSessionStore does not reuse an older pending command for a newer running turn', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-new-turn-old-tool-'));
+  const sessionId = '019e-new-turn-old-tool';
+  const now = Date.now();
+  const oldTaskStartedAt = new Date(now - 30 * 60_000);
+  const oldAssistantAt = new Date(now - 28 * 60_000);
+  const oldToolCallAt = new Date(now - 27 * 60_000);
+  const newUserAt = new Date(now - 60_000);
+  const newTaskStartedAt = new Date(now - 58_000);
+
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '新轮旧命令', updated_at: newUserAt.toISOString() }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '18');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-06-18T13-10-00-${sessionId}.jsonl`);
+  await fs.writeFile(rolloutPath, [
+    JSON.stringify({ timestamp: oldTaskStartedAt.toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ timestamp: oldAssistantAt.toISOString(), type: 'event_msg', payload: { type: 'agent_message', message: '开始跑旧测试。', phase: 'commentary' } }),
+    JSON.stringify({ timestamp: oldToolCallAt.toISOString(), type: 'response_item', payload: { type: 'function_call', name: 'shell_command', call_id: 'call_old', arguments: '{"command":"python -m pytest old_tests.py"}' } }),
+    JSON.stringify({ timestamp: newUserAt.toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '现在同步了吗' }] } }),
+    JSON.stringify({ timestamp: newTaskStartedAt.toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+    ''
+  ].join('\n'), 'utf8');
+  await fs.utimes(rolloutPath, newTaskStartedAt, newTaskStartedAt);
+
+  const store = new CodexSessionStore({ codexHome });
+  const session = await store.getSession(sessionId, { tail: 20 });
+
+  assert.equal(session.activityStatus, 'running');
+  assert.equal(session.runtimeState, 'running');
+  assert.equal(session.canInterrupt, true);
+  assert.equal(session.entries.some((entry) => entry.type === 'tool_call'), false);
+  const liveActivity = session.entries.find((entry) => entry.type === 'live_activity');
+  assert.equal(liveActivity?.text, 'Codex 正在处理当前消息');
+  assert.doesNotMatch(liveActivity?.text ?? '', /old_tests/);
+  const staleTool = session.entries.find((entry) => entry.type === 'tool_result' && /命令未返回/.test(entry.text));
+  assert.ok(staleTool);
+  assert.match(staleTool.text, /old_tests/);
+});
+
+test('CodexSessionStore treats fresh work after an interrupted marker as a new running turn', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-post-interrupt-running-'));
+  const sessionId = '019e-post-interrupt-running';
+  const now = Date.now();
+  const userAt = new Date(now - 120_000);
+  const abortedAt = new Date(now - 90_000);
+  const reasoningAt = new Date(now - 30_000);
+  const toolCallAt = new Date(now - 20_000);
+
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '中断后继续运行', updated_at: toolCallAt.toISOString() }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '19');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-06-19T16-00-00-${sessionId}.jsonl`);
+  await fs.writeFile(rolloutPath, [
+    JSON.stringify({ timestamp: userAt.toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '先中断' }] } }),
+    JSON.stringify({ timestamp: abortedAt.toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>' }] } }),
+    JSON.stringify({ timestamp: reasoningAt.toISOString(), type: 'response_item', payload: { type: 'reasoning', summary: [{ text: '重新分析链路状态' }] } }),
+    JSON.stringify({ timestamp: toolCallAt.toISOString(), type: 'response_item', payload: { type: 'function_call', name: 'shell_command', call_id: 'call_after_interrupt', arguments: '{"command":"npm test"}' } }),
+    ''
+  ].join('\n'), 'utf8');
+  await fs.utimes(rolloutPath, toolCallAt, toolCallAt);
+
+  const store = new CodexSessionStore({ codexHome });
+  const session = await store.getSession(sessionId, { tail: 20 });
+
+  assert.equal(session.activityStatus, 'running');
+  assert.equal(session.runtimeState, 'running');
+  assert.equal(session.canInterrupt, true);
+  assert.equal(session.terminalReason, '');
+  assert.equal(session.activityUpdatedAt, toolCallAt.toISOString());
+  assert.equal(session.entries.some((entry) => entry.type === 'live_activity'), true);
+});
+
+test('CodexSessionStore exposes Codex client errors and compaction as dedicated notice entries', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-client-notices-'));
+  const sessionId = '019e-client-notices';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '客户端通知', updated_at: '2026-06-16T08:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '16');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-06-16T16-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-06-16T08:00:01Z',
+      type: 'event_msg',
+      payload: {
+        type: 'client_error',
+        statusCode: 401,
+        error: { code: 'unauthorized', message: 'Unauthorized' }
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-16T08:00:02Z',
+      type: 'event_msg',
+      payload: {
+        type: 'client_status',
+        message: 'Codex 正在压缩上下文，等待 compaction 完成。'
+      }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  const notices = detail.entries.filter((entry) => entry.type === 'codex_client_notice');
+
+  assert.equal(notices.length, 2);
+  assert.equal(notices[0].liveKind, 'auth');
+  assert.match(notices[0].text, /Codex 鉴权失败/);
+  assert.equal(notices[1].liveKind, 'context');
+  assert.match(notices[1].text, /正在压缩上下文/);
+});
+
+test('CodexSessionStore keeps open turns running after a settled tool output tail', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-settled-tool-output-'));
   const sessionId = '019e-settled-tool-output';
   const now = Date.now();
@@ -719,9 +934,12 @@ test('CodexSessionStore stops running after a settled tool output tail', async (
   const store = new CodexSessionStore({ codexHome });
   const session = await store.getSession(sessionId, { tail: 20 });
 
-  assert.equal(session.activityStatus, 'completed');
+  assert.equal(session.activityStatus, 'running');
+  assert.equal(session.runtimeState, 'running');
+  assert.equal(session.canInterrupt, true);
+  assert.equal(session.terminalReason, '');
   assert.equal(session.activityUpdatedAt, toolOutputAt.toISOString());
-  assert.equal(session.entries.some((entry) => entry.type === 'live_activity'), false);
+  assert.equal(session.entries.some((entry) => entry.type === 'live_activity'), true);
 });
 
 test('CodexSessionStore merges duplicate user records from rollout event and response sources', async () => {
@@ -770,6 +988,49 @@ test('CodexSessionStore merges duplicate user records from rollout event and res
   const imagePath = detail.entries[0].text.match(/\((.+desktop-.+\.png)\)/)?.[1];
   assert.ok(imagePath);
   await fs.access(imagePath);
+});
+
+test('CodexSessionStore merges duplicate assistant records from rollout event and response sources', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-duplicate-assistant-'));
+  const sessionId = '019e-duplicate-assistant';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '重复回复', updated_at: '2026-06-16T18:20:57.600Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '16');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const assistantText = '审查结果：你这个判断是对的。重复显示来自两个日志来源。';
+  const assistantTextWithCitation = `${assistantText}\n\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[test]\n</citation_entries>\n<rollout_ids>\n019e-test\n</rollout_ids>\n</oai-mem-citation>`;
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-06-16T18-20-00-${sessionId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-06-16T18:20:57.580Z',
+      type: 'event_msg',
+      payload: {
+        type: 'agent_message',
+        message: assistantText
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-16T18:20:57.587Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: assistantTextWithCitation }]
+      }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  const assistantEntries = detail.entries.filter((entry) => entry.role === 'assistant');
+
+  assert.equal(assistantEntries.length, 1);
+  assert.equal(assistantEntries[0].type, 'response_item');
+  assert.match(assistantEntries[0].text, /<oai-mem-citation>/);
 });
 
 test('CodexSessionStore materializes desktop tool output images for mobile display', async () => {
@@ -856,6 +1117,131 @@ test('CodexSessionStore rewrites assistant local markdown images into mobile ima
   const imagePath = detail.entries[0].text.match(/\((.+desktop-.+\.png)\)/)?.[1];
   assert.ok(imagePath);
   await fs.access(imagePath);
+});
+
+test('CodexSessionStore materializes Codex generated images for mobile display', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-generated-image-'));
+  const mobileImagesDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-session-generated-images-'));
+  const sessionId = '019e-generated-image';
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '生成图', updated_at: '2026-06-18T10:55:45.587Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '18');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-06-18T10-55-00-${sessionId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-06-18T10:55:45.568Z',
+      type: 'event_msg',
+      payload: {
+        type: 'image_generation_end',
+        call_id: 'ig_1',
+        status: 'completed',
+        result: imageBytes.toString('base64')
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-18T10:55:45.582Z',
+      type: 'response_item',
+      payload: {
+        type: 'image_generation_call',
+        id: 'ig_1',
+        status: 'completed',
+        result: imageBytes.toString('base64')
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-18T10:55:45.587Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: '图片已生成。' }]
+      }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome, mobileImagesDir });
+  const detail = await store.getSession(sessionId);
+  const imageEntries = detail.entries.filter((entry) => /!\[桌面端图片\]\(.+desktop-.+\.png\)/.test(entry.text));
+
+  assert.equal(imageEntries.length, 1);
+  assert.equal(imageEntries[0].role, 'assistant');
+  assert.equal(imageEntries[0].type, 'response_item');
+  assert.match(imageEntries[0].syncId, /^generated-image:ig_1:/);
+  assert.match(imageEntries[0].text, /^已生成图片\n!\[桌面端图片\]\(.+desktop-.+\.png\)$/);
+  const imagePath = imageEntries[0].text.match(/\((.+desktop-.+\.png)\)/)?.[1];
+  assert.ok(imagePath);
+  assert.deepEqual(await fs.readFile(imagePath), imageBytes);
+});
+
+test('CodexSessionStore gives split generated-image records the same stable sync id', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-generated-image-sync-'));
+  const mobileImagesDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-session-generated-image-sync-'));
+  const sessionId = '019e-generated-image-sync';
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+  const imageBase64 = imageBytes.toString('base64');
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '生成图分页', updated_at: '2026-06-18T10:56:45.587Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '18');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-06-18T10-56-00-${sessionId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-06-18T10:56:45.568Z',
+      type: 'event_msg',
+      payload: {
+        type: 'image_generation_end',
+        call_id: 'ig_split',
+        status: 'completed',
+        result: imageBase64
+      }
+    }),
+    JSON.stringify({ timestamp: '2026-06-18T10:56:45.570Z', type: 'event_msg', payload: { type: 'agent_message', message: '中间消息一' } }),
+    JSON.stringify({ timestamp: '2026-06-18T10:56:45.571Z', type: 'event_msg', payload: { type: 'agent_message', message: '中间消息二' } }),
+    JSON.stringify({
+      timestamp: '2026-06-18T10:56:45.582Z',
+      type: 'response_item',
+      payload: {
+        type: 'image_generation_call',
+        id: 'ig_split',
+        status: 'completed',
+        result: imageBase64
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-18T10:56:45.587Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: '图片已生成。' }]
+      }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome, mobileImagesDir });
+  const detail = await store.getSession(sessionId);
+  const imageEntries = detail.entries.filter((entry) => /!\[桌面端图片\]\(.+desktop-.+\.png\)/.test(entry.text));
+  assert.equal(imageEntries.length, 1);
+  assert.equal(imageEntries[0].type, 'response_item');
+
+  const recent = await store.getSessionSync(sessionId, { limit: 2 });
+  const recentImage = recent.entries.find((entry) => /!\[桌面端图片\]\(.+desktop-.+\.png\)/.test(entry.text));
+  assert.ok(recentImage);
+  assert.equal(recentImage.type, 'response_item');
+
+  const older = await store.getSessionSync(sessionId, { limit: 10, before: recent.sync.cursorStart });
+  const olderImage = older.entries.find((entry) => /!\[桌面端图片\]\(.+desktop-.+\.png\)/.test(entry.text));
+  assert.ok(olderImage);
+  assert.equal(olderImage.type, 'event_msg');
+  assert.equal(olderImage.syncId, recentImage.syncId);
 });
 
 test('CodexSessionStore hides skill triggers and internal skill instruction blocks from visible chat', async () => {
@@ -1039,6 +1425,85 @@ test('CodexSessionStore reads visible entries appended after a rollout cursor', 
   const entries = await store.readSessionEntriesAfterCursor(cursor);
 
   assert.deepEqual(entries.map((entry) => entry.text), ['新消息', '新回复']);
+});
+
+test('CodexSessionStore syncs recent, older, and appended session pages by file offset', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-sync-page-'));
+  const sessionId = '019e-sync-page-session';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '16');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const filePath = path.join(sessionDir, `rollout-2026-06-16T10-00-00-${sessionId}.jsonl`);
+  await fs.writeFile(filePath, [
+    JSON.stringify({ timestamp: '2026-06-16T00:00:01Z', type: 'event_msg', payload: { type: 'user_message', message: '消息一' } }),
+    JSON.stringify({ timestamp: '2026-06-16T00:00:02Z', type: 'event_msg', payload: { type: 'agent_message', message: '回复二' } }),
+    JSON.stringify({ timestamp: '2026-06-16T00:00:03Z', type: 'event_msg', payload: { type: 'user_message', message: '消息三' } }),
+    JSON.stringify({ timestamp: '2026-06-16T00:00:04Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ text: '回复四' }] } }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const recent = await store.getSessionSync(sessionId, { limit: 2 });
+
+  assert.equal(recent.sync.mode, 'recent');
+  assert.equal(recent.sync.hasMoreBefore, true);
+  assert.deepEqual(recent.entries.map((entry) => entry.text), ['消息三', '回复四']);
+  assert.ok(Number(recent.sync.cursorStart) > 0);
+  assert.ok(Number(recent.sync.cursorEnd) > Number(recent.sync.cursorStart));
+
+  const older = await store.getSessionSync(sessionId, { limit: 2, before: recent.sync.cursorStart });
+  assert.equal(older.sync.mode, 'before');
+  assert.deepEqual(older.entries.map((entry) => entry.text), ['消息一', '回复二']);
+
+  await fs.appendFile(filePath, [
+    JSON.stringify({ timestamp: '2026-06-16T00:00:05Z', type: 'event_msg', payload: { type: 'user_message', message: '消息五' } }),
+    ''
+  ].join('\n'), 'utf8');
+  const appended = await store.getSessionSync(sessionId, { limit: 2, after: recent.sync.cursorEnd });
+
+  assert.equal(appended.sync.mode, 'after');
+  assert.deepEqual(appended.entries.map((entry) => entry.text), ['消息五']);
+  assert.ok(Number(appended.sync.cursorEnd) > Number(recent.sync.cursorEnd));
+
+  const unchanged = await store.getSessionSync(sessionId, { limit: 2, after: appended.sync.cursorEnd });
+  assert.equal(unchanged.sync.mode, 'after');
+  assert.equal(unchanged.sync.pageDirection, 'after');
+  assert.equal(unchanged.sync.snapshotFileSize, unchanged.sync.fileSize);
+  assert.deepEqual(unchanged.entries.map((entry) => entry.text), []);
+  assert.ok(Number(unchanged.sync.cursorEnd) >= Number(appended.sync.cursorEnd));
+
+  const beyondCurrentFile = await store.getSessionSync(sessionId, { limit: 2, after: String(Number(appended.sync.cursorEnd) + 5000) });
+  assert.equal(beyondCurrentFile.sync.mode, 'after');
+  assert.deepEqual(beyondCurrentFile.entries.map((entry) => entry.text), []);
+  assert.ok(Number(beyondCurrentFile.sync.cursorEnd) >= Number(appended.sync.cursorEnd) + 5000);
+});
+
+test('CodexSessionStore recent sync expands backward to include the latest user turn anchor', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-sync-anchor-'));
+  const sessionId = '019e-sync-anchor-session';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '19');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const filePath = path.join(sessionDir, `rollout-2026-06-19T17-00-00-${sessionId}.jsonl`);
+  await fs.writeFile(filePath, [
+    JSON.stringify({ timestamp: '2026-06-19T09:06:59.000Z', type: 'event_msg', payload: { type: 'user_message', message: '请分析这个显示问题' } }),
+    JSON.stringify({ timestamp: '2026-06-19T09:07:00.000Z', type: 'session_meta', payload: { cwd: 'C:\\work', notes: 'x'.repeat(1600) } }),
+    JSON.stringify({ timestamp: '2026-06-19T09:07:08.000Z', type: 'response_item', payload: { type: 'reasoning', summary: [{ text: '正在核对日志' }] } }),
+    JSON.stringify({ timestamp: '2026-06-19T09:07:10.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '我先核对刚才补丁有没有落在正确位置。' }] } }),
+    JSON.stringify({ timestamp: '2026-06-19T09:07:11.000Z', type: 'response_item', payload: { type: 'function_call_output', output: 'ok' } }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({
+    codexHome,
+    sessionDetailFullReadLimitBytes: 128,
+    sessionDetailTailBytes: 256
+  });
+  const recent = await store.getSessionSync(sessionId, { limit: 3 });
+
+  assert.equal(recent.sync.mode, 'recent');
+  assert.equal(recent.entries[0].role, 'user');
+  assert.equal(recent.entries[0].text, '请分析这个显示问题');
+  assert.ok(recent.entries.some((entry) => entry.text.includes('我先核对刚才补丁')));
+  assert.ok(Number(recent.sync.cursorStart) < Number(recent.sync.cursorEnd));
 });
 
 test('CodexSessionStore physically deletes rollout files and hides the thread from desktop lists', async () => {

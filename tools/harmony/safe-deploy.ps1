@@ -47,6 +47,22 @@ function Copy-HapSnapshot {
   return $target
 }
 
+function Read-ArkConst {
+  param(
+    [string]$Path,
+    [string]$Name
+  )
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return ''
+  }
+  $text = Get-Content -LiteralPath $Path -Raw
+  $match = [regex]::Match($text, "export\s+const\s+$([regex]::Escape($Name))\s*:\s*string\s*=\s*'([^']*)'")
+  if ($match.Success) {
+    return $match.Groups[1].Value
+  }
+  return ''
+}
+
 function Invoke-SafeSmoke {
   param(
     [string]$ScriptRoot,
@@ -58,11 +74,17 @@ function Invoke-SafeSmoke {
   $args = @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
-    '-File', (Join-Path $ScriptRoot 'smoke-link.ps1'),
-    '-BridgeUrl', $BridgeUrl,
-    '-BridgeToken', $BridgeToken,
-    '-ConfigPath', $ConfigPath
+    '-File', (Join-Path $ScriptRoot 'smoke-link.ps1')
   )
+  if (-not [string]::IsNullOrWhiteSpace($BridgeUrl)) {
+    $args += @('-BridgeUrl', $BridgeUrl)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($BridgeToken)) {
+    $args += @('-BridgeToken', $BridgeToken)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $args += @('-ConfigPath', $ConfigPath)
+  }
   if (-not [string]::IsNullOrWhiteSpace($DeviceId)) {
     $args += @('-DeviceId', $DeviceId)
   }
@@ -86,11 +108,17 @@ function Invoke-Deploy {
   $args = @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
-    '-File', (Join-Path $ScriptRoot 'deploy.ps1'),
-    '-BridgeUrl', $BridgeUrl,
-    '-BridgeToken', $BridgeToken,
-    '-ConfigPath', $ConfigPath
+    '-File', (Join-Path $ScriptRoot 'deploy.ps1')
   )
+  if (-not [string]::IsNullOrWhiteSpace($BridgeUrl)) {
+    $args += @('-BridgeUrl', $BridgeUrl)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($BridgeToken)) {
+    $args += @('-BridgeToken', $BridgeToken)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $args += @('-ConfigPath', $ConfigPath)
+  }
   if (-not [string]::IsNullOrWhiteSpace($DeviceId)) {
     $args += @('-DeviceId', $DeviceId)
   }
@@ -161,6 +189,13 @@ $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '..\..'))
 $projectRoot = Join-Path $repoRoot 'HarmonyCodexRemote'
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
   $ConfigPath = Join-Path $scriptRoot 'codex-remote.config.psd1'
+}
+$bridgeConfigPath = Join-Path $projectRoot 'entry\src\main\ets\config\BridgeConfig.ets'
+if ([string]::IsNullOrWhiteSpace($BridgeUrl)) {
+  $BridgeUrl = Read-ArkConst -Path $bridgeConfigPath -Name 'DEFAULT_BRIDGE_URL'
+}
+if ([string]::IsNullOrWhiteSpace($BridgeToken)) {
+  $BridgeToken = Read-ArkConst -Path $bridgeConfigPath -Name 'DEFAULT_BRIDGE_TOKEN'
 }
 $config = Import-PowerShellDataFile -LiteralPath $ConfigPath
 $snapshotDir = Join-Path $repoRoot 'artifacts\hap\known-good'
