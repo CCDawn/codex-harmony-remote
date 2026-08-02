@@ -8,38 +8,55 @@ import { CodexAppServerApprovalBroker } from '../src/codexAppServerApprovalBroke
 import { CodexAppServerRunJournal } from '../src/codexAppServerRunJournal.js';
 import { CodexThreadService } from '../src/codexThreadService.js';
 
-test('run journal persists only recoverable run metadata and never the prompt body', () => {
+const THREAD_1 = '019e0000-0000-7000-8000-000000000001';
+const TURN_1 = '019e0000-0000-7000-8000-000000000002';
+const TURN_2 = '019e0000-0000-7000-8000-000000000003';
+
+test('run journal persists only recoverable run metadata and never the prompt or command bodies', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-runs-'));
   const filePath = path.join(directory, 'runs.json');
-  const journal = new CodexAppServerRunJournal({ filePath });
+  const journal = new CodexAppServerRunJournal({ filePath, epoch: 'epoch-journal' });
 
   journal.persist([{
     id: 'run-1',
-    threadId: 'thr-1',
-    turnId: 'turn-1',
+    threadId: THREAD_1,
+    turnId: TURN_1,
     projectId: 'project-1',
     prompt: '这段提示绝不能写进恢复状态',
+    command: 'Write-Output secret-command-body',
     submissionId: 'submission-1',
     status: 'running',
     createdAt: '2026-07-28T00:00:00.000Z',
     updatedAt: '2026-07-28T00:00:01.000Z',
     model: 'gpt-test',
-    reasoningEffort: 'high'
+    reasoningEffort: 'high',
+    generation: 7
   }, {
     id: 'run-finished',
-    threadId: 'thr-finished',
+    threadId: THREAD_1,
+    turnId: TURN_2,
     status: 'completed'
   }]);
 
   const persisted = fs.readFileSync(filePath, 'utf8');
   assert.doesNotMatch(persisted, /这段提示绝不能写进恢复状态/);
+  assert.doesNotMatch(persisted, /secret-command-body/);
+  const parsed = JSON.parse(persisted);
+  assert.equal(parsed.schemaVersion, 2);
+  assert.equal(parsed.epoch, 'epoch-journal');
+  assert.equal(typeof parsed.journalId, 'string');
+  assert.equal(parsed.runs.length, 1);
+  assert.equal(parsed.runs[0].threadId, THREAD_1);
+  assert.equal(parsed.runs[0].turnId, TURN_1);
+  assert.equal(parsed.runs[0].status, 'running');
   assert.deepEqual(journal.load(), [{
     id: 'run-1',
-    threadId: 'thr-1',
-    turnId: 'turn-1',
+    threadId: THREAD_1,
+    turnId: TURN_1,
     projectId: 'project-1',
     submissionId: 'submission-1',
     status: 'recovering',
+    lastKnownStatus: 'running',
     createdAt: '2026-07-28T00:00:00.000Z',
     updatedAt: '2026-07-28T00:00:01.000Z',
     model: 'gpt-test',
@@ -48,8 +65,93 @@ test('run journal persists only recoverable run metadata and never the prompt bo
     promptLength: 13,
     createdThreadId: null,
     deliveryMode: 'app_server',
-    generation: 0
+    generation: 7
   }]);
+});
+
+test('run journal never persists synthetic probe identifiers and requires Codex-shaped UUIDs', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-runs-'));
+  const filePath = path.join(directory, 'runs.json');
+  const journal = new CodexAppServerRunJournal({ filePath });
+
+  journal.persist([{
+    id: 'probe-1',
+    threadId: '019e-thread',
+    turnId: TURN_1,
+    status: 'running'
+  }, {
+    id: 'probe-2',
+    threadId: THREAD_1,
+    turnId: 'turn-1',
+    status: 'running'
+  }, {
+    id: 'probe-3',
+    threadId: THREAD_1,
+    turnId: '',
+    status: 'running'
+  }, {
+    id: 'probe-4',
+    threadId: 'not-a-uuid',
+    turnId: 'also-not-a-uuid',
+    status: 'running'
+  }, {
+    id: 'run-valid',
+    threadId: THREAD_1,
+    turnId: TURN_1,
+    status: 'running'
+  }]);
+
+  const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  assert.equal(parsed.runs.length, 1);
+  assert.equal(parsed.runs[0].id, 'run-valid');
+  assert.deepEqual(journal.load().map((entry) => entry.id), ['run-valid']);
+
+  fs.writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    runs: [{
+      id: 'handwritten-probe',
+      threadId: '019e-thread',
+      turnId: 'turn-1',
+      status: 'running'
+    }]
+  }));
+  assert.deepEqual(journal.load(), []);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('run journal loads legacy schemas forward and refuses unknown future schemas', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-runs-'));
+  const filePath = path.join(directory, 'runs.json');
+  const journal = new CodexAppServerRunJournal({ filePath });
+
+  fs.writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 1,
+    runs: [{
+      id: 'legacy-run',
+      threadId: THREAD_1,
+      turnId: TURN_1,
+      status: 'running',
+      createdAt: '2026-07-28T00:00:00.000Z',
+      updatedAt: '2026-07-28T00:00:01.000Z'
+    }]
+  }));
+  const loaded = journal.load();
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].id, 'legacy-run');
+  assert.equal(loaded[0].status, 'recovering');
+  assert.equal(loaded[0].lastKnownStatus, 'running');
+
+  fs.writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 99,
+    runs: [{
+      id: 'future-run',
+      threadId: THREAD_1,
+      turnId: TURN_1,
+      status: 'running'
+    }]
+  }));
+  assert.deepEqual(journal.load(), []);
+  fs.rmSync(directory, { recursive: true, force: true });
 });
 
 test('approval broker accepts only the current app-server generation and expires stale prompts', async () => {
@@ -351,17 +453,19 @@ test('thread service restores a persisted active turn during the first App Serve
   const runStatePath = path.join(directory, 'runs.json');
   new CodexAppServerRunJournal({ filePath: runStatePath }).persist([{
     id: 'run-recover',
-    threadId: 'thr-recover',
-    turnId: 'turn-1',
+    threadId: THREAD_1,
+    turnId: TURN_1,
     projectId: 'project-1',
     submissionId: 'submission-recover',
     status: 'running',
     createdAt: '2026-07-28T00:00:00.000Z',
     updatedAt: '2026-07-28T00:00:01.000Z',
     model: 'gpt-test',
-    reasoningEffort: 'high'
+    reasoningEffort: 'high',
+    generation: 1
   }]);
   const client = new FakeRuntimeClient();
+  client.threadReadTurns = [{ id: TURN_1, status: 'inProgress' }];
   const service = new CodexThreadService({
     client,
     runStatePath,
@@ -372,7 +476,185 @@ test('thread service restores a persisted active turn during the first App Serve
   await service.initialize();
 
   assert.equal(service.getRun('run-recover').status, 'running');
+  assert.equal(service.getRun('run-recover').runtime.canInterrupt, true);
   assert.equal(client.calls.filter((call) => call.method === 'thread/read').length, 1);
+  const recoveredEvent = service.getRun('run-recover').events
+    .find((event) => event.type === 'codex.run.recovered');
+  assert.equal(recoveredEvent.payload.reason, 'verified_active');
+  assert.equal(recoveredEvent.payload.runId, 'run-recover');
+  assert.equal(recoveredEvent.payload.threadId, THREAD_1);
+  assert.equal(recoveredEvent.payload.turnId, TURN_1);
+  assert.equal(recoveredEvent.payload.fromStatus, 'recovering');
+  assert.equal(recoveredEvent.payload.toStatus, 'running');
+  assert.equal(recoveredEvent.payload.generation, 1);
+  assert.equal(recoveredEvent.payload.epoch, service.runtimeSnapshotTracker.epoch);
+  assert.deepEqual(new CodexAppServerRunJournal({ filePath: runStatePath }).load().map((entry) => entry.id), ['run-recover']);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('persisted run for the same exact turn cannot override an official terminal state', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-sticky-'));
+  const runStatePath = path.join(directory, 'runs.json');
+  new CodexAppServerRunJournal({ filePath: runStatePath }).persist([{
+    id: 'run-sticky',
+    threadId: THREAD_1,
+    turnId: TURN_1,
+    projectId: 'project-1',
+    submissionId: 'submission-sticky',
+    status: 'running',
+    createdAt: '2026-07-28T00:00:00.000Z',
+    updatedAt: '2026-07-28T00:00:01.000Z',
+    model: 'gpt-test',
+    reasoningEffort: 'high',
+    generation: 1
+  }]);
+  const client = new FakeRuntimeClient();
+  client.threadReadTurns = [{ id: TURN_1, status: 'completed' }];
+  const service = new CodexThreadService({
+    client,
+    runStatePath,
+    projects: [{ id: 'project-1', name: 'Project', root: 'C:\\work' }]
+  });
+
+  await service.initialize();
+
+  const run = service.getRun('run-sticky');
+  assert.equal(run.status, 'completed');
+  assert.equal(run.runtime.canInterrupt, false);
+  assert.equal(run.interruptReady, false);
+  const interrupted = await service.interruptRun('run-sticky');
+  assert.equal(interrupted.status, 'completed');
+  assert.equal(client.calls.filter((call) => call.method === 'turn/interrupt').length, 0);
+  const terminalEvent = run.events.find((event) => event.type === 'codex.run.recovered_terminal');
+  assert.deepEqual(terminalEvent.payload, {
+    runId: 'run-sticky',
+    threadId: THREAD_1,
+    turnId: TURN_1,
+    fromStatus: 'recovering',
+    toStatus: 'completed',
+    reason: 'official_terminal_sticky',
+    generation: 1,
+    epoch: service.runtimeSnapshotTracker.epoch
+  });
+  assert.deepEqual(new CodexAppServerRunJournal({ filePath: runStatePath }).load(), []);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('persisted run for a missing exact turn settles as interrupted and is never persisted again', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-missing-'));
+  const runStatePath = path.join(directory, 'runs.json');
+  new CodexAppServerRunJournal({ filePath: runStatePath }).persist([{
+    id: 'run-missing',
+    threadId: THREAD_1,
+    turnId: TURN_1,
+    projectId: 'project-1',
+    status: 'running',
+    createdAt: '2026-07-28T00:00:00.000Z',
+    updatedAt: '2026-07-28T00:00:01.000Z',
+    generation: 1
+  }]);
+  const client = new FakeRuntimeClient();
+  client.threadReadTurns = [{ id: TURN_2, status: 'completed' }];
+  const service = new CodexThreadService({
+    client,
+    runStatePath,
+    projects: [{ id: 'project-1', name: 'Project', root: 'C:\\work' }]
+  });
+
+  await service.initialize();
+
+  const run = service.getRun('run-missing');
+  assert.equal(run.status, 'interrupted');
+  assert.equal(run.runtime.canInterrupt, false);
+  const interrupted = await service.interruptRun('run-missing');
+  assert.equal(interrupted.status, 'interrupted');
+  assert.equal(client.calls.filter((call) => call.method === 'turn/interrupt').length, 0);
+  const terminalEvent = run.events.find((event) => event.type === 'codex.run.recovered_terminal');
+  assert.equal(terminalEvent.payload.reason, 'turn_not_found');
+  assert.equal(terminalEvent.payload.fromStatus, 'recovering');
+  assert.equal(terminalEvent.payload.toStatus, 'interrupted');
+  assert.equal(terminalEvent.payload.runId, 'run-missing');
+  assert.equal(terminalEvent.payload.threadId, THREAD_1);
+  assert.equal(terminalEvent.payload.turnId, TURN_1);
+  assert.deepEqual(new CodexAppServerRunJournal({ filePath: runStatePath }).load(), []);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('persisted run is superseded while a genuinely newer turn stays active', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-supersede-'));
+  const runStatePath = path.join(directory, 'runs.json');
+  new CodexAppServerRunJournal({ filePath: runStatePath }).persist([{
+    id: 'run-old',
+    threadId: THREAD_1,
+    turnId: TURN_1,
+    projectId: 'project-1',
+    status: 'running',
+    createdAt: '2026-07-28T00:00:00.000Z',
+    updatedAt: '2026-07-28T00:00:01.000Z',
+    generation: 1
+  }]);
+  const client = new FakeRuntimeClient();
+  client.threadReadTurns = [{ id: TURN_2, status: 'inProgress' }];
+  const service = new CodexThreadService({
+    client,
+    runStatePath,
+    projects: [{ id: 'project-1', name: 'Project', root: 'C:\\work' }]
+  });
+
+  await service.initialize();
+
+  const run = service.getRun('run-old');
+  assert.equal(run.status, 'interrupted');
+  assert.equal(run.runtime.canInterrupt, false);
+  const terminalEvent = run.events.find((event) => event.type === 'codex.run.recovered_terminal');
+  assert.equal(terminalEvent.payload.reason, 'superseded_by_newer_turn');
+  assert.equal(terminalEvent.payload.toStatus, 'interrupted');
+  assert.equal(service.activeRunsByThreadId.has(THREAD_1), false);
+  assert.ok(service.liveSessions.get(THREAD_1));
+  assert.deepEqual(new CodexAppServerRunJournal({ filePath: runStatePath }).load(), []);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('thread/read failure during recovery fails closed and is not persisted again', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-read-fail-'));
+  const runStatePath = path.join(directory, 'runs.json');
+  new CodexAppServerRunJournal({ filePath: runStatePath }).persist([{
+    id: 'run-read-fail',
+    threadId: THREAD_1,
+    turnId: TURN_1,
+    projectId: 'project-1',
+    status: 'running',
+    createdAt: '2026-07-28T00:00:00.000Z',
+    updatedAt: '2026-07-28T00:00:01.000Z',
+    generation: 1
+  }]);
+  const client = new FakeRuntimeClient();
+  client.threadReadError = new Error('app server unreachable');
+  const service = new CodexThreadService({
+    client,
+    runStatePath,
+    projects: [{ id: 'project-1', name: 'Project', root: 'C:\\work' }]
+  });
+
+  await service.initialize();
+
+  const run = service.getRun('run-read-fail');
+  assert.equal(run.status, 'failed');
+  assert.equal(run.error, 'app server unreachable');
+  assert.equal(run.runtime.canInterrupt, false);
+  const interrupted = await service.interruptRun('run-read-fail');
+  assert.equal(interrupted.status, 'failed');
+  assert.equal(client.calls.filter((call) => call.method === 'turn/interrupt').length, 0);
+  const failedEvent = run.events.find((event) => event.type === 'codex.run.recovery_failed');
+  assert.equal(failedEvent.payload.reason, 'thread_read_failed');
+  assert.equal(failedEvent.payload.runId, 'run-read-fail');
+  assert.equal(failedEvent.payload.threadId, THREAD_1);
+  assert.equal(failedEvent.payload.turnId, TURN_1);
+  assert.equal(failedEvent.payload.fromStatus, 'recovering');
+  assert.equal(failedEvent.payload.toStatus, 'failed');
+  assert.equal(failedEvent.payload.message, 'app server unreachable');
+  assert.equal(failedEvent.payload.epoch, service.runtimeSnapshotTracker.epoch);
+  assert.deepEqual(new CodexAppServerRunJournal({ filePath: runStatePath }).load(), []);
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
@@ -406,6 +688,8 @@ class FakeRuntimeClient extends EventEmitter {
     this.responses = new Map();
     this.initializeCalls = 0;
     this.failNextTurnStart = false;
+    this.threadReadTurns = [{ id: 'turn-1', status: 'inProgress' }];
+    this.threadReadError = null;
   }
 
   async initialize() {
@@ -439,11 +723,14 @@ class FakeRuntimeClient extends EventEmitter {
       return {};
     }
     if (method === 'thread/read') {
+      if (this.threadReadError) {
+        throw this.threadReadError;
+      }
       return {
         thread: {
           id: params.threadId,
           cwd: 'C:\\work',
-          turns: [{ id: 'turn-1', status: 'inProgress' }]
+          turns: this.threadReadTurns
         }
       };
     }

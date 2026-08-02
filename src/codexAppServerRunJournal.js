@@ -1,5 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+
+const CURRENT_SCHEMA_VERSION = 2;
+const LEGACY_SCHEMA_VERSION = 1;
 
 const ACTIVE_STATUSES = new Set([
   'queued',
@@ -11,10 +15,31 @@ const ACTIVE_STATUSES = new Set([
   'recovering'
 ]);
 
+// Codex thread and turn ids are UUIDs. Anything else (probe fixtures,
+// synthetic ids such as "019e-thread" or "turn-1") is not recoverable and
+// must never reach the production-style active-run journal.
+const CODEX_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isCodexUuid(value) {
+  return CODEX_UUID_PATTERN.test(String(value ?? '').trim());
+}
+
+export function isRecoverableRunIdentifier(run) {
+  if (!run) {
+    return false;
+  }
+  return Boolean(
+    isCodexUuid(run.threadId ?? run.codexSessionId)
+    && isCodexUuid(run.turnId ?? run.activeCodexTurnId)
+  );
+}
+
 export class CodexAppServerRunJournal {
   constructor(options = {}) {
     this.filePath = String(options.filePath ?? '').trim();
     this.fs = options.fsModule ?? fs;
+    this.epoch = String(options.epoch ?? options.runtimeSnapshotEpoch ?? randomUUID());
+    this.journalId = String(options.journalId ?? randomUUID());
   }
 
   load() {
@@ -23,12 +48,19 @@ export class CodexAppServerRunJournal {
     }
     try {
       const parsed = JSON.parse(this.fs.readFileSync(this.filePath, 'utf8'));
+      const schemaVersion = Number(parsed?.schemaVersion ?? LEGACY_SCHEMA_VERSION);
+      if (!Number.isInteger(schemaVersion) || schemaVersion > CURRENT_SCHEMA_VERSION) {
+        // A journal written by a newer bridge is outside this reader's
+        // reconciliation contract: never guess its entry shape.
+        return [];
+      }
       const entries = Array.isArray(parsed) ? parsed : parsed?.runs;
       if (!Array.isArray(entries)) {
         return [];
       }
       return entries
         .filter((entry) => entry && typeof entry === 'object' && ACTIVE_STATUSES.has(String(entry.status ?? '')))
+        .filter((entry) => isRecoverableRunIdentifier(entry))
         .map((entry) => restoreRun(entry));
     } catch {
       return [];
@@ -41,13 +73,16 @@ export class CodexAppServerRunJournal {
     }
     const recoverable = runs
       .filter((run) => run && ACTIVE_STATUSES.has(String(run.status ?? '')))
+      .filter((run) => isRecoverableRunIdentifier(run))
       .map((run) => snapshotRun(run));
     const directory = path.dirname(this.filePath);
     try {
       this.fs.mkdirSync(directory, { recursive: true });
       const temporary = `${this.filePath}.tmp`;
       this.fs.writeFileSync(temporary, JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+        journalId: this.journalId,
+        epoch: this.epoch,
         updatedAt: new Date().toISOString(),
         runs: recoverable
       }, null, 2), 'utf8');
@@ -86,6 +121,7 @@ function restoreRun(entry) {
     projectId: String(entry.projectId ?? 'codex'),
     submissionId: nullableString(entry.submissionId),
     status: 'recovering',
+    lastKnownStatus: String(entry.status ?? 'running'),
     createdAt: String(entry.createdAt ?? new Date().toISOString()),
     updatedAt: String(entry.updatedAt ?? new Date().toISOString()),
     model: String(entry.model ?? ''),

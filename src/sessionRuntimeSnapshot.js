@@ -20,11 +20,14 @@ export class SessionRuntimeSnapshotTracker {
   build({ sessions = [], activeRuns = [], officialStates = [], stale = false } = {}) {
     const activeByThread = latestActiveRunByThread(activeRuns);
     const officialByThread = runtimeStateByThread(officialStates);
+    const decisions = [];
     const runtimeSessions = sessions.map((session) => {
       const threadId = String(session?.id ?? session?.threadId ?? '').trim();
       const activeRun = activeByThread.get(threadId) ?? null;
       const officialState = officialByThread.get(threadId) ?? null;
-      return runtimeSession(session, activeRun, officialState);
+      const built = runtimeSession(session, activeRun, officialState, this.epoch);
+      decisions.push(built.decision);
+      return built.session;
     });
     const fingerprint = JSON.stringify(runtimeSessions);
     if (this.revision === 0 || fingerprint !== this.lastFingerprint) {
@@ -37,7 +40,8 @@ export class SessionRuntimeSnapshotTracker {
       revision: this.revision,
       generatedAt: this.now(),
       stale: stale === true,
-      sessions: runtimeSessions
+      sessions: runtimeSessions,
+      decisions
     };
   }
 }
@@ -59,19 +63,15 @@ export function normalizeRuntimeSnapshotState(value) {
   return 'idle';
 }
 
-function runtimeSession(session, activeRun, officialState) {
+function runtimeSession(session, activeRun, officialState, epoch) {
   const threadId = String(session?.id ?? session?.threadId ?? '').trim();
   const projectedState = normalizeRuntimeSnapshotState(session?.runtimeState ?? session?.activityStatus);
-  const state = activeRun
-    ? normalizeRuntimeSnapshotState(activeRun.status ?? activeRun.runtime?.state)
-    : officialState
-      ? normalizeRuntimeSnapshotState(officialState.state ?? officialState.status)
-      : projectedState;
+  const projectedTurnId = String(session?.activeTurnId ?? session?.activityTurnId ?? '').trim();
   const activeTurnId = activeRun
     ? String(activeRun.turnId ?? activeRun.activeCodexTurnId ?? '').trim()
     : officialState
       ? String(officialState.activeTurnId ?? '').trim()
-      : String(session?.activeTurnId ?? session?.activityTurnId ?? '').trim();
+      : projectedTurnId;
   const stateUpdatedAt = String(
     activeRun?.updatedAt
       ?? officialState?.updatedAt
@@ -80,34 +80,83 @@ function runtimeSession(session, activeRun, officialState) {
       ?? session?.updatedAt
       ?? ''
   );
-  const source = activeRun
-    ? 'app-server-run'
-    : officialState
-      ? String(officialState.source ?? 'desktop-app-server')
-      : String(session?.runtimeSource ?? session?.activitySource ?? session?.source ?? 'unknown');
-  return {
+  let state;
+  let source;
+  let reason;
+  let runId = null;
+  let generation = null;
+
+  if (activeRun) {
+    const runState = normalizeRuntimeSnapshotState(activeRun.status ?? activeRun.runtime?.state);
+    const runTurnId = String(activeRun.turnId ?? activeRun.activeCodexTurnId ?? '').trim();
+    runId = String(activeRun.id ?? '');
+    generation = numberOrNull(activeRun.generation);
+    if (
+      runTurnId
+      && projectedTurnId === runTurnId
+      && TERMINAL_STATES.has(projectedState)
+      && !TERMINAL_STATES.has(runState)
+    ) {
+      // The official projection is terminal for the exact same turn the run
+      // claims: terminal is sticky and the stale run must not override it.
+      state = projectedState;
+      reason = 'official_terminal_sticky';
+    } else {
+      state = runState;
+      reason = runTurnId && projectedTurnId && runTurnId !== projectedTurnId
+        ? 'newer_turn_active'
+        : 'active_run';
+    }
+    source = reason === 'official_terminal_sticky'
+      ? String(session?.runtimeSource ?? session?.activitySource ?? session?.source ?? 'unknown')
+      : 'app-server-run';
+  } else if (officialState) {
+    state = normalizeRuntimeSnapshotState(officialState.state ?? officialState.status);
+    reason = 'official_state';
+    generation = numberOrNull(officialState.generation);
+    source = String(officialState.source ?? 'desktop-app-server');
+  } else {
+    state = projectedState;
+    reason = 'session_projected';
+    source = String(session?.runtimeSource ?? session?.activitySource ?? session?.source ?? 'unknown');
+  }
+
+  const decision = {
     threadId,
-    title: String(session?.title ?? '未命名会话'),
-    projectRoot: String(session?.projectRoot ?? ''),
-    projectLabel: String(session?.projectLabel ?? '未归类'),
-    sidebarSection: String(session?.sidebarSection ?? 'recent'),
-    pinned: session?.pinned === true,
-    updatedAt: String(session?.updatedAt ?? stateUpdatedAt),
-    relativeTime: String(session?.relativeTime ?? ''),
-    state,
-    stateUpdatedAt,
-    source,
-    activeTurnId,
-    canInterrupt: activeRun
-      ? ACTIVE_STATES.has(state)
-      : officialState
-        ? officialState.canInterrupt === true || ACTIVE_STATES.has(state)
-        : session?.canInterrupt === true,
-    terminalReason: TERMINAL_STATES.has(state)
-      ? String(officialState?.terminalReason ?? session?.terminalReason ?? state)
-      : '',
-    lastVisibleRole: String(session?.lastVisibleRole ?? ''),
-    detailAvailable: session?.detailAvailable !== false
+    runId,
+    turnId: activeTurnId,
+    fromState: projectedState,
+    toState: state,
+    generation,
+    epoch,
+    reason
+  };
+  return {
+    session: {
+      threadId,
+      title: String(session?.title ?? '未命名会话'),
+      projectRoot: String(session?.projectRoot ?? ''),
+      projectLabel: String(session?.projectLabel ?? '未归类'),
+      sidebarSection: String(session?.sidebarSection ?? 'recent'),
+      pinned: session?.pinned === true,
+      updatedAt: String(session?.updatedAt ?? stateUpdatedAt),
+      relativeTime: String(session?.relativeTime ?? ''),
+      state,
+      stateUpdatedAt,
+      source,
+      activeTurnId,
+      canInterrupt: activeRun
+        ? ACTIVE_STATES.has(state)
+        : officialState
+          ? officialState.canInterrupt === true || ACTIVE_STATES.has(state)
+          : session?.canInterrupt === true,
+      terminalReason: TERMINAL_STATES.has(state)
+        ? String(officialState?.terminalReason ?? session?.terminalReason ?? state)
+        : '',
+      lastVisibleRole: String(session?.lastVisibleRole ?? ''),
+      detailAvailable: session?.detailAvailable !== false
+    },
+    decision
   };
 }
 
@@ -148,4 +197,9 @@ function isNewerRun(candidate, current) {
     return candidateMs > currentMs;
   }
   return String(candidate?.id ?? '') > String(current?.id ?? '');
+}
+
+function numberOrNull(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
 }

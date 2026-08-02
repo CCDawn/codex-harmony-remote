@@ -5,7 +5,7 @@ import { buildSessionSnapshot, sanitize, summarizeThreadForEvent } from './codex
 import { CodexAppServerEventConverter } from './codexAppServerEvents.js';
 import { CodexAppServerApprovalBroker } from './codexAppServerApprovalBroker.js';
 import { CodexAppServerUserInputBroker } from './codexAppServerUserInputBroker.js';
-import { CodexAppServerRunJournal } from './codexAppServerRunJournal.js';
+import { CodexAppServerRunJournal, isRecoverableRunIdentifier } from './codexAppServerRunJournal.js';
 import { isLiveActivityEntry } from './codexLiveActivity.js';
 import { classifyCodexClientNotice, createCodexClientNoticeEntry } from './codexClientNotices.js';
 import { CodexProjectCatalog } from './codexProjectCatalog.js';
@@ -54,7 +54,8 @@ export class CodexThreadService {
     this.runJournal = options.runJournal ?? new CodexAppServerRunJournal({
       filePath: options.runStatePath === undefined
         ? defaultRunStatePath()
-        : options.runStatePath
+        : options.runStatePath,
+      epoch: this.runtimeSnapshotTracker.epoch
     });
     this.persistQueued = false;
     this.recoveryPromise = null;
@@ -918,7 +919,7 @@ export class CodexThreadService {
       error.statusCode = 404;
       throw error;
     }
-    if (isTerminalActivityStatus(run.status)) {
+    if (isTerminalActivityStatus(run.status) || run.status === 'recovering') {
       return this.serializeRun(run);
     }
     const turnId = await this.waitForTurnId(run);
@@ -1030,7 +1031,7 @@ export class CodexThreadService {
     }
     const recovered = this.runJournal.load();
     for (const snapshot of recovered) {
-      if (!snapshot.id || !snapshot.threadId || this.runs.has(snapshot.id)) {
+      if (!isRecoverableRunIdentifier(snapshot) || !snapshot.id || this.runs.has(snapshot.id)) {
         continue;
       }
       const run = {
@@ -1078,12 +1079,15 @@ export class CodexThreadService {
     if (!run || isTerminalActivityStatus(run.status)) {
       return run;
     }
+    const recoveringFrom = run.lastKnownStatus ?? run.status;
     run.status = 'recovering';
     run.updatedAt = new Date().toISOString();
-    this.addRunEvent(run, 'codex.run.recovering', {
-      threadId: run.threadId,
-      turnId: run.turnId ?? ''
-    });
+    this.addRunEvent(run, 'codex.run.recovering', this.recoveryEventPayload(
+      run,
+      recoveringFrom,
+      'recovering',
+      'recovery_started'
+    ));
     this.schedulePersistRuns();
     try {
       const response = await this.requestAppServer('thread/read', {
@@ -1094,41 +1098,122 @@ export class CodexThreadService {
       const session = buildSessionSnapshot(thread, { threadId: run.threadId, prompt: run.prompt });
       this.liveSessions.set(run.threadId, session);
       run.session = session;
-      const terminalState = runtimeStateFromDesktopThread(thread);
-      if (isTerminalActivityStatus(terminalState)) {
-        run.status = terminalState;
-        run.updatedAt = new Date().toISOString();
-        this.markLiveSessionTerminal(run.threadId, terminalState, run.updatedAt, run.turnId);
-        this.removeLiveActivity(run.threadId, run.turnId);
-        await this.finishRun(run);
-      } else {
-        run.status = 'running';
-        run.updatedAt = new Date().toISOString();
-        this.activeRunsByThreadId.set(run.threadId, run.id);
-        if (run.turnId) {
-          this.activeRunsByTurnId.set(run.turnId, run.id);
+      const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+      const turnStates = turns.map((turn) => ({
+        id: String(turn?.id ?? '').trim(),
+        status: normalizeDesktopTurnStatus(turn?.status)
+      }));
+      const activeTurnStates = turnStates.filter((turn) => !isTerminalActivityStatus(turn.status));
+
+      if (run.turnId) {
+        const exact = turnStates.find((turn) => turn.id === run.turnId) ?? null;
+        if (exact && isTerminalActivityStatus(exact.status)) {
+          // Official terminal state for the exact same turn is sticky: a
+          // persisted run can never resurrect it as active.
+          this.settleRecoveredRun(run, exact.status, 'official_terminal_sticky', { markSession: true });
+          return run;
         }
-        this.addRunEvent(run, 'codex.run.recovered', {
-          threadId: run.threadId,
-          turnId: run.turnId ?? ''
-        });
-        this.schedulePersistRuns();
+        if (exact) {
+          this.activateRecoveredRun(run, 'verified_active');
+          return run;
+        }
+        // The exact turn is gone. A genuinely newer active turn must stay
+        // running; otherwise the run is settled as no longer present.
+        const reason = activeTurnStates.length > 0 ? 'superseded_by_newer_turn' : 'turn_not_found';
+        this.settleRecoveredRun(run, 'interrupted', reason, { markSession: activeTurnStates.length === 0 });
+        return run;
+      }
+
+      if (activeTurnStates.length === 1) {
+        // Uncertain start: adopt the thread's single active turn so the run
+        // stays bound to a real Codex-shaped turn id.
+        run.turnId = activeTurnStates[0].id;
+        run.activeCodexTurnId = run.turnId;
+        this.activeRunsByTurnId.set(run.turnId, run.id);
+        this.activateRecoveredRun(run, 'turn_id_recovered');
+      } else if (activeTurnStates.length > 1) {
+        this.activateRecoveredRun(run, 'multi_turn_active');
+      } else {
+        const terminalState = runtimeStateFromDesktopThread(thread);
+        const status = isTerminalActivityStatus(terminalState) ? terminalState : 'interrupted';
+        this.settleRecoveredRun(run, status, 'turn_not_found', { markSession: true });
       }
     } catch (error) {
-      run.updatedAt = new Date().toISOString();
-      run.status = 'recovering';
-      this.addRunEvent(run, 'codex.run.recovery_failed', {
-        threadId: run.threadId,
-        message: error?.message ?? String(error)
+      // Fail closed: an unverifiable run must not linger as recovering/running,
+      // must not be interruptible, and must not be persisted again as active.
+      run.error = error?.message ?? String(error);
+      this.settleRecoveredRun(run, 'failed', 'thread_read_failed', {
+        markSession: true,
+        message: run.error
       });
-      this.schedulePersistRuns();
     }
     return run;
   }
 
+  activateRecoveredRun(run, reason) {
+    const fromStatus = run.status;
+    run.status = 'running';
+    run.updatedAt = new Date().toISOString();
+    this.activeRunsByThreadId.set(run.threadId, run.id);
+    if (run.turnId) {
+      this.activeRunsByTurnId.set(run.turnId, run.id);
+    }
+    this.addRunEvent(run, 'codex.run.recovered', this.recoveryEventPayload(
+      run,
+      fromStatus,
+      'running',
+      reason
+    ));
+    this.schedulePersistRuns();
+  }
+
+  settleRecoveredRun(run, status, reason, { markSession = true, message = '' } = {}) {
+    const fromStatus = run.status;
+    run.status = status;
+    run.updatedAt = new Date().toISOString();
+    if (run.turnId) {
+      this.activeRunsByTurnId.delete(run.turnId);
+    }
+    if (this.activeRunsByThreadId.get(run.threadId) === run.id) {
+      this.activeRunsByThreadId.delete(run.threadId);
+    }
+    if (markSession) {
+      this.markLiveSessionTerminal(run.threadId, status, run.updatedAt, run.turnId);
+      this.removeLiveActivity(run.threadId, run.turnId);
+    }
+    const eventType = status === 'failed' ? 'codex.run.recovery_failed' : 'codex.run.recovered_terminal';
+    this.addRunEvent(run, eventType, this.recoveryEventPayload(
+      run,
+      fromStatus,
+      status,
+      reason,
+      message ? { message } : {}
+    ));
+    this.schedulePersistRuns();
+  }
+
+  recoveryEventPayload(run, fromStatus, toStatus, reason, extra = {}) {
+    return {
+      runId: run.id,
+      threadId: run.threadId,
+      turnId: run.turnId ?? null,
+      fromStatus,
+      toStatus,
+      reason,
+      generation: Number(run.generation ?? this.clientGeneration()) || 0,
+      epoch: this.runtimeSnapshotTracker.epoch,
+      ...extra
+    };
+  }
+
   async reconcileUncertainTurnStart(run, error) {
     this.addRunEvent(run, 'codex.turn.start.uncertain', {
+      runId: run.id,
       threadId: run.threadId,
+      turnId: run.turnId ?? null,
+      reason: 'uncertain_turn_start',
+      generation: Number(run.generation ?? this.clientGeneration()) || 0,
+      epoch: this.runtimeSnapshotTracker.epoch,
       message: error?.message ?? String(error)
     });
     await this.reconcilePersistedRun(run);
@@ -1465,14 +1550,14 @@ export class CodexThreadService {
       status: run.status,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
-      interruptReady: !isTerminalActivityStatus(run.status) && Boolean(run.turnId || run.status === 'running'),
+      interruptReady: !isTerminalActivityStatus(run.status) && run.status !== 'recovering' && Boolean(run.turnId || run.status === 'running'),
       interruptRequested: run.interruptRequested === true,
       submissionId: run.submissionId || '',
       runtime: {
         kind: 'app_server',
         state: run.status,
         generation: run.generation ?? this.clientGeneration(),
-        canInterrupt: !isTerminalActivityStatus(run.status) && Boolean(run.turnId || run.status === 'running'),
+        canInterrupt: !isTerminalActivityStatus(run.status) && run.status !== 'recovering' && Boolean(run.turnId || run.status === 'running'),
         reconnecting: this.runtimeHealth().state === 'reconnecting'
       },
       pendingUserInput: run.pendingUserInputId

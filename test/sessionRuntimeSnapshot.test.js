@@ -83,6 +83,89 @@ test('runtime snapshot uses a new epoch for a restarted tracker', () => {
   assert.notEqual(first.epoch, restarted.epoch);
 });
 
+test('runtime snapshot keeps a newer active turn running and records a structured decision', () => {
+  const tracker = new SessionRuntimeSnapshotTracker({
+    epoch: 'epoch-decisions',
+    now: () => '2026-07-30T09:00:00.000Z'
+  });
+
+  const snapshot = tracker.build({
+    sessions: [{
+      id: 'thread-1',
+      title: '远程会话',
+      projectLabel: 'Codex',
+      activeTurnId: 'turn-1',
+      runtimeState: 'completed',
+      runtimeUpdatedAt: '2026-07-30T08:59:00.000Z',
+      terminalReason: 'completed'
+    }],
+    activeRuns: [{
+      id: 'run-2',
+      threadId: 'thread-1',
+      turnId: 'turn-2',
+      status: 'running',
+      updatedAt: '2026-07-30T09:00:00.000Z',
+      generation: 3
+    }]
+  });
+
+  assert.equal(snapshot.sessions[0].state, 'running');
+  assert.equal(snapshot.sessions[0].activeTurnId, 'turn-2');
+  assert.equal(snapshot.sessions[0].canInterrupt, true);
+  assert.deepEqual(snapshot.decisions, [{
+    threadId: 'thread-1',
+    runId: 'run-2',
+    turnId: 'turn-2',
+    fromState: 'completed',
+    toState: 'running',
+    generation: 3,
+    epoch: 'epoch-decisions',
+    reason: 'newer_turn_active'
+  }]);
+});
+
+test('runtime snapshot keeps an official terminal state sticky for the exact same turn', () => {
+  const tracker = new SessionRuntimeSnapshotTracker({
+    epoch: 'epoch-sticky',
+    now: () => '2026-07-30T09:00:00.000Z'
+  });
+
+  const snapshot = tracker.build({
+    sessions: [{
+      id: 'thread-1',
+      title: '远程会话',
+      projectLabel: 'Codex',
+      activeTurnId: 'turn-1',
+      runtimeState: 'completed',
+      runtimeUpdatedAt: '2026-07-30T09:00:00.000Z',
+      terminalReason: 'completed'
+    }],
+    activeRuns: [{
+      id: 'run-stale',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      status: 'running',
+      updatedAt: '2026-07-30T09:00:01.000Z',
+      generation: 1
+    }]
+  });
+
+  assert.equal(snapshot.sessions[0].state, 'completed');
+  assert.equal(snapshot.sessions[0].activeTurnId, 'turn-1');
+  assert.equal(snapshot.sessions[0].canInterrupt, false);
+  assert.equal(snapshot.sessions[0].terminalReason, 'completed');
+  assert.deepEqual(snapshot.decisions, [{
+    threadId: 'thread-1',
+    runId: 'run-stale',
+    turnId: 'turn-1',
+    fromState: 'completed',
+    toState: 'completed',
+    generation: 1,
+    epoch: 'epoch-sticky',
+    reason: 'official_terminal_sticky'
+  }]);
+});
+
 test('desktop official runtime state overrides stale session-file inference before active bridge runs', () => {
   const tracker = new SessionRuntimeSnapshotTracker({
     epoch: 'epoch-official',
