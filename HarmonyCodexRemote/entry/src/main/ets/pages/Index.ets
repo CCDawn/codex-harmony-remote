@@ -39,11 +39,11 @@ import {
 import { StandbyMonitorSnapshot } from '../model/StandbyMonitorModels';
 import { StandbyMonitorSnapshotService } from '../services/StandbyMonitorSnapshotService';
 import { SessionRuntimeStore } from '../services/SessionRuntimeStore';
-import { common, ConfigurationConstant, wantAgent } from '@kit.AbilityKit';
+import { AppBackgroundRuntimeService } from '../services/AppBackgroundRuntimeService';
+import { common, ConfigurationConstant } from '@kit.AbilityKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
-import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
 import {
   DEFAULT_BRIDGE_TOKEN,
   DEFAULT_BRIDGE_URL,
@@ -8858,22 +8858,13 @@ struct Index {
     }
     try {
       const context = getContext(this) as common.UIAbilityContext;
-      const agent = await wantAgent.getWantAgent({
-        wants: [{
-          bundleName: 'com.codex.remote.app',
-          abilityName: 'EntryAbility'
-        }],
-        actionType: wantAgent.OperationType.START_ABILITY,
-        requestCode: 11078,
-        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      });
-      await backgroundTaskManager.startBackgroundRunning(
-        context,
-        backgroundTaskManager.BackgroundMode.DATA_TRANSFER,
-        agent
+      const state = await AppBackgroundRuntimeService.ensureRunning(context, 'index_relay');
+      this.relayBackgroundRunning = state.running;
+      this.log(
+        'info',
+        'hdc_relay.background.started',
+        `source=${state.source}; startedAt=${state.startedAt}; detail=${state.detail}`
       );
-      this.relayBackgroundRunning = true;
-      this.log('info', 'hdc_relay.background.started', '');
     } catch (error) {
       this.log('error', 'hdc_relay.background.failed', this.errorText(error));
     }

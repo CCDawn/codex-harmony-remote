@@ -13,6 +13,9 @@ const sessionPresentationServicePath = path.resolve('HarmonyCodexRemote/entry/sr
 const bridgeModelsPath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/model/BridgeModels.ets');
 const entryAbilityPath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/entryability/EntryAbility.ets');
 const moduleProfilePath = path.resolve('HarmonyCodexRemote/entry/src/main/module.json5');
+const backgroundRuntimeServicePath = path.resolve(
+  'HarmonyCodexRemote/entry/src/main/ets/services/AppBackgroundRuntimeService.ets'
+);
 
 function source() {
   return fs.readFileSync(indexPath, 'utf8');
@@ -40,6 +43,10 @@ function bridgeModelsSource() {
 
 function moduleProfileSource() {
   return fs.readFileSync(moduleProfilePath, 'utf8');
+}
+
+function backgroundRuntimeServiceSource() {
+  return fs.readFileSync(backgroundRuntimeServicePath, 'utf8');
 }
 
 function methodBody(name) {
@@ -1071,6 +1078,26 @@ test('monitoring falls back to a stable privacy-safe notification and an always-
   assert.match(indexText, /DesktopMonitorPanel\(/);
   assert.match(indexText, /DesktopMonitorDisplayService\.enter/);
   assert.match(indexText, /DesktopMonitorDisplayService\.leave/);
+});
+
+test('the ability owns an idempotent data-transfer background runtime across lifecycle transitions', () => {
+  const abilityText = entryAbilitySource();
+  const profileText = moduleProfileSource();
+  const backgroundText = backgroundRuntimeServiceSource();
+  const indexText = source();
+
+  assert.match(profileText, /"backgroundModes":\s*\["dataTransfer"\]/);
+  assert.match(profileText, /ohos\.permission\.KEEP_BACKGROUND_RUNNING/);
+  assert.match(backgroundText, /export class AppBackgroundRuntimeService/);
+  assert.match(backgroundText, /static async ensureRunning/);
+  assert.match(backgroundText, /startPromise/);
+  assert.match(backgroundText, /backgroundTaskManager\.startBackgroundRunning/);
+  assert.match(backgroundText, /backgroundTaskManager\.BackgroundMode\.DATA_TRANSFER/);
+  assert.match(abilityText, /onCreate[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_create'\)/);
+  assert.match(abilityText, /onForeground[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_foreground'\)/);
+  assert.match(abilityText, /onBackground[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_background'\)/);
+  assert.match(indexText, /AppBackgroundRuntimeService\.ensureRunning\(context,\s*'index_relay'\)/);
+  assert.doesNotMatch(indexText, /backgroundTaskManager\.startBackgroundRunning/);
 });
 
 test('notification badges use absolute unread counts and unchanged monitor snapshots do not accumulate', () => {

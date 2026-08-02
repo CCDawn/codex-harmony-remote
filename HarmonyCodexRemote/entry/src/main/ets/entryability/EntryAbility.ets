@@ -6,6 +6,7 @@ import {
   NOTIFICATION_REVISION_STORAGE_KEY,
   NOTIFICATION_SESSION_STORAGE_KEY
 } from '../services/AppNotificationService';
+import { AppBackgroundRuntimeService } from '../services/AppBackgroundRuntimeService';
 
 const WINDOW_WIDTH_STORAGE_KEY = 'codexRemoteWindowWidth';
 const WINDOW_HEIGHT_STORAGE_KEY = 'codexRemoteWindowHeight';
@@ -45,6 +46,13 @@ export default class EntryAbility extends UIAbility {
     AppStorage.setOrCreate<string>(NOTIFICATION_EVENT_ID_STORAGE_KEY, '');
     AppStorage.setOrCreate<string>(NOTIFICATION_REVISION_STORAGE_KEY, '');
     this.applyNotificationTarget(want);
+    void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_create')
+      .then(() => {
+        console.info('[CodexRemote] Background runtime ready: ability_create');
+      })
+      .catch((error: Error) => {
+        console.error('[CodexRemote] Background runtime failed: ability_create: ' + error.message);
+      });
     console.info('[CodexRemote] EntryAbility onCreate');
   }
 
@@ -54,6 +62,20 @@ export default class EntryAbility extends UIAbility {
 
   onConfigurationUpdate(newConfig: Configuration): void {
     this.syncSystemDarkMode(newConfig.colorMode);
+  }
+
+  onForeground(): void {
+    void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_foreground')
+      .catch((error: Error) => {
+        console.error('[CodexRemote] Background runtime failed: ability_foreground: ' + error.message);
+      });
+  }
+
+  onBackground(): void {
+    void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_background')
+      .catch((error: Error) => {
+        console.error('[CodexRemote] Background runtime failed: ability_background: ' + error.message);
+      });
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
