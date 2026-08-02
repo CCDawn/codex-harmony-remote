@@ -1080,6 +1080,31 @@ test('monitoring falls back to a stable privacy-safe notification and an always-
   assert.match(indexText, /DesktopMonitorDisplayService\.leave/);
 });
 
+test('conversation history loads older cursor pages at the top without re-enabling bottom follow', () => {
+  const sourceText = source();
+  const clientText = fs.readFileSync(
+    path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'),
+    'utf8'
+  );
+  const modelText = bridgeModelsSource();
+  const edgeBody = methodBody('handleSessionScrollEdge(edge: Edge): void');
+  const olderBody = methodBody('loadOlderSessionEntries(source: string): Promise<void>');
+  const refreshBody = methodBody('refreshSelectedSessionDetail(): Promise<void>');
+
+  assert.match(modelText, /export interface CodexSessionSync/);
+  assert.match(modelText, /sync\?: CodexSessionSync/);
+  assert.match(modelText, /syncId\?: string/);
+  assert.match(clientText, /static async getSessionHistoryPage/);
+  assert.match(clientText, /\/api\/codex\/threads\/\$\{sessionId\}\/sync/);
+  assert.match(sourceText, /this\.SessionHistoryLoader\(\)/);
+  assert.match(edgeBody, /edge === Edge\.Top[\s\S]*loadOlderSessionEntries\('scroll_edge_top'\)/);
+  assert.match(olderBody, /BridgeClient\.getSessionHistoryPage/);
+  assert.match(olderBody, /beforeCursor/);
+  assert.match(olderBody, /this\.sessionAutoFollowBottom = false/);
+  assert.match(olderBody, /this\.mergeSessionEntryPages/);
+  assert.match(refreshBody, /this\.mergeSessionDetailPreservingHistory/);
+});
+
 test('the ability owns an idempotent data-transfer background runtime across lifecycle transitions', () => {
   const abilityText = entryAbilitySource();
   const profileText = moduleProfileSource();

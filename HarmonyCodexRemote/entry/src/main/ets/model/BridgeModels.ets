@@ -403,11 +403,27 @@ export interface CodexSessionEntry {
   type: string;
   role: string;
   text: string;
+  syncId?: string;
+  syncStartOffset?: number;
+  syncEndOffset?: number;
   liveKind?: string;
   threadId?: string;
   turnId?: string;
   itemId?: string;
   toolItems?: CodexSessionToolItem[];
+}
+
+export interface CodexSessionSync {
+  mode: string;
+  source: string;
+  filePath: string;
+  fileSize: number;
+  fileUpdatedAt: string;
+  cursorStart: string;
+  cursorEnd: string;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
+  entryCount: number;
 }
 
 export interface CodexSessionFingerprint {
@@ -443,4 +459,5 @@ export interface CodexSessionDetail {
   filePath: string;
   entries: CodexSessionEntry[];
   entryCount: number;
+  sync?: CodexSessionSync;
 }

@@ -1,5 +1,5 @@
 import { AppLogPayload, BridgeClient } from '../services/BridgeClient';
-import { BridgeEvent, BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, BridgeUserInputOption, BridgeUserInputQuestion, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SlashIndexItem, SystemLinkStatus, SystemRepairStatus } from '../model/BridgeModels';
+import { BridgeEvent, BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, BridgeUserInputOption, BridgeUserInputQuestion, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, CodexSessionSync, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SlashIndexItem, SystemLinkStatus, SystemRepairStatus } from '../model/BridgeModels';
 import { HdcRelayConfig, HdcRelayState, HdcRelayTunnel } from '../services/HdcRelayTunnel';
 import { ContentActionService } from '../services/ContentActionService';
 import { AttachmentService, PickedMobileFile } from '../services/AttachmentService';
@@ -269,6 +269,7 @@ struct Index {
   @State sessionComposerFocused: boolean = false;
   @State desktopScreenshotMetaText: string = '';
   @State sessionAutoFollowBottom: boolean = true;
+  @State isLoadingOlderSessionEntries: boolean = false;
   @State sessionStatusExpanded: boolean = false;
   @State slashCommandPanelVisible: boolean = false;
   @State slashIndexItems: SlashIndexItem[] = [];
@@ -1920,6 +1921,7 @@ struct Index {
       } else {
         Scroll(this.sessionScroller) {
           Column({ space: 3 }) {
+            this.SessionHistoryLoader()
             ForEach(this.visibleSessionEntries(), (entry: CodexSessionEntry) => {
               this.SessionEntryCard(entry)
             }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
@@ -4716,6 +4718,29 @@ struct Index {
     }
   }
 
+  @Builder
+  SessionHistoryLoader() {
+    if (this.selectedSession?.sync?.hasMoreBefore === true) {
+      Row({ space: 8 }) {
+        if (this.isLoadingOlderSessionEntries) {
+          LoadingProgress()
+            .width(16)
+            .height(16)
+            .color(this.themeColor('#1F6FEB'))
+        }
+        Text(this.isLoadingOlderSessionEntries ? '正在加载更早消息' : '加载更早消息')
+          .fontSize(this.scaledFontSize(12))
+          .fontColor(this.themeColor('#1F6FEB'))
+      }
+      .width('100%')
+      .height(38)
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => {
+        void this.loadOlderSessionEntries('history_button');
+      })
+    }
+  }
+
   private confirmSelectedSessionInterrupt(): void {
     const sessionId = this.selectedSession?.id ?? '';
     const taskId = this.selectedSessionInterruptTaskId();
@@ -5921,7 +5946,12 @@ struct Index {
   private async loadSessionDetail(sessionId: string): Promise<void> {
     const requestSeq = ++this.sessionDetailRequestSeq;
     try {
-      const detail = await BridgeClient.getSession(this.normalizedBridgeUrl(), sessionId, this.bridgeToken);
+      const detail = await BridgeClient.getSessionHistoryPage(
+        this.normalizedBridgeUrl(),
+        sessionId,
+        this.bridgeToken,
+        160
+      );
       if (requestSeq !== this.sessionDetailRequestSeq) {
         this.log('warn', 'session.detail.stale_ignored', `sessionId=${sessionId}; requestSeq=${requestSeq}; latestSeq=${this.sessionDetailRequestSeq}`);
         return;
@@ -6022,7 +6052,7 @@ struct Index {
       return;
     }
     const refreshedBottomSignature = this.sessionBottomSignature(refreshed);
-    this.selectedSession = refreshed;
+    this.selectedSession = this.mergeSessionDetailPreservingHistory(this.selectedSession, refreshed);
     this.applySessionActivitySnapshot(refreshed, 'detail_refresh');
     this.markSessionRead(previousSessionId);
     if (refreshed.entryCount !== previousEntryCount || refreshedBottomSignature !== previousBottomSignature) {
@@ -6078,6 +6108,10 @@ struct Index {
   }
 
   private handleSessionScrollEdge(edge: Edge): void {
+    if (edge === Edge.Top) {
+      void this.loadOlderSessionEntries('scroll_edge_top');
+      return;
+    }
     if (edge !== Edge.Bottom) {
       return;
     }
@@ -6085,6 +6119,135 @@ struct Index {
       this.log('info', 'ui.session_scroll.follow_resumed', 'edge=bottom');
     }
     this.sessionAutoFollowBottom = true;
+  }
+
+  private async loadOlderSessionEntries(source: string): Promise<void> {
+    if (this.isLoadingOlderSessionEntries || this.selectedSession === null) {
+      return;
+    }
+    const sessionId = this.selectedSession.id;
+    const beforeCursor = this.selectedSession.sync?.cursorStart ?? '';
+    if (this.selectedSession.sync?.hasMoreBefore !== true || beforeCursor.length === 0) {
+      return;
+    }
+    this.isLoadingOlderSessionEntries = true;
+    this.sessionAutoFollowBottom = false;
+    this.bumpSessionScrollGeneration();
+    try {
+      const older = await BridgeClient.getSessionHistoryPage(
+        this.normalizedBridgeUrl(),
+        sessionId,
+        this.bridgeToken,
+        120,
+        beforeCursor
+      );
+      if (this.selectedSession === null || this.selectedSession.id !== sessionId) {
+        return;
+      }
+      const current = this.selectedSession;
+      const entries = this.mergeSessionEntryPages(older.entries, current.entries);
+      const mergedSync: CodexSessionSync | undefined = older.sync ? {
+        mode: older.sync.mode,
+        source: older.sync.source,
+        filePath: older.sync.filePath,
+        fileSize: older.sync.fileSize,
+        fileUpdatedAt: older.sync.fileUpdatedAt,
+        cursorStart: older.sync.cursorStart,
+        cursorEnd: current.sync?.cursorEnd ?? older.sync.cursorEnd,
+        hasMoreBefore: older.sync.hasMoreBefore,
+        hasMoreAfter: current.sync?.hasMoreAfter ?? older.sync.hasMoreAfter,
+        entryCount: entries.length
+      } : current.sync;
+      this.selectedSession = this.sessionDetailWithEntries(current, entries, mergedSync);
+      this.log(
+        'info',
+        'session.history.older_loaded',
+        `source=${source}; sessionId=${sessionId}; before=${beforeCursor}; added=${entries.length - current.entries.length}; hasMoreBefore=${this.selectedSession.sync?.hasMoreBefore === true}`
+      );
+    } catch (error) {
+      this.message = `加载更早消息失败：${this.errorText(error)}`;
+      this.log(
+        'warn',
+        'session.history.older_failed',
+        `source=${source}; sessionId=${sessionId}; before=${beforeCursor}; message=${this.errorText(error)}`
+      );
+    } finally {
+      this.isLoadingOlderSessionEntries = false;
+    }
+  }
+
+  private mergeSessionDetailPreservingHistory(
+    current: CodexSessionDetail,
+    refreshed: CodexSessionDetail
+  ): CodexSessionDetail {
+    if (!current.sync || current.entries.length === 0) {
+      return refreshed;
+    }
+    const entries = this.mergeSessionEntryPages(current.entries, refreshed.entries);
+    const mergedSync: CodexSessionSync = {
+      mode: current.sync.mode,
+      source: current.sync.source,
+      filePath: current.sync.filePath,
+      fileSize: refreshed.sync?.fileSize ?? current.sync.fileSize,
+      fileUpdatedAt: refreshed.sync?.fileUpdatedAt ?? current.sync.fileUpdatedAt,
+      cursorStart: current.sync.cursorStart,
+      cursorEnd: refreshed.sync?.cursorEnd ?? current.sync.cursorEnd,
+      hasMoreBefore: current.sync.hasMoreBefore,
+      hasMoreAfter: refreshed.sync?.hasMoreAfter ?? current.sync.hasMoreAfter,
+      entryCount: entries.length
+    };
+    return this.sessionDetailWithEntries(refreshed, entries, mergedSync);
+  }
+
+  private sessionDetailWithEntries(
+    base: CodexSessionDetail,
+    entries: CodexSessionEntry[],
+    sync: CodexSessionSync | undefined
+  ): CodexSessionDetail {
+    return {
+      id: base.id,
+      title: base.title,
+      updatedAt: base.updatedAt,
+      relativeTime: base.relativeTime,
+      projectRoot: base.projectRoot,
+      projectLabel: base.projectLabel,
+      source: base.source,
+      activitySource: base.activitySource,
+      activityStatus: base.activityStatus,
+      activityUpdatedAt: base.activityUpdatedAt,
+      runtimeState: base.runtimeState,
+      runtimeSource: base.runtimeSource,
+      runtimeUpdatedAt: base.runtimeUpdatedAt,
+      activeTurnId: base.activeTurnId,
+      canInterrupt: base.canInterrupt,
+      terminalReason: base.terminalReason,
+      lastVisibleRole: base.lastVisibleRole,
+      pinned: base.pinned,
+      detailAvailable: base.detailAvailable,
+      filePath: base.filePath,
+      entries,
+      entryCount: base.entryCount,
+      sync
+    };
+  }
+
+  private mergeSessionEntryPages(
+    older: CodexSessionEntry[],
+    newer: CodexSessionEntry[]
+  ): CodexSessionEntry[] {
+    const merged: CodexSessionEntry[] = [];
+    const seen: Record<string, boolean> = {};
+    [...older, ...newer].forEach((entry: CodexSessionEntry) => {
+      const key = entry.syncId && entry.syncId.length > 0
+        ? `sync:${entry.syncId}`
+        : `entry:${entry.timestamp}:${entry.role}:${entry.type}:${entry.text}`;
+      if (seen[key] === true) {
+        return;
+      }
+      seen[key] = true;
+      merged.push(entry);
+    });
+    return merged;
   }
 
   private applyKeyboardAvoidMode(): void {

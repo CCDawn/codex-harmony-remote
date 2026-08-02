@@ -295,6 +295,35 @@ export class BridgeClient {
     return parsed.session;
   }
 
+  static async getSessionHistoryPage(
+    baseUrl: string,
+    sessionId: string,
+    token: string = '',
+    limit: number = 160,
+    beforeCursor: string = '',
+    afterCursor: string = ''
+  ): Promise<CodexSessionDetail> {
+    const params: string[] = [`limit=${Math.max(1, Math.min(200, Math.floor(limit)))}`];
+    if (beforeCursor.trim().length > 0) {
+      params.push(`before=${encodeURIComponent(beforeCursor.trim())}`);
+    }
+    if (afterCursor.trim().length > 0) {
+      params.push(`after=${encodeURIComponent(afterCursor.trim())}`);
+    }
+    const raw = await BridgeClient.request(
+      http.RequestMethod.GET,
+      `${baseUrl}/api/codex/threads/${sessionId}/sync?${params.join('&')}`,
+      '',
+      token,
+      { connectTimeout: 10000, readTimeout: 45000, retries: 1, retryDelayMs: 800 }
+    );
+    const parsed = JSON.parse(raw) as SessionResponse;
+    if (!parsed.session) {
+      throw new Error('桥接服务没有返回会话历史');
+    }
+    return parsed.session;
+  }
+
   static async deleteSession(baseUrl: string, sessionId: string, token: string = ''): Promise<void> {
     const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/threads/${sessionId}/delete`, '{}', token);
     const parsed = JSON.parse(raw) as DeleteThreadResponse;
