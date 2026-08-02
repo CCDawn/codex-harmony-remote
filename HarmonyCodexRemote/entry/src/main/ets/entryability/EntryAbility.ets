@@ -10,6 +10,7 @@ import {
 const WINDOW_WIDTH_STORAGE_KEY = 'codexRemoteWindowWidth';
 const WINDOW_HEIGHT_STORAGE_KEY = 'codexRemoteWindowHeight';
 const ACTIVE_SESSION_STORAGE_KEY = 'codexRemoteActiveSessionId';
+const SESSION_NAVIGATION_STORAGE_KEY = 'codexRemoteSessionNavigationState';
 const SESSION_DRAFT_STORAGE_KEY = 'codexRemoteSessionDraft';
 const SESSION_SIDEBAR_WIDTH_STORAGE_KEY = 'codexRemoteSessionSidebarWidth';
 const PREVIEW_IMAGE_URL_STORAGE_KEY = 'codexRemotePreviewImageUrl';
@@ -30,6 +31,7 @@ export default class EntryAbility extends UIAbility {
     AppStorage.setOrCreate<number>(WINDOW_WIDTH_STORAGE_KEY, 0);
     AppStorage.setOrCreate<number>(WINDOW_HEIGHT_STORAGE_KEY, 0);
     AppStorage.setOrCreate<string>(ACTIVE_SESSION_STORAGE_KEY, '');
+    AppStorage.setOrCreate<string>(SESSION_NAVIGATION_STORAGE_KEY, '');
     AppStorage.setOrCreate<string>(SESSION_DRAFT_STORAGE_KEY, '');
     AppStorage.setOrCreate<number>(SESSION_SIDEBAR_WIDTH_STORAGE_KEY, 304);
     AppStorage.setOrCreate<string>(PREVIEW_IMAGE_URL_STORAGE_KEY, '');

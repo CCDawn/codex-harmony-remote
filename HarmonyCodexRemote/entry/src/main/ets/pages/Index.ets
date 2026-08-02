@@ -149,6 +149,12 @@ interface SessionStructuredField {
   kind: string;
 }
 
+interface SessionNavigationSnapshot {
+  revision: number;
+  mode: string;
+  sessionId: string;
+}
+
 @Entry
 @Component
 struct Index {
@@ -158,6 +164,7 @@ struct Index {
   @StorageLink('codexRemoteWindowWidth') sessionWindowWidth: number = 0;
   @StorageLink('codexRemoteWindowHeight') sessionWindowHeight: number = 0;
   @StorageLink('codexRemoteActiveSessionId') activeSessionId: string = '';
+  @StorageLink('codexRemoteSessionNavigationState') sessionNavigationState: string = '';
   @StorageLink('codexRemoteSessionDraft') sessionMessage: string = '';
   @StorageLink('codexRemoteSessionSidebarWidth') sessionSidebarWidth: number = 304;
   @StorageLink('codexRemotePreviewImageUrl') previewImageUrl: string = '';
@@ -4251,6 +4258,12 @@ struct Index {
       this.log('warn', 'session.send.blocked', `reason=missing_session_file; sessionId=${this.selectedSession.id}`);
       return false;
     }
+    const navigation = this.readSessionNavigation();
+    if (navigation.mode !== 'session' || navigation.sessionId !== this.selectedSession.id) {
+      this.message = '会话导航状态已变化，已阻止发送。请重新打开目标会话后再试。';
+      this.log('error', 'session.send.blocked', `reason=navigation_target_mismatch; selectedSessionId=${this.selectedSession.id}; navigationMode=${navigation.mode}; navigationSessionId=${navigation.sessionId}; navigationRevision=${navigation.revision}`);
+      return false;
+    }
     if (!this.canSendSessionMessage()) {
       this.message = '当前任务仍在运行，完成后才能继续发送';
       this.log('info', 'session.send.blocked', `reason=task_active_or_empty; currentTaskId=${this.currentTask?.id ?? ''}`);
@@ -5932,17 +5945,63 @@ struct Index {
     }
   }
 
+  private readSessionNavigation(): SessionNavigationSnapshot {
+    if (this.sessionNavigationState.length > 0) {
+      try {
+        const parsed = JSON.parse(this.sessionNavigationState) as SessionNavigationSnapshot;
+        if (parsed && Number.isFinite(parsed.revision) && parsed.revision >= 0) {
+          return {
+            revision: parsed.revision,
+            mode: parsed.mode ?? 'home',
+            sessionId: parsed.sessionId ?? ''
+          };
+        }
+      } catch (error) {
+        this.log('warn', 'session.navigation.invalid_state', `message=${this.errorText(error)}; rawLength=${this.sessionNavigationState.length}`);
+      }
+    }
+    return {
+      revision: 0,
+      mode: this.activeSessionId.length > 0 ? 'session' : 'home',
+      sessionId: this.activeSessionId
+    };
+  }
+
+  private commitSessionNavigation(mode: string, sessionId: string, source: string): void {
+    const current = this.readSessionNavigation();
+    const next: SessionNavigationSnapshot = {
+      revision: current.revision + 1,
+      mode,
+      sessionId
+    };
+    this.sessionNavigationState = JSON.stringify(next);
+    this.activeSessionId = mode === 'session' ? sessionId : '';
+    this.log('info', 'session.navigation.committed', `source=${source}; mode=${mode}; sessionId=${sessionId}; revision=${next.revision}`);
+  }
+
+  private isSessionNavigationCurrent(revision: number, sessionId: string): boolean {
+    const current = this.readSessionNavigation();
+    return current.revision === revision
+      && current.mode === 'session'
+      && current.sessionId === sessionId;
+  }
+
   private async restoreActiveSessionIfNeeded(): Promise<void> {
-    if (this.activeSessionId.length === 0 || this.isNewSessionDraft) {
+    const navigation = this.readSessionNavigation();
+    if (navigation.mode !== 'session' || navigation.sessionId.length === 0 || this.isNewSessionDraft) {
       return;
     }
-    if (this.selectedSession !== null && this.selectedSession.id === this.activeSessionId) {
+    const sessionId = navigation.sessionId;
+    const restoreRevision = navigation.revision;
+    if (this.selectedSession !== null && this.selectedSession.id === sessionId) {
       return;
     }
-    const sessionId = this.activeSessionId;
-    this.log('info', 'session.rotation_restore.started', `sessionId=${sessionId}`);
+    this.log('info', 'session.rotation_restore.started', `sessionId=${sessionId}; revision=${restoreRevision}`);
     await this.loadSessionDetail(sessionId);
-    if (this.activeSessionId !== sessionId || this.selectedSession === null || this.selectedSession.id !== sessionId) {
+    if (!this.isSessionNavigationCurrent(restoreRevision, sessionId)
+      || this.selectedSession === null
+      || this.selectedSession.id !== sessionId) {
+      this.log('warn', 'session.rotation_restore.stale_ignored', `sessionId=${sessionId}; revision=${restoreRevision}; activeSessionId=${this.activeSessionId}`);
       return;
     }
     this.sessionSidebarCollapsed = !this.isLandscapeSessionLayout();
@@ -10388,7 +10447,7 @@ struct Index {
     this.closeSessionSwipe();
     this.applySessionActivitySnapshot(session, 'open');
     this.isNewSessionDraft = false;
-    this.activeSessionId = session.id;
+    this.commitSessionNavigation('session', session.id, 'open_session');
     this.expandedSessionEntries = [];
     this.sessionSidebarCollapsed = true;
     this.sessionSidebarUserCollapsed = false;
@@ -10523,7 +10582,7 @@ struct Index {
 
   private removeDeletedSessionLocalState(sessionId: string): void {
     if (this.activeSessionId === sessionId) {
-      this.activeSessionId = '';
+      this.commitSessionNavigation('home', '', 'delete_active_session');
     }
     this.sessions = this.sessions.filter((session: CodexSessionSummary) => session.id !== sessionId);
     this.runningSessionIds = this.runningSessionIds.filter((id: string) => id !== sessionId);
@@ -10644,7 +10703,7 @@ struct Index {
   private returnToSessionHome(source: string): void {
     this.sessionDetailRequestSeq += 1;
     this.selectedSession = null;
-    this.activeSessionId = '';
+    this.commitSessionNavigation('home', '', source);
     this.isNewSessionDraft = false;
     this.newSessionTaskId = '';
     this.sessionSidebarCollapsed = false;
@@ -10677,7 +10736,7 @@ struct Index {
       return;
     }
     this.selectedSession = null;
-    this.activeSessionId = '';
+    this.commitSessionNavigation('new', '', 'start_new_session');
     this.isNewSessionDraft = true;
     this.newSessionTaskId = '';
     this.sessionSidebarCollapsed = true;

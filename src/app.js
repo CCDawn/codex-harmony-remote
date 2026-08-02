@@ -2386,6 +2386,14 @@ async function dispatchExistingThreadMessage({
   const requestedReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? storedSettings.reasoningEffort ?? '');
   const model = requestedModel || defaults.model;
   const reasoningEffort = requestedReasoningEffort || defaults.reasoningEffort;
+  const submissionId = String(body.submissionId ?? '');
+  await logger.write('bridge', 'info', 'codex.thread.message.received', {
+    threadId,
+    submissionId,
+    projectId,
+    promptLength: prompt.length,
+    runtimeMode: appServerRuntimeMode(config)
+  });
   assertValidCodexSessionId(threadId);
   const sessionFingerprint = requireSessionFingerprint(body.sessionFingerprint);
   const verified = await sessions.verifySessionTarget(threadId, sessionFingerprint);
@@ -2396,7 +2404,9 @@ async function dispatchExistingThreadMessage({
     projectLabel: verified.projectLabel,
     filePath: verified.filePath,
     requestedTitle: sessionFingerprint.title ?? '',
-    requestedProjectLabel: sessionFingerprint.projectLabel ?? ''
+    requestedProjectLabel: sessionFingerprint.projectLabel ?? '',
+    submissionId,
+    runtimeMode: appServerRuntimeMode(config)
   });
   if (shouldUseAppServerForExistingThread(config, threadId)) {
     if (typeof threadService?.canSteerThread === 'function' && threadService.canSteerThread(threadId)) {
@@ -2404,13 +2414,14 @@ async function dispatchExistingThreadMessage({
         const run = await threadService.steerMessage({
           threadId,
           text: prompt,
-          submissionId: String(body.submissionId ?? '')
+          submissionId
         });
         await logger.write('bridge', 'info', 'codex.thread.message.app_server.steered', {
           runId: run.id,
           threadId,
           projectId,
           promptLength: prompt.length,
+          submissionId,
           runtimeMode: appServerRuntimeMode(config),
           sessionFingerprintVerified: true
         });
@@ -2431,13 +2442,14 @@ async function dispatchExistingThreadMessage({
       projectId,
       model,
       reasoningEffort,
-      submissionId: String(body.submissionId ?? '')
+      submissionId
     });
     await logger.write('bridge', 'info', 'codex.thread.message.app_server.queued', {
       runId: run.id,
       threadId,
       projectId,
       promptLength: prompt.length,
+      submissionId,
       model: model || 'auto',
       reasoningEffort: reasoningEffort || 'auto',
       runtimeMode: appServerRuntimeMode(config),
@@ -2449,7 +2461,7 @@ async function dispatchExistingThreadMessage({
     try {
       const task = await store.steerSessionTask(threadId, {
         prompt,
-        submissionId: String(body.submissionId ?? '')
+        submissionId
       });
       await logger.write('bridge', 'info', 'codex.thread.message.desktop_task.steered', {
         taskId: task.id,
@@ -2496,7 +2508,7 @@ async function dispatchExistingThreadMessage({
       projectId,
       model,
       reasoningEffort,
-      submissionId: String(body.submissionId ?? ''),
+      submissionId,
       deliveryMode: 'desktop_fallback'
     });
     await logger.write('bridge', 'warn', 'codex.thread.message.desktop_primary_fallback.queued', {
@@ -2524,7 +2536,7 @@ async function dispatchExistingThreadMessage({
     verifiedSessionTarget: verified,
     verifiedDesktopStatus,
     submissionSource: 'phone_thread_message',
-    submissionId: String(body.submissionId ?? ''),
+    submissionId,
     model,
     reasoningEffort
   });
@@ -2533,12 +2545,14 @@ async function dispatchExistingThreadMessage({
     threadId,
     projectId,
     promptLength: prompt.length,
+    submissionId,
     model: model || 'auto',
     reasoningEffort: reasoningEffort || 'auto',
     desktopVerification: 'verified_before_task',
     desktopStatus: verifiedDesktopStatus.status,
     desktopCurrentSessionId: verifiedDesktopStatus.currentSessionId ?? '',
-    desktopSessionVerified: verifiedDesktopStatus.sessionVerified === true
+    desktopSessionVerified: verifiedDesktopStatus.sessionVerified === true,
+    desktopTargetVerified: verifiedDesktopStatus.targetVerified === true
   });
   return { statusCode: 202, payload: { run: task } };
 }
@@ -3197,7 +3211,7 @@ function appServerRuntimeMode(config = {}) {
   const value = String(
     config.appServerRuntimeMode
     ?? process.env.CODEX_BRIDGE_RUNTIME_MODE
-    ?? 'app-server-primary'
+    ?? 'desktop'
   ).trim().toLowerCase();
   return [
     'desktop',
@@ -3206,7 +3220,7 @@ function appServerRuntimeMode(config = {}) {
     'app-server-new-only',
     'app-server-canary',
     'app-server-primary'
-  ].includes(value) ? value : 'app-server-primary';
+  ].includes(value) ? value : 'desktop';
 }
 
 function shouldUseDesktopPrimaryFallback(config) {

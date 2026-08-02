@@ -99,7 +99,7 @@ public relay.
 - `CODEX_BRIDGE_APP_SERVER_SANDBOX`: defaults to `workspace-write`.
 - `CODEX_BRIDGE_APP_SERVER_APPROVAL_POLICY`: defaults to `on-request`.
 
-`npm.cmd run agent:start` defaults to `app-server-primary`. The Bridge connects to the App
+`npm.cmd run agent:start` defaults to `desktop`. The Bridge connects to the App
 Server embedded in the running Codex desktop process, so the desktop and phone
 have one authoritative thread/turn/event owner. The phone and desktop keep
 independent selected-thread cursors: selecting or sending to thread B on the

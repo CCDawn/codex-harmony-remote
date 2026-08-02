@@ -19,7 +19,7 @@ $env:CODEX_BRIDGE_PORT = [string]$Port
 $env:CODEX_BRIDGE_WORKSPACE = $Workspace
 $env:CODEX_BRIDGE_ADAPTER = $Adapter
 if ([string]::IsNullOrWhiteSpace($RuntimeMode)) {
-  $RuntimeMode = 'app-server-primary'
+  $RuntimeMode = 'desktop'
 }
 $env:CODEX_BRIDGE_RUNTIME_MODE = $RuntimeMode
 $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS = $CanaryThreadIds

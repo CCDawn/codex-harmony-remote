@@ -38,7 +38,7 @@ $args = @{
 }
 
 if ([string]::IsNullOrWhiteSpace($RuntimeMode)) {
-  $RuntimeMode = 'app-server-primary'
+  $RuntimeMode = 'desktop'
 }
 $args.RuntimeMode = $RuntimeMode
 if (-not [string]::IsNullOrWhiteSpace($CanaryThreadIds)) {

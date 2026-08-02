@@ -35,7 +35,7 @@ function createAdapter() {
 }
 
 async function initializeSelectedRuntime(threadService) {
-  const mode = String(config.appServerRuntimeMode ?? 'app-server-primary').trim().toLowerCase();
+  const mode = String(config.appServerRuntimeMode ?? 'desktop').trim().toLowerCase();
   if (mode === 'desktop') {
     return;
   }

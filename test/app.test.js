@@ -14,8 +14,8 @@ import { extractAccountUsageFromDesktopSnapshot, extractAccountUsageFromUsageApi
 function createTestConfig() {
   const sessionSettingsById = new Map();
   const config = {
-    // Keep the legacy app fixture explicit. Production now defaults to the
-    // App Server primary path; these tests cover the desktop/CDP contract
+    // Keep the desktop fixture explicit. Production also defaults to the
+    // desktop-owned path; individual tests opt into compatibility modes
     // unless a case opts into another runtime mode below.
     appServerRuntimeMode: 'desktop',
     outboxEnabled: false,

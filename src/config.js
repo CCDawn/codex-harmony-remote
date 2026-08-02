@@ -66,7 +66,7 @@ export const config = {
     1,
     Number.parseInt(process.env.CODEX_BRIDGE_REMOTE_FILE_MAX_BYTES ?? `${25 * 1024 * 1024}`, 10)
   ),
-  appServerRuntimeMode: process.env.CODEX_BRIDGE_RUNTIME_MODE ?? 'app-server-primary',
+  appServerRuntimeMode: process.env.CODEX_BRIDGE_RUNTIME_MODE ?? 'desktop',
   appServerCanaryThreadIds: String(process.env.CODEX_BRIDGE_APP_SERVER_CANARY_THREADS ?? '')
     .split(',')
     .map((value) => value.trim())

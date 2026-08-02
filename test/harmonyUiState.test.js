@@ -770,6 +770,7 @@ test('session workspace uses responsive landscape columns with a fully hidden co
   const openBody = methodBody('openSession(session: CodexSessionSummary): Promise<void>');
   const restoreBody = methodBody('restoreActiveSessionIfNeeded(): Promise<void>');
   const returnHomeBody = methodBody('returnToSessionHome(source: string): void');
+  const sendBody = methodBody("sendMessageToSelectedSession(retryFailedMessageId: string = ''): Promise<boolean>");
   const aboutToAppearBody = methodBody('aboutToAppear(): void');
   const abilityText = entryAbilitySource();
   const moduleText = moduleProfileSource();
@@ -777,6 +778,7 @@ test('session workspace uses responsive landscape columns with a fully hidden co
   assert.match(sourceText, /@StorageLink\('codexRemoteWindowWidth'\) sessionWindowWidth: number = 0/);
   assert.match(sourceText, /@StorageLink\('codexRemoteWindowHeight'\) sessionWindowHeight: number = 0/);
   assert.match(sourceText, /@StorageLink\('codexRemoteActiveSessionId'\) activeSessionId: string = ''/);
+  assert.match(sourceText, /@StorageLink\('codexRemoteSessionNavigationState'\) sessionNavigationState: string = ''/);
   assert.match(sourceText, /@StorageLink\('codexRemoteSessionDraft'\) sessionMessage: string = ''/);
   assert.match(sourceText, /@StorageLink\('codexRemoteSessionSidebarWidth'\) sessionSidebarWidth: number = 304/);
   assert.match(sourceText, /@State sessionSidebarUserCollapsed: boolean = false/);
@@ -796,10 +798,16 @@ test('session workspace uses responsive landscape columns with a fully hidden co
   assert.match(toggleBody, /this\.sessionSidebarUserCollapsed = collapsed/);
   assert.match(landscapeBody, /width >= 720 && width > height/);
   assert.match(closeBody, /this\.sessionSidebarUserCollapsed = this\.isLandscapeSessionLayout\(\)/);
-  assert.match(openBody, /this\.activeSessionId = session\.id/);
+  assert.match(openBody, /this\.commitSessionNavigation\('session', session\.id, 'open_session'\)/);
   assert.match(openBody, /this\.sessionSidebarUserCollapsed = false/);
-  assert.match(restoreBody, /const sessionId = this\.activeSessionId[\s\S]*await this\.loadSessionDetail\(sessionId\)/);
-  assert.match(returnHomeBody, /this\.activeSessionId = ''/);
+  assert.match(restoreBody, /const navigation = this\.readSessionNavigation\(\)/);
+  assert.match(restoreBody, /navigation\.mode !== 'session'/);
+  assert.match(restoreBody, /const restoreRevision = navigation\.revision/);
+  assert.match(restoreBody, /this\.isSessionNavigationCurrent\(restoreRevision, sessionId\)/);
+  assert.match(returnHomeBody, /this\.commitSessionNavigation\('home', '', source\)/);
+  assert.match(sendBody, /const navigation = this\.readSessionNavigation\(\)/);
+  assert.match(sendBody, /navigation\.mode !== 'session' \|\| navigation\.sessionId !== this\.selectedSession\.id/);
+  assert.match(sendBody, /reason=navigation_target_mismatch/);
   assert.doesNotMatch(aboutToAppearBody, /this\.sessionMessage = ''/);
   assert.match(abilityText, /mainWindow\.on\('windowSizeChange', this\.windowSizeChangeHandler\)/);
   assert.match(abilityText, /mainWindow\.off\('windowSizeChange', this\.windowSizeChangeHandler\)/);

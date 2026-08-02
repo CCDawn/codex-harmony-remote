@@ -17,7 +17,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if ([string]::IsNullOrWhiteSpace($RuntimeMode)) {
-  $RuntimeMode = 'app-server-primary'
+  $RuntimeMode = 'desktop'
 }
 $RuntimeMode = $RuntimeMode.Trim().ToLowerInvariant()
 if ($RuntimeMode -notin @('desktop', 'desktop-primary', 'app-server-shadow', 'app-server-new-only', 'app-server-canary', 'app-server-primary')) {

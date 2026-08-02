@@ -258,15 +258,17 @@ test('safe deploy reads bridge defaults from app config when environment is empt
   assert.match(text, /if \(\[string\]::IsNullOrWhiteSpace\(\$BridgeToken\)\)/);
 });
 
-test('startup stack defaults to the App Server primary path and keeps desktop mode explicit', () => {
+test('startup stack defaults to the desktop-owned runtime and keeps independent App Server modes explicit', () => {
   const stackText = readScript('scripts/start-codex-mobile-stack.ps1');
   const agentText = readScript('scripts/agent/start-stack.ps1');
   const watchdogText = readScript('tools/harmony/watch-local-bridge.ps1');
   const lanText = readScript('scripts/start-bridge-lan.ps1');
   const configText = readScript('src/config.js');
+  const appText = readScript('src/app.js');
+  const serverText = readScript('src/server.js');
 
   assert.match(stackText, /\[string\]\$RuntimeMode = \$env:CODEX_BRIDGE_RUNTIME_MODE/);
-  assert.match(stackText, /\$RuntimeMode = 'app-server-primary'/);
+  assert.match(stackText, /\$RuntimeMode = 'desktop'/);
   assert.match(stackText, /'desktop', 'desktop-primary', 'app-server-shadow', 'app-server-new-only', 'app-server-canary', 'app-server-primary'/);
   assert.match(stackText, /CODEX_BRIDGE_RUNTIME_MODE='\$RuntimeMode'/);
   assert.match(stackText, /Bridge 运行模式未生效: expected=\$RuntimeMode; actual=\$actualMode/);
@@ -278,10 +280,15 @@ test('startup stack defaults to the App Server primary path and keeps desktop mo
   assert.match(stackText, /function Ensure-DesktopLiveWatchdog/);
   assert.match(stackText, /watch-desktop-live\.ps1/);
   assert.match(agentText, /\$args\.RuntimeMode = \$RuntimeMode/);
-  assert.match(agentText, /\$RuntimeMode = 'app-server-primary'/);
-  assert.match(watchdogText, /\$RuntimeMode = 'app-server-primary'/);
-  assert.match(lanText, /\$RuntimeMode = 'app-server-primary'/);
-  assert.match(configText, /CODEX_BRIDGE_RUNTIME_MODE \?\? 'app-server-primary'/);
+  assert.match(agentText, /\$RuntimeMode = 'desktop'/);
+  assert.match(watchdogText, /\$RuntimeMode = 'desktop'/);
+  assert.match(lanText, /\$RuntimeMode = 'desktop'/);
+  assert.match(configText, /CODEX_BRIDGE_RUNTIME_MODE \?\? 'desktop'/);
+  assert.match(appText, /process\.env\.CODEX_BRIDGE_RUNTIME_MODE[\s\S]*\?\? 'desktop'/);
+  assert.match(appText, /\]\.includes\(value\) \? value : 'desktop'/);
+  assert.match(serverText, /config\.appServerRuntimeMode \?\? 'desktop'/);
+  assert.match(appText, /codex\.thread\.message\.received/);
+  assert.match(appText, /submissionId/);
   assert.match(watchdogText, /local bridge runtime mismatch/);
 });
 

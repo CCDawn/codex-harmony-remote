@@ -93,7 +93,7 @@ Actions:
 
 ## Desktop-owned App Server Runtime
 
-The default runtime is `app-server-primary`. The phone may operate thread B while the
+The default runtime is `desktop`. The phone may operate thread B while the
 desktop displays thread A. A difference between those selected thread ids is
 informational and must not block sending, provided the desktop-owned App Server
 can verify B. A desktop channel outage remains blocking because the Bridge must
