@@ -17,7 +17,7 @@ function fingerprint() {
   };
 }
 
-async function createFixture({ outboxPath, runs = [], onSend = null }) {
+async function createFixture({ outboxPath, runs = [], onSend = null, threadServiceOverrides = {} }) {
   const threadService = {
     async listProjects() {
       return [{ id: 'probe', name: 'Probe', root: 'C:\\work' }];
@@ -63,12 +63,14 @@ async function createFixture({ outboxPath, runs = [], onSend = null }) {
     },
     listApprovals() {
       return [];
-    }
+    },
+    ...threadServiceOverrides
   };
   const config = {
     repoRoot: path.dirname(outboxPath),
     outboxPath,
     outboxEnabled: true,
+    outboxBlockedDelayMs: 250,
     appServerRuntimeMode: 'app-server-primary',
     threadService,
     sessions: {
@@ -222,5 +224,72 @@ test('outbox API edits, reorders, and cancels queued thread messages', async () 
     assert.equal(listed.items.find((item) => item.id === first.outbox.id).status, 'canceled');
   } finally {
     fixture.server.close();
+  }
+});
+
+test('outbox never steers a message into a turn whose interrupt is still pending', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-interrupt-barrier-'));
+  const outboxPath = path.join(root, 'outbox.json');
+  const runs = [{
+    id: 'run-interrupting',
+    threadId: 'thread-a',
+    codexSessionId: 'thread-a',
+    status: 'running',
+    interruptRequested: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    events: []
+  }];
+  const steered = [];
+  const dispatched = [];
+  const fixture = await createFixture({
+    outboxPath,
+    runs,
+    onSend: async (input) => {
+      dispatched.push(input.submissionId);
+      return {
+        id: `run-${input.submissionId}`,
+        projectId: input.projectId,
+        threadId: input.threadId,
+        codexSessionId: input.threadId,
+        submissionId: input.submissionId,
+        status: 'running',
+        interruptRequested: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        events: []
+      };
+    },
+    threadServiceOverrides: {
+      canSteerThread() {
+        return runs[0].status === 'running';
+      },
+      async steerMessage(input) {
+        steered.push(input.text);
+        return runs[0];
+      }
+    }
+  });
+
+  try {
+    const response = await send(fixture.baseUrl, 'after-interrupt-1', '继续');
+    const body = await response.json();
+    assert.equal(response.status, 202);
+    assert.equal(body.outbox.status, 'queued');
+    assert.deepEqual(steered, []);
+    assert.deepEqual(dispatched, []);
+
+    runs[0].status = 'interrupted';
+    runs[0].interruptRequested = false;
+    await new Promise((resolve) => setTimeout(resolve, 275));
+    await fixture.outbox.dispatchReady();
+
+    const released = fixture.outbox.get(body.outbox.id);
+    assert.equal(released.status, 'submitted');
+    assert.deepEqual(steered, []);
+    assert.deepEqual(dispatched, ['after-interrupt-1']);
+  } finally {
+    fixture.server.close();
+    await fs.rm(root, { recursive: true, force: true });
   }
 });

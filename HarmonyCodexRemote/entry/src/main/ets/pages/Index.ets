@@ -333,6 +333,9 @@ struct Index {
   private sessionRuntimeStore: SessionRuntimeStore = new SessionRuntimeStore();
   private latestRuntimeSnapshot: CodexRuntimeSnapshot | null = null;
   private reasoningEffortLoadedSessionId: string = '';
+  private reasoningEffortLoadedAt: number = 0;
+  private desktopModelDefaultsLoadedAt: number = 0;
+  private modelSettingsCacheTtlMs: number = 10000;
   private notifiedTaskIds: string[] = [];
   private notifiedSessionCompletionKeys: string[] = [];
   private notifiedAttentionKeys: string[] = [];
@@ -360,7 +363,7 @@ struct Index {
     this.startLogFlusher();
     this.startDashboardRefresh();
     void this.refreshSlashIndex();
-    void this.loadDesktopReasoningDefaults();
+    void this.loadDesktopReasoningDefaults(true);
     void this.startRelayBackgroundRunning();
     void this.requestNotificationPermission();
     void this.applyPendingNotificationNavigation();
@@ -3300,7 +3303,7 @@ struct Index {
                 .onClick(() => {
                   if (this.shouldUseSessionInterruptAction()) {
                     this.log('info', 'ui.click.session_primary_interrupt', `sessionId=${this.selectedSession?.id ?? ''}; taskId=${this.selectedSessionInterruptTaskId()}`);
-                    void this.interruptSelectedSessionTask();
+                    this.confirmSelectedSessionInterrupt();
                   } else {
                     this.log('info', 'ui.click.session_primary_send', `sessionId=${this.selectedSession?.id ?? ''}; prompt=${this.sessionMessage}; images=${this.pendingSessionImages.length}`);
                     this.slashCommandPanelVisible = false;
@@ -4696,6 +4699,32 @@ struct Index {
       this.isInterruptingTask = false;
       this.interruptingSessionTargetId = '';
     }
+  }
+
+  private confirmSelectedSessionInterrupt(): void {
+    const sessionId = this.selectedSession?.id ?? '';
+    const taskId = this.selectedSessionInterruptTaskId();
+    this.log('info', 'ui.interrupt.confirmation.shown', `sessionId=${sessionId}; taskId=${taskId}`);
+    AlertDialog.show({
+      title: '中断当前会话？',
+      message: '中断会停止当前正在执行的回合。你随后发送的新消息会等待中断进入终态，再按顺序提交到同一会话。',
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          this.log('info', 'ui.interrupt.confirmation.cancelled', `sessionId=${sessionId}; taskId=${taskId}`);
+        }
+      },
+      secondaryButton: {
+        value: '确认中断',
+        fontColor: this.themeColor('#D92D20'),
+        action: () => {
+          this.log('info', 'ui.interrupt.confirmation.confirmed', `sessionId=${sessionId}; taskId=${taskId}`);
+          void this.interruptSelectedSessionTask();
+        }
+      }
+    });
   }
 
   private async refreshRunningSelectedSessionStatus(): Promise<void> {
@@ -7208,8 +7237,13 @@ struct Index {
     return this.reasoningEffortMenuVisible && (this.selectedSession !== null || this.isNewSessionDraft);
   }
 
-  private async loadSessionReasoningEffort(sessionId: string): Promise<void> {
-    if (sessionId.length === 0 || this.reasoningEffortLoadedSessionId === sessionId) {
+  private async loadSessionReasoningEffort(sessionId: string, force: boolean = false): Promise<void> {
+    if (sessionId.length === 0) {
+      return;
+    }
+    if (!force
+      && this.reasoningEffortLoadedSessionId === sessionId
+      && Date.now() - this.reasoningEffortLoadedAt < this.modelSettingsCacheTtlMs) {
       return;
     }
     try {
@@ -7223,24 +7257,33 @@ struct Index {
       this.sessionReasoningEffort = this.normalizeReasoningEffort(settings.reasoningEffort ?? '');
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? this.desktopDefaultReasoningEffort);
       this.reasoningEffortLoadedSessionId = sessionId;
-      this.log('info', 'session.model_settings.loaded', `sessionId=${sessionId}; model=${this.sessionModel || 'auto'}; defaultModel=${this.desktopDefaultModel || 'auto'}; effort=${this.sessionReasoningEffort || 'auto'}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
+      this.reasoningEffortLoadedAt = Date.now();
+      this.log('info', 'session.model_catalog.loaded', `sessionId=${sessionId}; force=${force}; model=${this.sessionModel || 'auto'}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; effort=${this.sessionReasoningEffort || 'auto'}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
     } catch (error) {
       this.sessionModel = '';
       this.sessionReasoningEffort = '';
-      this.reasoningEffortLoadedSessionId = sessionId;
-      this.log('warn', 'session.model_settings.load_failed', `sessionId=${sessionId}; message=${this.errorText(error)}`);
+      this.reasoningEffortLoadedSessionId = '';
+      this.reasoningEffortLoadedAt = 0;
+      this.log('warn', 'session.model_catalog.load_failed', `sessionId=${sessionId}; force=${force}; message=${this.errorText(error)}`);
     }
   }
 
-  private async loadDesktopReasoningDefaults(): Promise<void> {
+  private async loadDesktopReasoningDefaults(force: boolean = false): Promise<void> {
+    if (!force
+      && this.desktopModelDefaultsLoadedAt > 0
+      && Date.now() - this.desktopModelDefaultsLoadedAt < this.modelSettingsCacheTtlMs) {
+      return;
+    }
     try {
       const settings = await BridgeClient.getCodexSettings(this.normalizedBridgeUrl(), this.bridgeToken);
       this.desktopDefaultModel = this.normalizeModel(settings.defaultModel ?? settings.effectiveModel ?? '');
       this.availableModels = this.normalizeModelOptions(settings.modelOptions ?? []);
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? '');
-      this.log('info', 'session.model_settings.desktop_default_loaded', `defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
+      this.desktopModelDefaultsLoadedAt = Date.now();
+      this.log('info', 'session.model_catalog.refreshed', `force=${force}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
     } catch (error) {
-      this.log('warn', 'session.model_settings.desktop_default_failed', `message=${this.errorText(error)}`);
+      this.desktopModelDefaultsLoadedAt = 0;
+      this.log('warn', 'session.model_catalog.refresh_failed', `force=${force}; message=${this.errorText(error)}`);
     }
   }
 
@@ -9817,17 +9860,17 @@ struct Index {
     if (this.isSendingCurrentSessionMessage()) {
       return 'sending';
     }
-    if (this.isInterruptingSelectedSessionTask()) {
-      return 'interrupting';
-    }
-    if (this.shouldUseSessionInterruptAction()) {
-      return 'interrupt';
-    }
     if (this.canSendSessionMessage()) {
       if (!this.isNewSessionDraft && this.selectedSession !== null && this.hasRunningTaskForSession(this.selectedSession.id)) {
         return 'guidance_send';
       }
       return 'send';
+    }
+    if (this.isInterruptingSelectedSessionTask()) {
+      return 'interrupting';
+    }
+    if (this.shouldUseSessionInterruptAction()) {
+      return 'interrupt';
     }
     return 'disabled';
   }
@@ -10656,7 +10699,7 @@ struct Index {
     this.desktopLiveSessionVerified = false;
     this.message = '正在新建会话草稿';
     this.log('info', 'ui.click.new_session', '');
-    void this.loadDesktopReasoningDefaults();
+    void this.loadDesktopReasoningDefaults(true);
   }
 
   private canStartNewSessionDraft(): boolean {

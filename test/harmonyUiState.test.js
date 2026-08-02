@@ -116,6 +116,29 @@ test('selected running desktop session can interrupt through thread activity wit
   assert.match(selectedInterruptBody, /BridgeClient\.interruptCodexThread\(this\.normalizedBridgeUrl\(\), targetSessionId, this\.bridgeToken\)/);
 });
 
+test('session interrupt requires explicit confirmation and records the decision boundary', () => {
+  const composerBody = methodBody('SessionComposer()');
+  const confirmBody = methodBody('confirmSelectedSessionInterrupt()');
+
+  assert.match(composerBody, /this\.confirmSelectedSessionInterrupt\(\)/);
+  assert.doesNotMatch(composerBody, /void this\.interruptSelectedSessionTask\(\)/);
+  assert.match(confirmBody, /AlertDialog\.show\(\{/);
+  assert.match(confirmBody, /ui\.interrupt\.confirmation\.shown/);
+  assert.match(confirmBody, /ui\.interrupt\.confirmation\.cancelled/);
+  assert.match(confirmBody, /ui\.interrupt\.confirmation\.confirmed/);
+  assert.match(confirmBody, /void this\.interruptSelectedSessionTask\(\)/);
+});
+
+test('a draft remains sendable while the prior turn interrupt is being confirmed', () => {
+  const modeBody = methodBody('sessionPrimaryActionMode()');
+  const interruptingIndex = modeBody.indexOf('this.isInterruptingSelectedSessionTask()');
+  const sendableIndex = modeBody.indexOf('this.canSendSessionMessage()');
+
+  assert.ok(sendableIndex >= 0 && sendableIndex < interruptingIndex,
+    'draft sendability must be resolved before the interrupt-only loading state');
+  assert.match(modeBody, /this\.canSendSessionMessage\(\)[\s\S]*this\.hasRunningTaskForSession\(this\.selectedSession\.id\)[\s\S]*return 'guidance_send'/);
+});
+
 test('primary action loading state is scoped to the selected session', () => {
   const symbolBody = methodBody('SessionPrimaryActionSymbol()');
   const modeBody = methodBody('sessionPrimaryActionMode()');
@@ -386,6 +409,22 @@ test('automatic reasoning effort displays the desktop default strength', () => {
   assert.match(defaultsBody, /settings\.defaultModel/);
   assert.match(defaultsBody, /settings\.modelOptions/);
   assert.match(defaultsBody, /settings\.defaultReasoningEffort/);
+});
+
+test('model settings cache refreshes after failures and emits catalog diagnostics', () => {
+  const sourceText = source();
+  const loadBody = methodBody('loadSessionReasoningEffort(sessionId: string, force: boolean = false): Promise<void>');
+  const defaultsBody = methodBody('loadDesktopReasoningDefaults(force: boolean = false): Promise<void>');
+
+  assert.match(sourceText, /private modelSettingsCacheTtlMs: number = 10000/);
+  assert.match(loadBody, /force/);
+  assert.match(loadBody, /Date\.now\(\) - this\.reasoningEffortLoadedAt < this\.modelSettingsCacheTtlMs/);
+  assert.match(loadBody, /session\.model_catalog\.loaded/);
+  assert.match(loadBody, /modelCount=\$\{this\.availableModels\.length\}/);
+  assert.doesNotMatch(loadBody, /catch \(error\)[\s\S]*this\.reasoningEffortLoadedSessionId = sessionId/);
+  assert.match(defaultsBody, /force/);
+  assert.match(defaultsBody, /session\.model_catalog\.refreshed/);
+  assert.match(defaultsBody, /modelCount=\$\{this\.availableModels\.length\}/);
 });
 
 test('git codex directives render as compact component blocks', () => {

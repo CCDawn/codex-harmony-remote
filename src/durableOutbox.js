@@ -46,6 +46,7 @@ export class DurableOutbox {
     this.initialized = null;
     this.persistPromise = Promise.resolve();
     this.dispatchPromise = null;
+    this.blockedDecisionByItemId = new Map();
     this.timer = null;
   }
 
@@ -323,12 +324,32 @@ export class DurableOutbox {
 
   async dispatchOne(item) {
     if (this.canDispatch) {
-      const allowed = await this.canDispatch(clone(item));
-      if (!allowed) {
+      const decision = normalizeDispatchDecision(await this.canDispatch(clone(item)));
+      if (!decision.allowed) {
         item.nextAttemptAt = isoAt(this.now() + this.blockedDelayMs);
         item.updatedAt = isoAt(this.now());
         await this.persist();
+        const previousReason = this.blockedDecisionByItemId.get(item.id);
+        if (previousReason !== decision.reason) {
+          this.blockedDecisionByItemId.set(item.id, decision.reason);
+          await this.log('info', decision.reason === 'interrupt_pending'
+            ? 'submission.blocked_by_interrupt'
+            : 'submission.blocked', {
+            ...summarize(item),
+            reason: decision.reason,
+            runId: decision.runId,
+            turnId: decision.turnId
+          });
+        }
         return clone(item);
+      }
+      const previousReason = this.blockedDecisionByItemId.get(item.id);
+      if (previousReason) {
+        this.blockedDecisionByItemId.delete(item.id);
+        await this.log('info', 'submission.dequeued', {
+          ...summarize(item),
+          previousReason
+        });
       }
     }
     item.status = 'dispatching';
@@ -550,6 +571,23 @@ function normalizePayload(payload) {
     return {};
   }
   return clone(payload);
+}
+
+function normalizeDispatchDecision(value) {
+  if (value && typeof value === 'object') {
+    return {
+      allowed: value.allowed === true,
+      reason: String(value.reason ?? 'runtime_busy'),
+      runId: String(value.runId ?? ''),
+      turnId: String(value.turnId ?? '')
+    };
+  }
+  return {
+    allowed: value === true,
+    reason: value === true ? '' : 'runtime_busy',
+    runId: '',
+    turnId: ''
+  };
 }
 
 function normalizeResult(result) {

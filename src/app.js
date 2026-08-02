@@ -94,6 +94,7 @@ export function createApp({ config, adapter }) {
     : config.outbox ?? new DurableOutbox({
         filePath: config.outboxPath
           ?? path.join(config.repoRoot ?? process.cwd(), 'logs', 'state', 'mobile-outbox.json'),
+        blockedDelayMs: config.outboxBlockedDelayMs,
         logger,
         reconcile: config.outboxReconciler
           ?? createOutboxReceiptReconciler({ threadService, sessions }),
@@ -2196,6 +2197,14 @@ async function canDispatchOutboxItem({ item, store, threadService }) {
         ))
       : null;
     if (activeRun) {
+      if (activeRun.interruptRequested === true) {
+        return {
+          allowed: false,
+          reason: 'interrupt_pending',
+          runId: String(activeRun.id ?? ''),
+          turnId: String(activeRun.turnId ?? activeRun.activeCodexTurnId ?? '')
+        };
+      }
       return typeof threadService?.canSteerThread === 'function'
         && threadService.canSteerThread(item.threadId);
     }
