@@ -36,6 +36,7 @@ test('analyzeLogRun correlates interrupt, queued follow-up, policy, model, and r
     { timestamp: '2026-08-02T00:00:06.000Z', source: 'bridge', level: 'warn', event: 'policy.mismatch', data: { runId: 'run-2', threadId: 'thread-1', turnId: 'turn-2' } },
     { timestamp: '2026-08-02T00:00:07.000Z', source: 'bridge', level: 'info', event: 'model.catalog.loaded', data: { source: 'app_server', revision: 'gpt-sol|gpt-terra', modelCount: 2, defaultModel: 'gpt-sol' } },
     { timestamp: '2026-08-02T00:00:08.000Z', source: 'bridge', level: 'info', event: 'runtime.snapshot.reconciled', data: { revision: 4, conflictCount: 1, decisions: [{ threadId: 'thread-1', turnId: 'turn-1', reason: 'official_terminal_sticky' }] } },
+    { timestamp: '2026-08-02T00:00:08.500Z', source: 'bridge', level: 'info', event: 'runtime.snapshot.app_server_projected', data: { source: 'thread/list', resolvedThreadIds: ['thread-1'], activeThreadIds: [], unresolvedActiveThreadIds: [] } },
     { timestamp: '2026-08-02T00:00:09.000Z', source: 'bridge', level: 'info', event: 'codex.turn.interrupt.requested', data: { runId: 'run-stuck', threadId: 'thread-2', payload: { turnId: 'turn-stuck' } } }
   ];
   await fs.writeFile(
@@ -56,6 +57,8 @@ test('analyzeLogRun correlates interrupt, queued follow-up, policy, model, and r
   assert.equal(summary.stateSync.policy.mismatches.length, 1);
   assert.equal(summary.stateSync.modelCatalog.source, 'app_server');
   assert.equal(summary.stateSync.runtime.conflicts, 1);
+  assert.equal(summary.stateSync.runtime.projections, 1);
+  assert.deepEqual(summary.stateSync.runtime.latestProjection.resolvedThreadIds, ['thread-1']);
   assert.deepEqual(
     summary.stateSync.anomalies.map((item) => item.code).sort(),
     ['interrupt_without_terminal', 'policy_mismatch']

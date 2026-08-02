@@ -51,6 +51,7 @@ export class CodexThreadService {
       epoch: options.runtimeSnapshotEpoch
     });
     this.lastRuntimeSnapshotLoggedRevision = 0;
+    this.lastAppServerProjectionLogFingerprint = '';
     this.converter = new CodexAppServerEventConverter();
     this.runJournal = options.runJournal ?? new CodexAppServerRunJournal({
       filePath: options.runStatePath === undefined
@@ -135,6 +136,37 @@ export class CodexThreadService {
         this.addServiceEvent('codex.desktop_runtime_states.list_failed', {
           message: error.message ?? String(error)
         });
+      }
+    }
+    if (this.allowIndependentAppServer) {
+      const projectedStates = sessions
+        .filter((session) => isRunningActivityStatus(
+          normalizeActivityStatus(session?.appServerRuntimeState)
+        ))
+        .map(runtimeStateFromAppServerProjection);
+      officialStates = mergeRuntimeStateLists(officialStates, projectedStates);
+      const officialThreadIds = new Set(officialStates.map((state) => state.threadId));
+      const unresolvedActiveThreadIds = sessions
+        .filter((session) => {
+          const state = normalizeActivityStatus(session?.runtimeState ?? session?.activityStatus);
+          return isRunningActivityStatus(state)
+            && !officialThreadIds.has(String(session?.id ?? session?.threadId ?? '').trim());
+        })
+        .map((session) => String(session?.id ?? session?.threadId ?? '').trim())
+        .filter(Boolean);
+      stale = unresolvedActiveThreadIds.length > 0;
+      const projectionData = {
+        source: 'thread/list',
+        resolvedThreadIds: projectedStates.map((state) => state.threadId),
+        activeThreadIds: projectedStates
+          .filter((state) => isRunningActivityStatus(state.state))
+          .map((state) => state.threadId),
+        unresolvedActiveThreadIds
+      };
+      const projectionFingerprint = JSON.stringify(projectionData);
+      if (projectionFingerprint !== this.lastAppServerProjectionLogFingerprint) {
+        this.lastAppServerProjectionLogFingerprint = projectionFingerprint;
+        this.addServiceEvent('runtime.snapshot.app_server_projected', projectionData);
       }
     }
     const snapshot = this.runtimeSnapshotTracker.build({
@@ -1636,6 +1668,7 @@ export class CodexThreadService {
     const cwd = String(thread?.cwd ?? '');
     const project = this.resolveProjectByRoot(cwd);
     const updatedAt = timestampToIso(thread?.updatedAt ?? thread?.createdAt) || new Date().toISOString();
+    const runtime = appServerThreadRuntimeState(thread);
     return {
       id,
       title: cleanTitle(thread?.name ?? thread?.preview ?? thread?.firstUserMessage ?? '未命名会话'),
@@ -1645,7 +1678,18 @@ export class CodexThreadService {
       projectLabel: project?.name ?? (cwd ? path.basename(cwd.replace(/[\\/]+$/, '')) : '未归类'),
       sidebarSection: 'recent',
       source: 'app-server',
-      activitySource: 'app-server',
+      activitySource: 'app-server-thread-list',
+      activityStatus: runtime.state,
+      activityUpdatedAt: updatedAt,
+      runtimeState: runtime.state,
+      runtimeSource: 'app-server-thread-list',
+      runtimeUpdatedAt: updatedAt,
+      activeTurnId: runtime.activeTurnId,
+      canInterrupt: runtime.canInterrupt,
+      terminalReason: '',
+      appServerRuntimeState: runtime.state,
+      appServerRuntimeUpdatedAt: updatedAt,
+      appServerActiveTurnId: runtime.activeTurnId,
       pinned: false,
       detailAvailable: true
     };
@@ -1722,6 +1766,45 @@ function cleanTitle(value) {
   return `${text.slice(0, 80)}...`;
 }
 
+function appServerThreadRuntimeState(thread) {
+  const rawStatus = typeof thread?.status === 'object'
+    ? String(thread.status?.type ?? '')
+    : String(thread?.status ?? '');
+  const activeFlags = Array.isArray(thread?.status?.activeFlags)
+    ? thread.status.activeFlags.map((flag) => String(flag).toLowerCase())
+    : [];
+  const joinedFlags = activeFlags.join(' ');
+  let state = 'idle';
+  if (rawStatus.trim().toLowerCase() === 'active') {
+    if (joinedFlags.includes('approval')) {
+      state = 'waiting_approval';
+    } else if (joinedFlags.includes('input') || joinedFlags.includes('question')) {
+      state = 'waiting_input';
+    } else if (joinedFlags.includes('recover') || joinedFlags.includes('compact')) {
+      state = 'recovering';
+    } else {
+      state = 'running';
+    }
+  }
+  return {
+    state,
+    activeTurnId: String(thread?.activeTurnId ?? thread?.turnId ?? '').trim(),
+    canInterrupt: isRunningActivityStatus(state)
+  };
+}
+
+function runtimeStateFromAppServerProjection(session) {
+  const state = normalizeActivityStatus(session?.appServerRuntimeState) || 'idle';
+  return {
+    threadId: String(session?.id ?? session?.threadId ?? '').trim(),
+    state,
+    updatedAt: String(session?.appServerRuntimeUpdatedAt ?? session?.updatedAt ?? ''),
+    source: 'app-server-thread-list',
+    activeTurnId: String(session?.appServerActiveTurnId ?? '').trim(),
+    canInterrupt: isRunningActivityStatus(state)
+  };
+}
+
 function sessionToSummary(session) {
   const runtimeState = normalizeActivityStatus(session.runtimeState ?? session.activityStatus) || 'idle';
   return {
@@ -1786,6 +1869,9 @@ function mergeRemoteAndDesktopSessions(remoteSessions, desktopSessions) {
       runtimeUpdatedAt,
       canInterrupt: !terminal && (runtimeState === 'running' || runtimeState === 'waiting_approval' || runtimeState === 'waiting_input' || remote.canInterrupt === true || desktop.canInterrupt === true),
       terminalReason: terminalReasonForStatus(runtimeState),
+      appServerRuntimeState: remote.appServerRuntimeState ?? '',
+      appServerRuntimeUpdatedAt: remote.appServerRuntimeUpdatedAt ?? '',
+      appServerActiveTurnId: remote.appServerActiveTurnId ?? '',
       lastVisibleRole: remote.lastVisibleRole || desktop.lastVisibleRole || '',
       pinned: desktop.pinned ?? remote.pinned ?? false,
       detailAvailable: desktop.detailAvailable !== false || remote.detailAvailable === true
@@ -1862,9 +1948,24 @@ function terminalStatusFromConvertedEvent(item) {
   return 'completed';
 }
 
-function runtimeStateFromDesktopThread(thread) {
+function mergeRuntimeStateLists(primary, secondary) {
+  const byThreadId = new Map();
+  for (const state of [...secondary, ...primary]) {
+    const threadId = String(state?.threadId ?? state?.id ?? '').trim();
+    if (threadId) {
+      byThreadId.set(threadId, state);
+    }
+  }
+  return [...byThreadId.values()];
+}
+
+function latestRuntimeTurn(thread) {
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-  const latest = [...turns].reverse().find((turn) => String(turn?.status ?? '').trim().length > 0);
+  return [...turns].reverse().find((turn) => String(turn?.status ?? '').trim().length > 0) ?? null;
+}
+
+function runtimeStateFromDesktopThread(thread) {
+  const latest = latestRuntimeTurn(thread);
   if (!latest) {
     return '';
   }
@@ -1945,6 +2046,9 @@ function chooseActivityState(left, right) {
   if ((leftRunning && rightIdle) || (rightRunning && leftIdle)) {
     const running = leftRunning ? left : right;
     const idle = leftIdle ? left : right;
+    if (idle.source === 'app-server-thread-list') {
+      return running;
+    }
     if (!idle.explicitUpdatedAt) {
       return running;
     }

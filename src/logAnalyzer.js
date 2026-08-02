@@ -97,6 +97,9 @@ function summarizeStateSync(entries) {
     || entry.event === 'session.model_catalog.refreshed'
   ));
   const runtimeEvents = entries.filter((entry) => entry.event === 'runtime.snapshot.reconciled');
+  const runtimeProjectionEvents = entries.filter((entry) => (
+    entry.event === 'runtime.snapshot.app_server_projected'
+  ));
   const runtimeConflicts = runtimeEvents.reduce(
     (total, entry) => total + Number(entry.data?.conflictCount ?? 0),
     0
@@ -141,7 +144,9 @@ function summarizeStateSync(entries) {
     runtime: {
       reconciliations: runtimeEvents.length,
       conflicts: runtimeConflicts,
-      latest: runtimeEvents.at(-1)?.data ?? null
+      latest: runtimeEvents.at(-1)?.data ?? null,
+      projections: runtimeProjectionEvents.length,
+      latestProjection: runtimeProjectionEvents.at(-1)?.data ?? null
     },
     anomalies
   };
@@ -336,6 +341,7 @@ function renderMarkdown(summary) {
   lines.push(`- Policy mismatches: ${summary.stateSync.policy.mismatches.length}`);
   lines.push(`- Model catalog: ${summary.stateSync.modelCatalog?.source ?? 'unknown'} (${summary.stateSync.modelCatalog?.modelCount ?? 0} models)`);
   lines.push(`- Runtime conflicts: ${summary.stateSync.runtime.conflicts}`);
+  lines.push(`- App Server runtime projections: ${summary.stateSync.runtime.projections}`);
   if (summary.stateSync.anomalies.length === 0) {
     lines.push('- Anomalies: none');
   } else {

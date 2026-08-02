@@ -303,6 +303,76 @@ test('CodexThreadService marks fallback runtime snapshots stale when desktop off
   assert.equal(staleSnapshot.sessions[0].source, 'session-file');
 });
 
+test('CodexThreadService reconciles App Server active state without hiding unverified desktop work', async () => {
+  const client = new FakeAppServerClient();
+  client.threadListStatus = { type: 'idle' };
+  const sessions = {
+    async listSessions() {
+      return [{
+        id: '019e-thread',
+        title: '桌面已结束但文件仍显示运行',
+        updatedAt: '2026-07-30T09:00:00.000Z',
+        runtimeState: 'running',
+        runtimeSource: 'session-file',
+        runtimeUpdatedAt: '2026-07-30T09:00:00.000Z',
+        detailAvailable: true
+      }];
+    }
+  };
+  const service = new CodexThreadService({
+    client,
+    sessions,
+    runtimeStateProvider: async () => {
+      throw new Error('desktop CDP unavailable');
+    }
+  });
+
+  const snapshot = await service.getRuntimeSnapshot();
+
+  assert.equal(snapshot.stale, true);
+  assert.equal(snapshot.sessions[0].state, 'running');
+  assert.equal(snapshot.sessions[0].source, 'session-file');
+  assert.equal(
+    client.calls.some((call) => call.method === 'thread/read'),
+    false
+  );
+
+  const activeClient = new FakeAppServerClient();
+  activeClient.threadListStatus = {
+    type: 'active',
+    activeFlags: ['approval']
+  };
+  const appServerOfficial = new CodexThreadService({
+    client: activeClient,
+    sessions,
+    runtimeStateProvider: async () => {
+      throw new Error('desktop CDP unavailable');
+    }
+  });
+  const appServerSnapshot = await appServerOfficial.getRuntimeSnapshot();
+  assert.equal(appServerSnapshot.stale, false);
+  assert.equal(appServerSnapshot.sessions[0].state, 'waiting_approval');
+  assert.equal(appServerSnapshot.sessions[0].source, 'app-server-thread-list');
+
+  const desktopOfficial = new CodexThreadService({
+    client: new FakeAppServerClient(),
+    sessions,
+    runtimeStateProvider: async () => [{
+      threadId: '019e-thread',
+      state: 'running',
+      activeTurnId: 'desktop-turn',
+      updatedAt: '2026-07-30T09:01:00.000Z',
+      source: 'desktop-app-server',
+      canInterrupt: true
+    }]
+  });
+  const desktopSnapshot = await desktopOfficial.getRuntimeSnapshot();
+  assert.equal(desktopSnapshot.stale, false);
+  assert.equal(desktopSnapshot.sessions[0].state, 'running');
+  assert.equal(desktopSnapshot.sessions[0].source, 'desktop-app-server');
+  assert.equal(desktopSnapshot.sessions[0].activeTurnId, 'desktop-turn');
+});
+
 test('CodexThreadService strict desktop mode never starts or requests the independent app-server', async () => {
   const client = new FakeAppServerClient();
   let initialized = 0;
@@ -1273,6 +1343,7 @@ class FakeAppServerClient extends EventEmitter {
     this.calls = [];
     this.waiters = [];
     this.threadStatus = 'completed';
+    this.threadListStatus = { type: 'idle' };
   }
 
   async request(method, params) {
@@ -1284,7 +1355,8 @@ class FakeAppServerClient extends EventEmitter {
           id: '019e-thread',
           name: '测试会话',
           cwd: 'C:\\work',
-          updatedAt: 1779926401
+          updatedAt: 1779926401,
+          status: this.threadListStatus
         }]
       };
     }
