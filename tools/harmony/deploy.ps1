@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [switch]$Build,
   [switch]$SkipInstall,
@@ -485,8 +485,9 @@ function Set-JunctionTarget {
   if ($existing) {
     if ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
       $currentTarget = ''
-      if ($existing.Target -and $existing.Target.Count -gt 0) {
-        $currentTarget = [System.IO.Path]::GetFullPath([string]$existing.Target[0])
+      $existingTargets = @($existing.Target)
+      if ($existingTargets.Count -gt 0) {
+        $currentTarget = [System.IO.Path]::GetFullPath([string]$existingTargets[0])
       }
       $probeOk = $true
       if (-not [string]::IsNullOrWhiteSpace($ProbeRelativePath)) {

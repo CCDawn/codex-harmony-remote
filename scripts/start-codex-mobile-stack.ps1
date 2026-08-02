@@ -1,8 +1,10 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [int]$BridgePort = 8787,
   [string]$BridgeToken = $env:CODEX_BRIDGE_TOKEN,
   [string]$BridgeUrl = '',
+  [string]$RuntimeMode = $env:CODEX_BRIDGE_RUNTIME_MODE,
+  [string]$CanaryThreadIds = $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS,
   [string]$ConfigPath = '',
   [string]$SessionId = '',
   [switch]$SkipHdcRelay,
@@ -13,6 +15,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($RuntimeMode)) {
+  $RuntimeMode = 'app-server-primary'
+}
+$RuntimeMode = $RuntimeMode.Trim().ToLowerInvariant()
+if ($RuntimeMode -notin @('desktop', 'desktop-primary', 'app-server-shadow', 'app-server-new-only', 'app-server-canary', 'app-server-primary')) {
+  throw "未知运行模式: $RuntimeMode"
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($BridgeUrl)) {
@@ -26,6 +36,26 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $logRoot = Join-Path $repoRoot 'logs\startup'
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 
+function Resolve-CompatiblePowerShellHost {
+  $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source) -and (Test-Path -LiteralPath ([string]$pwsh.Source))) {
+    return [string]$pwsh.Source
+  }
+
+  $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentHost -and -not [string]::IsNullOrWhiteSpace([string]$currentHost.Path) -and (Test-Path -LiteralPath ([string]$currentHost.Path))) {
+    return [string]$currentHost.Path
+  }
+
+  $legacyHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  if (Test-Path -LiteralPath $legacyHost) {
+    return $legacyHost
+  }
+
+  throw '未找到可用的 PowerShell 主机'
+}
+
+$script:PowerShellHostPath = Resolve-CompatiblePowerShellHost
 $script:StartupStatus = [ordered]@{}
 $script:CodexFrontendRepairRestarted = $false
 
@@ -80,7 +110,9 @@ function Write-StartupStatusLine {
 function Write-FinalStartupSummary {
   Write-Step "一键状态总览"
   Write-StartupStatusLine -Label '手机会话 bridge' -Name 'LocalBridge'
+  Write-StartupStatusLine -Label 'App Server 运行模式' -Name 'AppServerRuntime'
   Write-StartupStatusLine -Label 'bridge 自动恢复' -Name 'LocalBridgeWatchdog'
+  Write-StartupStatusLine -Label '桌面实时自动恢复' -Name 'DesktopLiveWatchdog'
   Write-StartupStatusLine -Label '公网 bridge 代理' -Name 'PublicBridge'
   Write-StartupStatusLine -Label 'Codex 桌面实时通道' -Name 'CodexDesktop'
   Write-StartupStatusLine -Label 'Codex 前端窗口' -Name 'CodexFrontend'
@@ -92,7 +124,11 @@ function Write-FinalStartupSummary {
   Write-StartupStatusLine -Label 'HDC 自动恢复' -Name 'HdcWatchdog'
   Write-StartupStatusLine -Label 'HDC 目标' -Name 'HdcTarget'
 
-  $hardNames = @('LocalBridge', 'CodexDesktop', 'DesktopScript', 'SessionApi')
+  $hardNames = switch ($RuntimeMode) {
+    'app-server-primary' { @('LocalBridge', 'AppServerRuntime', 'SessionApi') }
+    'desktop-primary' { @('LocalBridge', 'AppServerRuntime', 'CodexDesktop', 'DesktopScript', 'SessionApi') }
+    default { @('LocalBridge', 'CodexDesktop', 'DesktopScript', 'SessionApi') }
+  }
   $hardFailed = $false
   foreach ($name in $hardNames) {
     $state = [string](Get-StartupStatus -Name $name).State
@@ -102,11 +138,32 @@ function Write-FinalStartupSummary {
   }
   $hdcState = [string](Get-StartupStatus -Name 'HdcTarget').State
   if ($hardFailed) {
-    Write-Host "    整体状态：不可用，需要先修复 bridge / Codex 桌面实时通道。" -ForegroundColor Red
+    $unavailableMessage = if ($RuntimeMode -eq 'app-server-primary') {
+      '整体状态：不可用，需要先修复 bridge / App Server 主链路。'
+    } elseif ($RuntimeMode -eq 'desktop-primary') {
+      '整体状态：不可用，需要先修复 bridge / App Server 兜底 / Codex 桌面实时通道。'
+    } else {
+      '整体状态：不可用，需要先修复 bridge / Codex 桌面实时通道。'
+    }
+    Write-Host "    $unavailableMessage" -ForegroundColor Red
   } elseif ($hdcState -eq 'ok' -or $hdcState -eq 'skipped') {
-    Write-Host "    整体状态：正常。" -ForegroundColor Green
+    $readyMessage = if ($RuntimeMode -eq 'app-server-primary') {
+      '整体状态：正常。App Server 主链路可用；桌面 CDP 仅作为回退能力。'
+    } elseif ($RuntimeMode -eq 'desktop-primary') {
+      '整体状态：正常。桌面实时主链路已启用，App Server 仅在发送前预检失败时兜底。'
+    } else {
+      '整体状态：正常。'
+    }
+    Write-Host "    $readyMessage" -ForegroundColor Green
   } else {
-    Write-Host "    整体状态：部分可用。手机会话可用，HDC 部署/抓日志链路正在等待手机中继恢复。" -ForegroundColor Yellow
+    $partialMessage = if ($RuntimeMode -eq 'app-server-primary') {
+      '整体状态：部分可用。App Server 主链路可用，HDC 部署/抓日志链路正在等待手机中继恢复。'
+    } elseif ($RuntimeMode -eq 'desktop-primary') {
+      '整体状态：部分可用。桌面实时主链路和 App Server 兜底均已就绪，HDC 部署/抓日志链路正在等待手机中继恢复。'
+    } else {
+      '整体状态：部分可用。手机会话可用，HDC 部署/抓日志链路正在等待手机中继恢复。'
+    }
+    Write-Host "    $partialMessage" -ForegroundColor Yellow
   }
 }
 
@@ -405,6 +462,25 @@ function Wait-BridgeHealth {
   throw "Bridge 健康检查失败: $BridgeUrl/health; $lastError"
 }
 
+function Set-AppServerRuntimeStartupStatus {
+  param([object]$Runtime)
+
+  if ($RuntimeMode -eq 'desktop') {
+    Set-StartupStatus -Name 'AppServerRuntime' -State 'ok' -Message '桌面内嵌 App Server 为唯一所有者；独立 App Server 已禁用'
+    return $true
+  }
+
+  $appServer = Get-ObjectValue -Object $Runtime -Name 'appServer' -Fallback $null
+  $state = [string](Get-ObjectValue -Object $appServer -Name 'state' -Fallback 'unknown')
+  if ($state -ne 'ready') {
+    Set-StartupStatus -Name 'AppServerRuntime' -State 'failed' -Message "运行模式=$RuntimeMode; App Server 状态=$state"
+    return $false
+  }
+
+  Set-StartupStatus -Name 'AppServerRuntime' -State 'ok' -Message "运行模式=$RuntimeMode; App Server 已就绪"
+  return $true
+}
+
 function Start-LocalBridgeProcess {
   $stdout = Join-Path $logRoot 'bridge.stdout.log'
   $stderr = Join-Path $logRoot 'bridge.stderr.log'
@@ -414,9 +490,11 @@ function Start-LocalBridgeProcess {
 `$env:CODEX_BRIDGE_WORKSPACE='$repoRoot'
 `$env:CODEX_BRIDGE_TOKEN='$BridgeToken'
 `$env:CODEX_BRIDGE_ADAPTER='codex'
+`$env:CODEX_BRIDGE_RUNTIME_MODE='$RuntimeMode'
+`$env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS='$CanaryThreadIds'
 node src/server.js
 "@
-  Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+  Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-Command', $command
@@ -430,9 +508,17 @@ function Ensure-LocalBridge {
     if ($probe.Ok) {
       $run = Get-ObjectValue -Object $probe.Value -Name 'run' -Fallback $null
       $runId = Get-ObjectValue -Object $run -Name 'runId' -Fallback 'unknown'
-      Write-Info "已在线: $BridgeUrl run=$runId"
-      Set-StartupStatus -Name 'LocalBridge' -State 'ok' -Message "已在线 run=$runId"
-      return
+      $runtime = Get-ObjectValue -Object $probe.Value -Name 'runtime' -Fallback $null
+      $actualMode = [string](Get-ObjectValue -Object $runtime -Name 'mode' -Fallback '')
+      if ($actualMode -eq $RuntimeMode) {
+        if (-not (Set-AppServerRuntimeStartupStatus -Runtime $runtime)) {
+          throw "App Server 未就绪: 运行模式=$RuntimeMode"
+        }
+        Write-Info "已在线: $BridgeUrl run=$runId; 运行模式=$actualMode"
+        Set-StartupStatus -Name 'LocalBridge' -State 'ok' -Message "已在线 run=$runId"
+        return
+      }
+      Write-Warn "当前 bridge 运行模式=$actualMode，目标=$RuntimeMode，将重启本地 bridge"
     }
     Write-Warn "未在线，将启动: $($probe.Error)"
   } else {
@@ -446,7 +532,15 @@ function Ensure-LocalBridge {
   $health = Wait-BridgeHealth -TimeoutSeconds 25
   $run = Get-ObjectValue -Object $health -Name 'run' -Fallback $null
   $runId = Get-ObjectValue -Object $run -Name 'runId' -Fallback 'unknown'
-  Write-Info "Bridge 已就绪: $BridgeUrl run=$runId"
+  $runtime = Get-ObjectValue -Object $health -Name 'runtime' -Fallback $null
+  $actualMode = [string](Get-ObjectValue -Object $runtime -Name 'mode' -Fallback '')
+  if ($actualMode -ne $RuntimeMode) {
+    throw "Bridge 运行模式未生效: expected=$RuntimeMode; actual=$actualMode"
+  }
+  if (-not (Set-AppServerRuntimeStartupStatus -Runtime $runtime)) {
+    throw "App Server 未就绪: 运行模式=$RuntimeMode"
+  }
+  Write-Info "Bridge 已就绪: $BridgeUrl run=$runId; 运行模式=$actualMode"
   Set-StartupStatus -Name 'LocalBridge' -State 'ok' -Message "已启动 run=$runId"
 }
 
@@ -475,20 +569,57 @@ function Ensure-BackgroundScript {
     '-ExecutionPolicy', 'Bypass',
     '-File', $ScriptPath
   ) + $Arguments
-  Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList $argumentList -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
+  Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList $argumentList -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
   Write-Info "$DisplayName 已启动"
 }
 
 function Ensure-LocalBridgeWatchdog {
   Write-Step "检查本地 bridge 自动恢复"
+  $expectedArgument = "-RuntimeMode $RuntimeMode"
+  $allProcesses = @(Get-CimInstance Win32_Process)
+  $staleWatchdogs = @(Get-MatchingProcesses -Pattern 'watch-local-bridge\.ps1' -RequireRepoPath | Where-Object {
+    [string]$_.CommandLine -notlike "*$expectedArgument*"
+  })
+  foreach ($stale in $staleWatchdogs) {
+    Write-Warn "检测到旧本地 bridge watchdog 模式，切换为 ${RuntimeMode}: PID=$($stale.ProcessId)"
+    Stop-ProcessTree -ProcessId ([int]$stale.ProcessId) -AllProcesses $allProcesses
+  }
+  $watchdogArguments = @('-BridgePort', "$BridgePort")
+  $watchdogArguments = Add-OptionalStringArgument -Arguments $watchdogArguments -Name '-RuntimeMode' -Value $RuntimeMode
+  $watchdogArguments = Add-OptionalStringArgument -Arguments $watchdogArguments -Name '-CanaryThreadIds' -Value $CanaryThreadIds
   Ensure-BackgroundScript `
     -DisplayName '本地 bridge watchdog' `
     -Pattern 'watch-local-bridge\.ps1' `
     -ScriptPath (Join-Path $repoRoot 'tools\harmony\watch-local-bridge.ps1') `
-    -Arguments (Add-OptionalStringArgument -Arguments @('-BridgePort', "$BridgePort") -Name '-BridgeToken' -Value $BridgeToken) `
+    -Arguments $watchdogArguments `
     -StdoutName 'local-bridge-watchdog.stdout.log' `
     -StderrName 'local-bridge-watchdog.stderr.log'
   Set-StartupStatus -Name 'LocalBridgeWatchdog' -State 'ok' -Message 'watchdog 已就绪'
+}
+
+function Ensure-DesktopLiveWatchdog {
+  if ($SkipCodexDesktop) {
+    Set-StartupStatus -Name 'DesktopLiveWatchdog' -State 'skipped' -Message '按参数跳过 Codex 桌面检查'
+    return
+  }
+  if ($RuntimeMode -notin @('desktop', 'desktop-primary')) {
+    Set-StartupStatus -Name 'DesktopLiveWatchdog' -State 'skipped' -Message "运行模式=$RuntimeMode 不要求桌面实时守护"
+    return
+  }
+
+  Write-Step "检查桌面实时自动恢复"
+  $watchdogArguments = @('-BridgePort', "$BridgePort")
+  if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
+    $watchdogArguments += @('-SessionId', $SessionId)
+  }
+  Ensure-BackgroundScript `
+    -DisplayName '桌面实时 watchdog' `
+    -Pattern 'watch-desktop-live\.ps1' `
+    -ScriptPath (Join-Path $repoRoot 'tools\harmony\watch-desktop-live.ps1') `
+    -Arguments $watchdogArguments `
+    -StdoutName 'desktop-live-watchdog.stdout.log' `
+    -StderrName 'desktop-live-watchdog.stderr.log'
+  Set-StartupStatus -Name 'DesktopLiveWatchdog' -State 'ok' -Message 'watchdog 已就绪；仅在 Codex 退出时自动拉起带 CDP 的桌面'
 }
 
 function Start-RelayProcess {
@@ -500,7 +631,7 @@ function Start-RelayProcess {
   $stdout = Join-Path $logRoot "$Name.stdout.log"
   $stderr = Join-Path $logRoot "$Name.stderr.log"
   $script = Join-Path $repoRoot 'tools\harmony\start-hdc-relay.ps1'
-  Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+  Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', $script,
@@ -876,7 +1007,7 @@ function Show-RelayState {
     '-SkipDesktopScreenshot'
   )
   $args = Add-OptionalStringArgument -Arguments $args -Name '-BridgeToken' -Value $BridgeToken
-  & powershell.exe @args
+  & $script:PowerShellHostPath @args
   if ($LASTEXITCODE -ne 0) {
     Write-Warn "Relay 状态检查失败，详见上方输出。"
     $global:LASTEXITCODE = 0
@@ -987,8 +1118,11 @@ function Get-CodexDesktopShellProcesses {
   @(Get-CimInstance Win32_Process | Where-Object {
     $path = [string]$_.ExecutablePath
     $cmd = [string]$_.CommandLine
-    $isDesktopShell = $path.EndsWith('\app\Codex.exe', [System.StringComparison]::OrdinalIgnoreCase) -or
+    $isPackagedChatGpt = $path -match '\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$' -or
+      $cmd -match '\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe'
+    $isLegacyCodex = $path.EndsWith('\app\Codex.exe', [System.StringComparison]::OrdinalIgnoreCase) -or
       ($cmd -match '\\app\\Codex\.exe"?(?:\s|$)')
+    $isDesktopShell = $isPackagedChatGpt -or $isLegacyCodex
     $isChildProcess = $cmd -match '\s--type='
     $isDesktopShell -and -not $isChildProcess
   })
@@ -1001,7 +1135,9 @@ function Test-CodexDesktopShellRunning {
 
 function Update-CodexFrontendWindowStatus {
   try {
-    $windows = @([System.Diagnostics.Process]::GetProcessesByName('Codex') | Where-Object {
+    $windowCandidates = @([System.Diagnostics.Process]::GetProcessesByName('ChatGPT')) +
+      @([System.Diagnostics.Process]::GetProcessesByName('Codex'))
+    $windows = @($windowCandidates | Where-Object {
       $_.MainWindowHandle -ne [IntPtr]::Zero -and -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle)
     })
     if ($windows.Count -gt 0) {
@@ -1067,7 +1203,7 @@ function Repair-CodexFrontendWindowWithLiveRestart {
   Write-Warn "Codex 实时通道在线但前端窗口缺失，将重新拉起带 CDP 的 Codex 前端"
   $script:CodexFrontendRepairRestarted = $true
   Set-StartupStatus -Name 'CodexDesktop' -State 'ok' -Message '实时通道在线但前端缺失，已重新拉起带 CDP 的 Codex'
-  & powershell.exe @args
+  & $script:PowerShellHostPath @args
   if ($LASTEXITCODE -ne 0) {
     Set-StartupStatus -Name 'CodexDesktop' -State 'failed' -Message "前端重拉起/CDP 注入失败，退出码: $LASTEXITCODE"
     throw "Codex 前端重拉起/CDP 注入失败，退出码: $LASTEXITCODE"
@@ -1252,7 +1388,7 @@ function Ensure-CodexDesktopLive {
     Set-StartupStatus -Name 'CodexDesktop' -State 'ok' -Message '按 -ForceRestart 或缺失 live 通道，已启动/重启 Codex 并注入 CDP'
   }
 
-  & powershell.exe @args
+  & $script:PowerShellHostPath @args
   if ($LASTEXITCODE -ne 0) {
     Set-StartupStatus -Name 'CodexDesktop' -State 'failed' -Message "启动/CDP 注入失败，退出码: $LASTEXITCODE"
     if ($useSoftRecover) {
@@ -1319,6 +1455,7 @@ Ensure-LocalBridgeWatchdog
 Ensure-HdcRelay
 Show-RelayState
 Ensure-CodexDesktopLive
+Ensure-DesktopLiveWatchdog
 Test-BridgeApi
 
 Write-FinalStartupSummary

@@ -6,10 +6,22 @@ export interface BridgeProject {
 
 export interface BridgeEvent {
   id: string;
+  seq?: number;
   taskId: string;
   type: string;
   payload: Record<string, Object>;
   createdAt: string;
+}
+
+export interface BridgeProtocolHandshake {
+  protocolVersion: number;
+  minimumClientProtocol: number;
+  bridgeVersion: string;
+  clientProtocol: number | null;
+  clientVersion: string;
+  compatible: boolean;
+  reason: string;
+  capabilities: string[];
 }
 
 export interface BridgeDesktopSync {
@@ -21,6 +33,25 @@ export interface BridgeDesktopSync {
   currentSessionId?: string | null;
   targetSessionId?: string | null;
   sessionVerified?: boolean;
+  targetVerified?: boolean;
+}
+
+export interface BridgeRuntime {
+  kind: string;
+  state: string;
+  generation?: number;
+  canInterrupt?: boolean;
+  reconnecting?: boolean;
+  pendingRequests?: number;
+  pendingApprovals?: number;
+  pendingUserInputs?: number;
+}
+
+export interface BridgeRuntimeStatus {
+  mode: string;
+  existingThreadExecution: string;
+  protocol?: BridgeProtocolHandshake | null;
+  appServer?: BridgeRuntime | null;
 }
 
 export interface DesktopLiveStatus {
@@ -49,6 +80,7 @@ export interface DesktopLiveStatus {
   currentSessionId?: string | null;
   targetSessionId?: string | null;
   sessionVerified?: boolean;
+  targetVerified?: boolean;
   checkedAt?: string;
 }
 
@@ -74,6 +106,8 @@ export interface SystemLinkStatus {
   recommendedAction?: string;
   recoverableFromPhone?: boolean;
   message?: string;
+  executionMode?: string;
+  desktopRequired?: boolean;
   bridge?: Record<string, Object>;
   desktop?: DesktopLiveStatus;
   sessions?: Record<string, Object>;
@@ -111,6 +145,22 @@ export interface MobileImageUpload {
   mimeType: string;
   bytes: number;
   messageText: string;
+}
+
+export interface MobileFileUpload {
+  fileName: string;
+  filePath: string;
+  mimeType: string;
+  bytes: number;
+  messageText: string;
+}
+
+export interface RemoteSessionFile {
+  fileName: string;
+  bytes: number;
+  mimeType: string;
+  openType: string;
+  modifiedAt: string;
 }
 
 export interface DesktopScreenshotImage {
@@ -178,8 +228,14 @@ export interface BridgeTask {
   interruptError?: string | null;
   syntheticInterrupt?: boolean;
   desktopSync?: BridgeDesktopSync | null;
+  runtime?: BridgeRuntime | null;
+  pendingUserInput?: BridgeUserInput | null;
+  submissionId?: string;
   session?: CodexSessionDetail | null;
   eventCount?: number;
+  eventCursor?: number;
+  eventGap?: boolean;
+  hasMoreEvents?: boolean;
   latestEvent?: BridgeEvent | null;
   resultSummary?: Object | null;
   error?: string | null;
@@ -208,8 +264,13 @@ export interface BridgeTaskSummary {
   interruptError?: string | null;
   syntheticInterrupt?: boolean;
   desktopSync?: BridgeDesktopSync | null;
+  runtime?: BridgeRuntime | null;
+  submissionId?: string;
   session?: CodexSessionDetail | null;
   eventCount: number;
+  eventCursor?: number;
+  eventGap?: boolean;
+  hasMoreEvents?: boolean;
   latestEvent: BridgeEvent | null;
   error?: string | null;
 }
@@ -224,6 +285,56 @@ export interface BridgeApproval {
   risk: string;
 }
 
+export interface BridgeUserInputOption {
+  label: string;
+  description: string;
+}
+
+export interface BridgeUserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options: BridgeUserInputOption[] | null;
+}
+
+export interface BridgeUserInput {
+  id: string;
+  taskId: string;
+  runId: string;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  status: string;
+  questions: BridgeUserInputQuestion[];
+  autoResolutionMs: number | null;
+  createdAt: string;
+  answeredAt?: string | null;
+  expiredAt?: string | null;
+  expireReason?: string;
+}
+
+export interface BridgeOutboxItem {
+  id: string;
+  kind: string;
+  threadId: string;
+  projectId: string;
+  submissionId: string;
+  text: string;
+  status: string;
+  order: number;
+  attemptCount: number;
+  retryable: boolean;
+  error: string;
+  nextAttemptAt: string;
+  lastAttemptAt: string;
+  submittedAt: string;
+  resultId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface CodexSessionSummary {
   id: string;
   title: string;
@@ -231,13 +342,58 @@ export interface CodexSessionSummary {
   relativeTime?: string;
   projectRoot?: string;
   projectLabel?: string;
+  sidebarSection?: string;
   source?: string;
   activitySource?: string;
   activityStatus?: string;
   activityUpdatedAt?: string;
+  runtimeState?: string;
+  runtimeSource?: string;
+  runtimeUpdatedAt?: string;
+  activeTurnId?: string;
+  canInterrupt?: boolean;
+  terminalReason?: string;
   lastVisibleRole?: string;
   pinned?: boolean;
   detailAvailable: boolean;
+}
+
+export interface CodexRuntimeSession {
+  threadId: string;
+  title: string;
+  projectRoot: string;
+  projectLabel: string;
+  sidebarSection: string;
+  pinned: boolean;
+  updatedAt: string;
+  relativeTime: string;
+  state: string;
+  stateUpdatedAt: string;
+  source: string;
+  activeTurnId: string;
+  canInterrupt: boolean;
+  terminalReason: string;
+  lastVisibleRole: string;
+  detailAvailable: boolean;
+}
+
+export interface CodexRuntimeSnapshot {
+  schemaVersion: number;
+  epoch: string;
+  revision: number;
+  generatedAt: string;
+  stale: boolean;
+  sessions: CodexRuntimeSession[];
+}
+
+export interface CodexSessionToolItem {
+  id: string;
+  name: string;
+  verb: string;
+  target: string;
+  detail: string;
+  status: string;
+  retryCount?: number;
 }
 
 export interface CodexSessionEntry {
@@ -249,6 +405,7 @@ export interface CodexSessionEntry {
   threadId?: string;
   turnId?: string;
   itemId?: string;
+  toolItems?: CodexSessionToolItem[];
 }
 
 export interface CodexSessionFingerprint {
@@ -272,6 +429,12 @@ export interface CodexSessionDetail {
   activitySource?: string;
   activityStatus?: string;
   activityUpdatedAt?: string;
+  runtimeState?: string;
+  runtimeSource?: string;
+  runtimeUpdatedAt?: string;
+  activeTurnId?: string;
+  canInterrupt?: boolean;
+  terminalReason?: string;
   lastVisibleRole?: string;
   pinned?: boolean;
   detailAvailable?: boolean;

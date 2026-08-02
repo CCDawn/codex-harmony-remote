@@ -24,6 +24,8 @@
     "agent:scan": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/scan-open-source.ps1",
     "agent:stage": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/create-open-source-staging.ps1 -ForceClean",
     "agent:verify-release": "powershell -ExecutionPolicy Bypass -File ./scripts/agent/verify-open-source-release.ps1",
+    "probe:app-server": "node scripts/probe-app-server-stability.mjs",
+    "probe:app-server:live": "node scripts/probe-app-server-live.mjs --confirm-live",
     "test": "node --test test/*.test.js"
   },
   "engines": {

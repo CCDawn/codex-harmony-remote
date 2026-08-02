@@ -4,7 +4,7 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
-    "deviceTypes": ["phone"],
+    "deviceTypes": ["phone", "tablet"],
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
@@ -17,6 +17,7 @@
         "label": "$string:app_name",
         "startWindowIcon": "$media:start_icon",
         "startWindowBackground": "$color:start_window_background",
+        "orientation": "auto_rotation",
         "backgroundModes": ["dataTransfer"],
         "exported": true,
         "skills": [
@@ -27,12 +28,28 @@
         ]
       }
     ],
+    "extensionAbilities": [
+      {
+        "name": "StandbyMonitorFormAbility",
+        "srcEntry": "./ets/standbymonitorformability/StandbyMonitorFormAbility.ets",
+        "description": "$string:standby_monitor_ability_desc",
+        "label": "$string:standby_monitor_ability_label",
+        "type": "form",
+        "exported": true,
+        "metadata": [
+          {
+            "name": "ohos.extension.form",
+            "resource": "$profile:standby_monitor_form_config"
+          }
+        ]
+      }
+    ],
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET",
         "reason": "$string:permission_internet_reason",
         "usedScene": {
-          "abilities": ["EntryAbility"],
+          "abilities": ["EntryAbility", "StandbyMonitorFormAbility"],
           "when": "inuse"
         }
       },
@@ -40,7 +57,7 @@
         "name": "ohos.permission.GET_NETWORK_INFO",
         "reason": "$string:permission_internet_reason",
         "usedScene": {
-          "abilities": ["EntryAbility"],
+          "abilities": ["EntryAbility", "StandbyMonitorFormAbility"],
           "when": "inuse"
         }
       },

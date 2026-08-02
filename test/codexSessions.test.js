@@ -114,12 +114,113 @@ test('CodexSessionStore lists desktop sidebar sessions and filters internal work
   assert.equal(sessions[0].id, userSessionId);
   assert.equal(sessions[0].title, '短标题：对话开发负责人');
   assert.equal(sessions[0].projectLabel, 'ExampleProject');
+  assert.equal(sessions[0].sidebarSection, 'project');
   assert.equal(sessions[0].source, 'desktop-sidebar');
   assert.equal(sessions[0].pinned, true);
   assert.equal(sessions.some((session) => session.id === workerSessionId), false);
   assert.equal(sessions.some((session) => session.id === execSessionId), false);
   assert.equal(sessions.some((session) => session.id === unsavedSmokeSessionId), false);
   assert.equal(sessions.some((session) => session.id === unsavedUserSessionId), false);
+});
+
+test('CodexSessionStore expands current local-project ids into visible workspace roots', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-local-projects-'));
+  const bossSessionId = '019e-boss-session';
+  const vibeSessionId = '019e-vibe-session';
+  const bossRoot = 'C:\\Users\\agent\\Desktop\\BossAi-All';
+  const vibeRoot = 'C:\\Users\\agent\\Desktop\\Vibelution';
+
+  await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+    'project-order': ['boss-id', 'vibe-id'],
+    'local-projects': {
+      'vibe-id': { id: 'vibe-id', name: 'Vibelution', rootPaths: [vibeRoot] },
+      'boss-id': { id: 'boss-id', name: 'BossAi-All', rootPaths: [bossRoot] }
+    },
+    'thread-workspace-root-hints': {
+      [bossSessionId]: bossRoot,
+      [vibeSessionId]: vibeRoot
+    }
+  }), 'utf8');
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), '', 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '27');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const bossPath = path.join(sessionDir, `rollout-${bossSessionId}.jsonl`);
+  const vibePath = path.join(sessionDir, `rollout-${vibeSessionId}.jsonl`);
+  await fs.writeFile(bossPath, `${JSON.stringify({ timestamp: '2026-07-27T01:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: 'Boss' } })}\n`, 'utf8');
+  await fs.writeFile(vibePath, `${JSON.stringify({ timestamp: '2026-07-27T02:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: 'Vibe' } })}\n`, 'utf8');
+
+  const db = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
+  db.exec(`
+    CREATE TABLE threads (
+      id TEXT, rollout_path TEXT, title TEXT, cwd TEXT, updated_at_ms INTEGER,
+      updated_at INTEGER, thread_source TEXT, source TEXT, archived INTEGER,
+      first_user_message TEXT, preview TEXT, has_user_event INTEGER
+    )
+  `);
+  const insert = db.prepare(`
+    INSERT INTO threads
+      (id, rollout_path, title, cwd, updated_at_ms, updated_at, thread_source, source, archived, first_user_message, preview, has_user_event)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run(bossSessionId, bossPath, 'Boss 会话', bossRoot, 1785114000000, 1785114000, 'user', 'vscode', 0, 'Boss', 'Boss', 1);
+  insert.run(vibeSessionId, vibePath, 'Vibe 会话', vibeRoot, 1785117600000, 1785117600, 'user', 'vscode', 0, 'Vibe', 'Vibe', 1);
+  db.close();
+
+  const sessions = await new CodexSessionStore({ codexHome }).listSessions();
+  assert.deepEqual(sessions.map((session) => session.projectLabel).sort(), ['BossAi-All', 'Vibelution']);
+});
+
+test('CodexSessionStore preserves Codex desktop project and recent sidebar sections', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-sidebar-sections-'));
+  const projectSessionId = '019e-project-session';
+  const recentSessionId = '019e-recent-session';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\BossAi-All';
+  const recentRoot = 'C:\\Users\\agent\\Documents\\scratch';
+
+  await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+    'local-projects': {
+      boss: { id: 'boss', name: 'BossAi-All', rootPaths: [projectRoot] }
+    },
+    'thread-workspace-root-hints': {
+      [projectSessionId]: projectRoot,
+      [recentSessionId]: recentRoot
+    },
+    'projectless-thread-ids': [recentSessionId]
+  }), 'utf8');
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), '', 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const projectPath = path.join(sessionDir, `rollout-${projectSessionId}.jsonl`);
+  const recentPath = path.join(sessionDir, `rollout-${recentSessionId}.jsonl`);
+  await fs.writeFile(projectPath, `${JSON.stringify({ timestamp: '2026-07-28T01:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '项目消息' } })}\n`, 'utf8');
+  await fs.writeFile(recentPath, `${JSON.stringify({ timestamp: '2026-07-28T02:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '最近消息' } })}\n`, 'utf8');
+
+  const db = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
+  db.exec(`
+    CREATE TABLE threads (
+      id TEXT, rollout_path TEXT, title TEXT, cwd TEXT, updated_at_ms INTEGER,
+      updated_at INTEGER, thread_source TEXT, source TEXT, archived INTEGER,
+      first_user_message TEXT, preview TEXT, has_user_event INTEGER
+    )
+  `);
+  const insert = db.prepare(`
+    INSERT INTO threads
+      (id, rollout_path, title, cwd, updated_at_ms, updated_at, thread_source, source, archived, first_user_message, preview, has_user_event)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run(projectSessionId, projectPath, '项目会话', projectRoot, 1785200400000, 1785200400, 'user', 'vscode', 0, '项目消息', '项目消息', 1);
+  insert.run(recentSessionId, recentPath, '最近会话', recentRoot, 1785204000000, 1785204000, 'user', 'vscode', 0, '最近消息', '最近消息', 1);
+  db.close();
+
+  const sessions = await new CodexSessionStore({ codexHome }).listSessions();
+  const project = sessions.find((session) => session.id === projectSessionId);
+  const recent = sessions.find((session) => session.id === recentSessionId);
+
+  assert.equal(project?.projectLabel, 'BossAi-All');
+  assert.equal(project?.sidebarSection, 'project');
+  assert.equal(recent?.sidebarSection, 'recent');
 });
 
 test('CodexSessionStore marks desktop commentary turns running until final completion', async () => {
@@ -692,6 +793,94 @@ test('CodexSessionStore tails visible conversation entries with compact tool sta
   assert.match(toolEntry?.text ?? '', /1\. npm test/);
   assert.match(toolEntry?.text ?? '', /输出：Exit code: 0/);
   assert.match(toolEntry?.text ?? '', /Wall time: 1\.2 seconds/);
+  assert.equal(toolEntry?.toolItems?.length, 15);
+  assert.deepEqual(toolEntry?.toolItems?.[0], {
+    id: 'shell_command-2026-05-28T02:01:00Z',
+    name: 'shell_command',
+    verb: 'Ran',
+    target: 'npm test',
+    detail: 'Exit code: 0；Wall time: 1.2 seconds',
+    status: 'completed'
+  });
+});
+
+test('CodexSessionStore preserves concrete tool identity and pairs reversed outputs by call id', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-tool-identity-'));
+  const sessionId = '019e-tool-identity';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '工具实名会话', updated_at: '2026-05-28T03:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-05-28T11-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-05-28T03:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '检查展示' } }),
+    JSON.stringify({
+      timestamp: '2026-05-28T03:00:01Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'tool_search_tool',
+        call_id: 'call_search',
+        arguments: JSON.stringify({ query: 'sessionEntryDisplayText' })
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T03:00:02Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'apply_patch',
+        call_id: 'call_patch',
+        arguments: JSON.stringify({
+          patch: '*** Begin Patch\n*** Update File: HarmonyCodexRemote/entry/src/main/ets/pages/Index.ets\n*** End Patch'
+        })
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T03:00:03Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_patch', output: 'Done!' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T03:00:04Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_search', output: '4 matches' }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  const toolEntry = detail.entries.find((entry) => entry.role === 'tool');
+
+  assert.equal(toolEntry?.toolItems?.length, 2);
+  assert.deepEqual(toolEntry?.toolItems?.map((item) => ({
+    id: item.id,
+    name: item.name,
+    verb: item.verb,
+    target: item.target,
+    detail: item.detail,
+    status: item.status
+  })), [
+    {
+      id: 'call_search',
+      name: 'tool_search_tool',
+      verb: 'Searched',
+      target: 'sessionEntryDisplayText',
+      detail: '4 matches',
+      status: 'completed'
+    },
+    {
+      id: 'call_patch',
+      name: 'apply_patch',
+      verb: 'Edited',
+      target: 'HarmonyCodexRemote/entry/src/main/ets/pages/Index.ets',
+      detail: 'Done!',
+      status: 'completed'
+    }
+  ]);
 });
 
 test('CodexSessionStore appends one live activity for running rollout detail and clears it after completion', async () => {
@@ -1506,7 +1695,7 @@ test('CodexSessionStore recent sync expands backward to include the latest user 
   assert.ok(Number(recent.sync.cursorStart) < Number(recent.sync.cursorEnd));
 });
 
-test('CodexSessionStore physically deletes rollout files and hides the thread from desktop lists', async () => {
+test('CodexSessionStore archives the thread from desktop lists while preserving its rollout file', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-delete-'));
   const sessionId = '019e-delete-session';
   const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
@@ -1558,10 +1747,11 @@ test('CodexSessionStore physically deletes rollout files and hides the thread fr
   const store = new CodexSessionStore({ codexHome });
   const deleted = await store.deleteSession(sessionId);
 
-  assert.equal(deleted.deletedFiles.length, 1);
+  assert.equal(deleted.deletedFiles.length, 0);
+  assert.deepEqual(deleted.preservedFiles, [rolloutPath]);
   assert.equal(deleted.archivedThreadCount, 1);
   assert.equal(deleted.removedIndexRecords, 1);
-  assert.equal(await exists(rolloutPath), false);
+  assert.equal(await exists(rolloutPath), true);
   assert.equal((await store.listSessions({ limit: 10 })).some((session) => session.id === sessionId), false);
   assert.doesNotMatch(await fs.readFile(path.join(codexHome, 'session_index.jsonl'), 'utf8'), new RegExp(sessionId));
 

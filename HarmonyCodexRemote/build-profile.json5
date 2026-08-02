@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "",
+          "certpath": "C:\\Users\\Administrator\\.ohos\\config\\default_HarmonyCodexRemote_5osYh8mT4pG6vlsraFaHIjIuYWVRgxDLnVjO8cRUciA=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "",
-          "profile": "",
+          "keyPassword": "0000001B431E3B32F788038B970EBA373B30B8B5DA84F2E8A55B9F034E0C45F822B114ECC08D6F4E35ECAB",
+          "profile": "C:\\Users\\Administrator\\.ohos\\config\\default_HarmonyCodexRemote_5osYh8mT4pG6vlsraFaHIjIuYWVRgxDLnVjO8cRUciA=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "",
-          "storePassword": ""
+          "storeFile": "C:\\Users\\Administrator\\.ohos\\config\\default_HarmonyCodexRemote_5osYh8mT4pG6vlsraFaHIjIuYWVRgxDLnVjO8cRUciA=.p12",
+          "storePassword": "0000001B71CD8C37F71B3F455E9AE4418CCD615901200D429043009B7A91407A5F00ED4068EF890824B59D"
         }
       }
     ],
@@ -19,21 +19,24 @@
       {
         "name": "default",
         "signingConfig": "default",
-        "compatibleSdkVersion": "6.0.2(22)",
+        "compatibleSdkVersion": "6.1.1(24)",
         "runtimeOS": "HarmonyOS",
         "arkTSVersion": "1.1",
         "bundleType": "app",
         "label": "$string:app_name",
         "icon": "$media:app_icon",
-        "versionCode": 1000011,
-        "versionName": "1.0.11",
+        "versionCode": 1000014,
+        "versionName": "1.0.14",
         "vendor": "codex-remote",
         "buildOption": {
           "arkOptions": {
             "types": []
+          },
+          "strictMode": {
+            "useNormalizedOHMUrl": true
           }
         },
-        "targetSdkVersion": "6.0.2(22)"
+        "targetSdkVersion": "6.1.1(24)"
       }
     ]
   },

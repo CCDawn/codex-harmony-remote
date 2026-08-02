@@ -12,6 +12,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Resolve-CompatiblePowerShellHost {
+  $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentHost -and -not [string]::IsNullOrWhiteSpace([string]$currentHost.Path) -and (Test-Path -LiteralPath ([string]$currentHost.Path))) {
+    return [string]$currentHost.Path
+  }
+
+  $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source) -and (Test-Path -LiteralPath ([string]$pwsh.Source))) {
+    return [string]$pwsh.Source
+  }
+
+  throw '未找到可用的 PowerShell 主机'
+}
+
+$powerShellHostPath = Resolve-CompatiblePowerShellHost
+
 function Write-Step {
   param([string]$Message)
   Write-Host ""
@@ -22,8 +38,11 @@ function Get-CodexDesktopProcesses {
   Get-CimInstance Win32_Process | Where-Object {
     $path = [string]$_.ExecutablePath
     $cmd = [string]$_.CommandLine
-    $path.EndsWith('\app\Codex.exe', [System.StringComparison]::OrdinalIgnoreCase) -or
+    $isPackagedChatGpt = $path -match '\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$' -or
+      $cmd -match '\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe'
+    $isLegacyCodex = $path.EndsWith('\app\Codex.exe', [System.StringComparison]::OrdinalIgnoreCase) -or
       ($cmd -match '\\app\\Codex\.exe"?(?:\s|$)')
+    $isPackagedChatGpt -or $isLegacyCodex
   }
 }
 
@@ -35,13 +54,15 @@ function Resolve-CodexAppDir {
       throw "Codex App 路径不存在: $ExplicitPath"
     }
     $resolved = [System.IO.Path]::GetFullPath($ExplicitPath)
-    if ((Split-Path -Leaf $resolved) -match '^(Codex|codex)\.exe$') {
+    if ((Split-Path -Leaf $resolved) -match '^(Codex|ChatGPT)\.exe$') {
       return Split-Path -Parent $resolved
     }
-    if (Test-Path -LiteralPath (Join-Path $resolved 'Codex.exe')) {
+    if ((Test-Path -LiteralPath (Join-Path $resolved 'ChatGPT.exe')) -or
+        (Test-Path -LiteralPath (Join-Path $resolved 'Codex.exe'))) {
       return $resolved
     }
-    if (Test-Path -LiteralPath (Join-Path $resolved 'app\Codex.exe')) {
+    if ((Test-Path -LiteralPath (Join-Path $resolved 'app\ChatGPT.exe')) -or
+        (Test-Path -LiteralPath (Join-Path $resolved 'app\Codex.exe'))) {
       return Join-Path $resolved 'app'
     }
     return $resolved
@@ -50,7 +71,8 @@ function Resolve-CodexAppDir {
   $appxPackage = Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($appxPackage -and -not [string]::IsNullOrWhiteSpace($appxPackage.InstallLocation)) {
     $appxAppDir = Join-Path ([string]$appxPackage.InstallLocation) 'app'
-    if (Test-Path -LiteralPath (Join-Path $appxAppDir 'Codex.exe')) {
+    if ((Test-Path -LiteralPath (Join-Path $appxAppDir 'ChatGPT.exe')) -or
+        (Test-Path -LiteralPath (Join-Path $appxAppDir 'Codex.exe'))) {
       return $appxAppDir
     }
   }
@@ -58,13 +80,17 @@ function Resolve-CodexAppDir {
   $running = Get-CodexDesktopProcesses | Select-Object -First 1
   if ($running -and -not [string]::IsNullOrWhiteSpace($running.ExecutablePath)) {
     $runningDir = Split-Path -Parent ([string]$running.ExecutablePath)
-    if (Test-Path -LiteralPath (Join-Path $runningDir 'Codex.exe')) {
+    if ((Test-Path -LiteralPath (Join-Path $runningDir 'ChatGPT.exe')) -or
+        (Test-Path -LiteralPath (Join-Path $runningDir 'Codex.exe'))) {
       return $runningDir
     }
   }
 
   $candidates = Get-ChildItem -LiteralPath 'C:\Program Files\WindowsApps' -Directory -Filter 'OpenAI.Codex_*' -ErrorAction SilentlyContinue |
-    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'app\Codex.exe') } |
+    Where-Object {
+      (Test-Path -LiteralPath (Join-Path $_.FullName 'app\ChatGPT.exe')) -or
+        (Test-Path -LiteralPath (Join-Path $_.FullName 'app\Codex.exe'))
+    } |
     Sort-Object Name -Descending |
     ForEach-Object { Join-Path $_.FullName 'app' }
 
@@ -341,7 +367,9 @@ function Start-PackagedCodex {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $BridgeUrl = $BridgeUrl.TrimEnd('/')
 $codexAppDir = Resolve-CodexAppDir -ExplicitPath $CodexAppPath
-$codexExe = Join-Path $codexAppDir 'Codex.exe'
+$packagedDesktopExe = Join-Path $codexAppDir 'ChatGPT.exe'
+$legacyDesktopExe = Join-Path $codexAppDir 'Codex.exe'
+$codexDesktopExe = if (Test-Path -LiteralPath $packagedDesktopExe) { $packagedDesktopExe } else { $legacyDesktopExe }
 $appUserModelId = Get-AppUserModelIdFromAppDir -AppDir $codexAppDir
 
 Write-Step "准备重启 Codex 桌面壳"
@@ -361,6 +389,7 @@ Save-DesktopLiveStatus @{
   cdpPort = $selectedCdpPort
   bridgeUrl = $BridgeUrl
   codexAppDir = $codexAppDir
+  codexDesktopExe = $codexDesktopExe
   appUserModelId = $appUserModelId
 }
 
@@ -378,11 +407,11 @@ if ($KeepExistingCodex -and (Test-CdpReady -Port $selectedCdpPort)) {
   $activatedProcessId = Start-PackagedCodex -AppUserModelId $appUserModelId -Arguments $argumentString
   Write-Host "已通过 Windows AppUserModelId 激活 Codex PID=$activatedProcessId" -ForegroundColor DarkGray
 } else {
-  if (-not (Test-Path -LiteralPath $codexExe)) {
-    throw "Codex.exe 不存在: $codexExe"
+  if (-not (Test-Path -LiteralPath $codexDesktopExe)) {
+    throw "Codex 桌面可执行文件不存在: $codexDesktopExe"
   }
-  Start-Process -FilePath $codexExe -ArgumentList $arguments -WorkingDirectory $codexAppDir
-  Write-Host "已通过进程方式启动 Codex，避免 packaged activation 参数污染 Electron app 路径。" -ForegroundColor DarkGray
+  Start-Process -FilePath $codexDesktopExe -ArgumentList $arguments -WorkingDirectory $codexAppDir
+  Write-Host "已直接启动 Codex Electron 桌面壳并保留 CDP 参数: $codexDesktopExe" -ForegroundColor DarkGray
 }
 
 Write-Step "等待 CDP 端口"
@@ -401,7 +430,7 @@ $hostCommand = @"
 `$env:CODEX_DESKTOP_CDP_PORT='$selectedCdpPort'
 node .\scripts\start-desktop-cdp-live-host.mjs
 "@
-Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+Start-Process -WindowStyle Hidden -FilePath $powerShellHostPath -ArgumentList @(
   '-NoProfile',
   '-ExecutionPolicy', 'Bypass',
   '-Command', $hostCommand

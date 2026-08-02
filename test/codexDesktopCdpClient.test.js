@@ -4,12 +4,30 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  buildDesktopCdpWebSocketOptions,
   CodexDesktopCdpClient,
+  extractConversationIdFromDesktopThreadKey,
   extractConversationIdFromPath,
   isRetryableCdpTransportError,
   resolveDesktopCdpPort,
-  resolveDesktopCdpPortCandidates
+  resolveDesktopCdpPortCandidates,
+  selectCodexDesktopCdpTarget
 } from '../src/codexDesktopCdpClient.js';
+
+test('buildDesktopCdpWebSocketOptions sends the Electron CDP allow-listed Origin', () => {
+  assert.deepEqual(buildDesktopCdpWebSocketOptions(9229, {}), {
+    headers: {
+      Origin: 'http://127.0.0.1:9229'
+    }
+  });
+  assert.deepEqual(buildDesktopCdpWebSocketOptions(51413, {
+    CODEX_DESKTOP_CDP_ORIGIN: 'http://localhost:51413/'
+  }), {
+    headers: {
+      Origin: 'http://localhost:51413'
+    }
+  });
+});
 
 test('extractConversationIdFromPath reads Codex desktop conversation routes', () => {
   assert.equal(
@@ -25,6 +43,73 @@ test('extractConversationIdFromPath reads Codex desktop conversation routes', ()
     '019e-hotkey'
   );
   assert.equal(extractConversationIdFromPath('/settings'), null);
+});
+
+test('extractConversationIdFromDesktopThreadKey reads the active sidebar thread id', () => {
+  assert.equal(
+    extractConversationIdFromDesktopThreadKey('local:019f8a33-68b5-7d33-ae86-477aa2239b22'),
+    '019f8a33-68b5-7d33-ae86-477aa2239b22'
+  );
+  assert.equal(extractConversationIdFromDesktopThreadKey('remote:019e-remote'), '019e-remote');
+  assert.equal(extractConversationIdFromDesktopThreadKey('invalid'), null);
+});
+
+test('CodexDesktopCdpClient opens a desktop thread through the rendered sidebar', async () => {
+  const client = new CodexDesktopCdpClient({ timeoutMs: 3210 });
+  let expression = '';
+  let timeoutMs = 0;
+  client.ensureConnected = async () => {};
+  client.evaluate = async (value, timeout) => {
+    expression = value;
+    timeoutMs = timeout;
+    return {
+      ok: true,
+      sessionId: '019f8a33-68b5-7d33-ae86-477aa2239b22',
+      desktopThreadKey: 'local:019f8a33-68b5-7d33-ae86-477aa2239b22'
+    };
+  };
+
+  const result = await client.openDesktopThread('019f8a33-68b5-7d33-ae86-477aa2239b22');
+
+  assert.equal(result.ok, true);
+  assert.equal(timeoutMs, 8000);
+  assert.match(expression, /data-app-action-sidebar-thread-id/);
+  assert.match(expression, /const sessionId = "019f8a33-68b5-7d33-ae86-477aa2239b22"/);
+  assert.match(expression, /\['local:' \+ sessionId, 'remote:' \+ sessionId\]/);
+  assert.match(expression, /scrollIntoView/);
+  assert.match(expression, /\.click\(\)/);
+  assert.match(expression, /data-app-action-sidebar-thread-active/);
+});
+
+test('CodexDesktopCdpClient rejects unsafe desktop thread ids before evaluating DOM code', async () => {
+  const client = new CodexDesktopCdpClient();
+  client.ensureConnected = async () => {
+    throw new Error('must not connect');
+  };
+
+  await assert.rejects(
+    client.openDesktopThread('../bad'),
+    /Invalid Codex desktop thread id/
+  );
+});
+
+test('selectCodexDesktopCdpTarget ignores the avatar overlay renderer', () => {
+  const selected = selectCodexDesktopCdpTarget([
+    {
+      type: 'page',
+      title: 'Codex',
+      url: 'app://-/index.html?initialRoute=%2Favatar-overlay',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:9229/devtools/page/avatar'
+    },
+    {
+      type: 'page',
+      title: 'Codex',
+      url: 'app://-/index.html',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:9229/devtools/page/main'
+    }
+  ]);
+
+  assert.equal(selected.webSocketDebuggerUrl, 'ws://127.0.0.1:9229/devtools/page/main');
 });
 
 test('resolveDesktopCdpPort prefers explicit environment value', () => {
@@ -201,6 +286,82 @@ test('CodexDesktopCdpClient retries retryable desktop read requests after a CDP 
 
   assert.equal(attempts, 2);
   assert.equal(result.thread.id, '019e-target');
+});
+
+test('a stale retryable failure does not close a newer concurrent CDP socket', async () => {
+  const client = new CodexDesktopCdpClient({ port: 51418 });
+  let attempts = 0;
+  let closed = 0;
+  const newerSocket = {
+    readyState: WebSocket.OPEN,
+    close() {
+      closed += 1;
+    }
+  };
+
+  const result = await client.withCdpReconnectRetry(async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      client.socket = newerSocket;
+      throw new Error('Codex 桌面 CDP 连接错误');
+    }
+    assert.equal(client.socket, newerSocket);
+    return 'recovered';
+  }, { retries: 1 });
+
+  assert.equal(result, 'recovered');
+  assert.equal(attempts, 2);
+  assert.equal(closed, 0);
+});
+
+test('a failed connection attempt does not close a newer concurrent CDP socket', async () => {
+  const client = new CodexDesktopCdpClient({ port: 51418 });
+  let connectCalls = 0;
+  let failFirstConnection = null;
+  let newerSocketClosed = 0;
+  const firstSocket = {
+    readyState: WebSocket.CONNECTING,
+    close() {}
+  };
+  const newerSocket = {
+    readyState: WebSocket.OPEN,
+    close() {
+      newerSocketClosed += 1;
+    }
+  };
+
+  client.connect = async () => {
+    connectCalls += 1;
+    if (connectCalls === 1) {
+      client.socket = firstSocket;
+      await new Promise((resolve, reject) => {
+        failFirstConnection = () => {
+          const error = new Error('连接 Codex 桌面 CDP 失败');
+          client.markDisconnected(firstSocket, error);
+          reject(error);
+        };
+      });
+      return;
+    }
+    client.socket = newerSocket;
+  };
+
+  const firstConnection = client.ensureConnected().catch((error) => error);
+  while (!failFirstConnection) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  failFirstConnection();
+  const secondConnection = client.ensureConnected().catch((error) => error);
+
+  const [firstError, secondError] = await Promise.all([firstConnection, secondConnection]);
+  assert.match(firstError.message, /连接 Codex 桌面 CDP 失败/);
+  assert.match(secondError.message, /连接 Codex 桌面 CDP 失败/);
+  assert.equal(connectCalls, 1);
+
+  await client.ensureConnected();
+  assert.equal(connectCalls, 2);
+  assert.equal(client.socket, newerSocket);
+  assert.equal(newerSocketClosed, 0);
 });
 
 test('CodexDesktopCdpClient does not retry non-idempotent turn starts', async () => {

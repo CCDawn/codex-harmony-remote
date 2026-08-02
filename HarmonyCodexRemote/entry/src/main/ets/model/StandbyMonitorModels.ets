@@ -1,0 +1,65 @@
+export interface StandbyMonitorSnapshot {
+  connected: boolean;
+  updatedAt: string;
+  runtimeEpoch: string;
+  runtimeRevision: number;
+  runtimeGeneratedAt: string;
+  runtimeStale: boolean;
+  attentionRevision: number;
+  mainStatus: string;
+  summaryText: string;
+  totalCount: number;
+  runningCount: number;
+  unreadCount: number;
+  sessionIds: string[];
+  sessionTitles: string[];
+  sessionProjects: string[];
+  sessionStates: string[];
+  sessionDetails: string[];
+  sessionKinds: string[];
+  unreadSessionIds: string[];
+  usagePrimaryLabel: string;
+  usagePrimaryValue: string;
+  usagePrimaryPercent: number;
+  usageSecondaryLabel: string;
+  usageSecondaryValue: string;
+  usageSecondaryPercent: number;
+  layoutMode: string;
+  formLocation: string;
+  page: number;
+  mirrored: boolean;
+  shiftIndex: number;
+}
+
+export class StandbyMonitorBindingData {
+  connected: boolean = false;
+  updatedAt: string = '';
+  runtimeEpoch: string = '';
+  runtimeRevision: number = 0;
+  runtimeGeneratedAt: string = '';
+  runtimeStale: boolean = true;
+  attentionRevision: number = 0;
+  mainStatus: string = '等待连接';
+  summaryText: string = '正在寻找 Codex';
+  totalCount: number = 0;
+  runningCount: number = 0;
+  unreadCount: number = 0;
+  sessionIds: string[] = [];
+  sessionTitles: string[] = [];
+  sessionProjects: string[] = [];
+  sessionStates: string[] = [];
+  sessionDetails: string[] = [];
+  sessionKinds: string[] = [];
+  unreadSessionIds: string[] = [];
+  usagePrimaryLabel: string = '5 小时';
+  usagePrimaryValue: string = '等待同步';
+  usagePrimaryPercent: number = 0;
+  usageSecondaryLabel: string = '每周';
+  usageSecondaryValue: string = '等待同步';
+  usageSecondaryPercent: number = 0;
+  layoutMode: string = 'landscape';
+  formLocation: string = 'standby';
+  page: number = 0;
+  mirrored: boolean = false;
+  shiftIndex: number = 0;
+}

@@ -1,0 +1,34 @@
+{
+  "forms": [
+    {
+      "name": "standby_monitor",
+      "displayName": "$string:standby_monitor_name",
+      "description": "$string:standby_monitor_desc",
+      "src": "./ets/standbymonitor/pages/StandbyMonitorCard.ets",
+      "uiSyntax": "arkts",
+      "window": {
+        "designWidth": 720,
+        "autoDesignWidth": true
+      },
+      "colorMode": "dark",
+      "renderingMode": "fullColor",
+      "isDynamic": true,
+      "isDefault": true,
+      "updateEnabled": true,
+      "updateDuration": 1,
+      "defaultDimension": "4*4",
+      "supportDimensions": [
+        "4*4"
+      ],
+      "supportDeviceTypes": [
+        "phone",
+        "tablet"
+      ],
+      "standby": {
+        "isSupported": true,
+        "isAdapted": true,
+        "isPrivacySensitive": false
+      }
+    }
+  ]
+}

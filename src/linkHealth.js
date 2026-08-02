@@ -10,6 +10,8 @@ export async function collectLinkHealth({
   repoRoot = process.cwd(),
   sessionId = '',
   logger = null,
+  desktopRequired = true,
+  executionMode = desktopRequired === false ? 'app_server' : 'desktop',
   desktopStatusProvider,
   sessionProbeProvider,
   relayProbeProvider,
@@ -26,7 +28,13 @@ export async function collectLinkHealth({
 
   const normalizedRelay = normalizeRelayStatus(relay);
   const normalizedHdc = normalizeHdcStatus(hdc);
-  const action = chooseLinkAction({ desktop, sessions, relay: normalizedRelay, hdc: normalizedHdc });
+  const action = chooseLinkAction({
+    desktop,
+    sessions,
+    relay: normalizedRelay,
+    hdc: normalizedHdc,
+    desktopRequired
+  });
   const health = {
     ok: action.severity !== 'blocked',
     checkedAt,
@@ -34,6 +42,8 @@ export async function collectLinkHealth({
     recommendedAction: action.action,
     recoverableFromPhone: action.recoverableFromPhone,
     message: action.message,
+    executionMode,
+    desktopRequired: desktopRequired !== false,
     bridge: {
       ok: true,
       message: 'bridge 请求已到达本地服务'
@@ -215,7 +225,8 @@ export async function probeHdcState(relayConfig) {
   };
 }
 
-export function chooseLinkAction({ desktop, sessions, relay, hdc }) {
+export function chooseLinkAction({ desktop, sessions, relay, hdc, desktopRequired = true }) {
+  const requiresDesktop = desktopRequired !== false;
   if (!sessions?.ok) {
     return {
       action: 'refresh_sessions',
@@ -224,7 +235,7 @@ export function chooseLinkAction({ desktop, sessions, relay, hdc }) {
       message: `会话索引异常：${sessions?.message ?? 'unknown'}`
     };
   }
-  if (desktop?.desktopLive !== true) {
+  if (requiresDesktop && desktop?.desktopLive !== true) {
     const hard = desktopRequiresHardRecovery(desktop);
     return {
       action: hard ? 'desktop_cdp_restart_required' : 'soft_recover_live_host',
@@ -235,12 +246,15 @@ export function chooseLinkAction({ desktop, sessions, relay, hdc }) {
         : desktop?.recoveryHint ?? '桌面 live 通道异常，可以手机端软恢复。'
     };
   }
-  if (desktop?.targetSessionId && desktop?.sessionVerified !== true) {
+  if (requiresDesktop
+    && desktop?.targetSessionId
+    && desktop?.sessionVerified !== true
+    && desktop?.targetVerified !== true) {
     return {
       action: 'sync_session',
       severity: 'degraded',
       recoverableFromPhone: true,
-      message: '桌面链路在线，但当前会话还没有校验一致'
+      message: '桌面链路在线，但桌面 App Server 尚未确认目标会话'
     };
   }
   if (relay && relay.ok === false) {
@@ -263,7 +277,9 @@ export function chooseLinkAction({ desktop, sessions, relay, hdc }) {
     action: 'none',
     severity: 'ok',
     recoverableFromPhone: true,
-    message: '会话、桌面实时通道和无线调试链路均正常'
+    message: requiresDesktop
+      ? '会话、桌面实时通道和无线调试链路均正常'
+      : 'App Server 主链路和无线调试链路均正常；桌面 CDP 仅用于本机实时同步，不影响手机发送。'
   };
 }
 
@@ -491,6 +507,7 @@ async function writeLinkHealthLog(logger, health) {
       message: health.message,
       desktopLive: health.desktop?.desktopLive === true,
       sessionVerified: health.desktop?.sessionVerified === true,
+      targetVerified: health.desktop?.targetVerified === true,
       relayOk: health.relay?.ok === true,
       hdcOk: health.hdc?.ok === true
     });

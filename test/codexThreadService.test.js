@@ -1,5 +1,6 @@
 ﻿import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,6 +12,7 @@ test('CodexThreadService starts a thread, sends a turn, and exposes live session
   const service = new CodexThreadService({
     client,
     projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work' }],
+    sandbox: 'danger-full-access',
     autoOpenDesktop: true,
     desktopOpener: async (threadId) => {
       desktopOpens.push(threadId);
@@ -18,8 +20,24 @@ test('CodexThreadService starts a thread, sends a turn, and exposes live session
     }
   });
 
-  const result = await service.startThread({ projectId: 'probe', prompt: '你好', model: 'gpt-alt', reasoningEffort: 'xhigh' });
+  const result = await service.startThread({
+    projectId: 'probe',
+    prompt: '你好',
+    model: 'gpt-alt',
+    reasoningEffort: 'xhigh',
+    submissionId: 'phone-receipt-1'
+  });
   assert.equal(result.run.status, 'running');
+  assert.equal(service.findRunBySubmission({
+    kind: 'new_thread',
+    projectId: 'probe',
+    submissionId: 'phone-receipt-1'
+  })?.id, result.run.id);
+  assert.equal(service.findRunBySubmission({
+    kind: 'existing_thread',
+    threadId: '019e-thread',
+    submissionId: 'phone-receipt-1'
+  })?.id, result.run.id);
   await client.waitForRequest('turn/start');
 
   const running = service.getRun(result.run.id);
@@ -80,6 +98,57 @@ test('CodexThreadService starts a thread, sends a turn, and exposes live session
     'user:你好',
     'assistant:你好，我正在处理。'
   ]);
+});
+
+test('CodexThreadService steers an active turn without creating a second run', async () => {
+  const client = new FakeAppServerClient();
+  const service = new CodexThreadService({
+    client,
+    projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work' }],
+    runStatePath: ''
+  });
+  const started = await service.startThread({
+    projectId: 'probe',
+    prompt: '先检查当前实现',
+    submissionId: 'initial-message'
+  });
+  await client.waitForRequest('turn/start');
+
+  const steered = await service.steerMessage({
+    threadId: '019e-thread',
+    text: '补充检查移动端截图',
+    submissionId: 'guidance-message'
+  });
+
+  assert.equal(steered.id, started.run.id);
+  assert.equal(service.listRuns().length, 1);
+  assert.equal(service.findRunBySubmission({
+    kind: 'existing_thread',
+    threadId: '019e-thread',
+    submissionId: 'guidance-message'
+  })?.id, started.run.id);
+  const steerCall = client.calls.find((call) => call.method === 'turn/steer');
+  assert.deepEqual(steerCall.params, {
+    threadId: '019e-thread',
+    input: [{ type: 'text', text: '补充检查移动端截图' }],
+    expectedTurnId: 'turn-1'
+  });
+  const session = await service.getThread('019e-thread');
+  assert.deepEqual(session.entries.filter((entry) => entry.role === 'user').map((entry) => entry.text), [
+    '先检查当前实现',
+    '补充检查移动端截图'
+  ]);
+  client.emit('notification', {
+    method: 'turn/completed',
+    params: {
+      threadId: '019e-thread',
+      turn: {
+        id: 'turn-1',
+        status: 'completed'
+      }
+    }
+  });
+  await until(() => service.getRun(started.run.id).status === 'completed');
 });
 
 test('CodexThreadService does not auto-open desktop deeplinks by default', async () => {
@@ -144,21 +213,205 @@ test('CodexThreadService lists app-server threads as phone sessions', async () =
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].id, '019e-thread');
   assert.equal(sessions[0].title, '测试会话');
+  assert.equal(sessions[0].sidebarSection, 'recent');
   assert.equal(sessions[0].detailAvailable, true);
 });
 
-test('CodexThreadService prefers desktop sidebar sessions when available', async () => {
+test('CodexThreadService exposes a versioned runtime snapshot keyed by the active turn', async () => {
   const client = new FakeAppServerClient();
+  const sessions = {
+    async listSessions() {
+      return [{
+        id: '019e-runtime-thread',
+        title: '统一状态',
+        updatedAt: '2026-07-30T09:00:00.000Z',
+        projectRoot: 'C:\\work',
+        projectLabel: 'work',
+        runtimeState: 'completed',
+        runtimeSource: 'session-file',
+        runtimeUpdatedAt: '2026-07-30T08:59:50.000Z',
+        terminalReason: 'completed',
+        detailAvailable: true
+      }];
+    }
+  };
+  const service = new CodexThreadService({
+    client,
+    sessions,
+    allowIndependentAppServer: false,
+    runtimeSnapshotEpoch: 'snapshot-epoch'
+  });
+  service.runs.set('run-active', {
+    id: 'run-active',
+    threadId: '019e-runtime-thread',
+    turnId: 'turn-new',
+    status: 'waiting_approval',
+    createdAt: '2026-07-30T09:00:01.000Z',
+    updatedAt: '2026-07-30T09:00:02.000Z'
+  });
+  service.activeRunsByThreadId.set('019e-runtime-thread', 'run-active');
+
+  const first = await service.getRuntimeSnapshot();
+  const second = await service.getRuntimeSnapshot();
+
+  assert.equal(first.epoch, 'snapshot-epoch');
+  assert.equal(first.revision, 1);
+  assert.equal(second.revision, 1);
+  assert.equal(first.sessions[0].threadId, '019e-runtime-thread');
+  assert.equal(first.sessions[0].activeTurnId, 'turn-new');
+  assert.equal(first.sessions[0].state, 'waiting_approval');
+  assert.equal(first.sessions[0].source, 'app-server-run');
+});
+
+test('CodexThreadService marks fallback runtime snapshots stale when desktop official state is unavailable', async () => {
+  const sessions = {
+    async listSessions() {
+      return [{
+        id: '019e-stale-runtime',
+        title: '旧文件状态',
+        updatedAt: '2026-07-30T09:00:00.000Z',
+        runtimeState: 'running',
+        runtimeSource: 'session-file',
+        detailAvailable: true
+      }];
+    }
+  };
+  const official = new CodexThreadService({
+    sessions,
+    allowIndependentAppServer: false,
+    runtimeStateProvider: async () => [{
+      threadId: '019e-stale-runtime',
+      state: 'idle',
+      source: 'desktop-app-server'
+    }]
+  });
+  const unavailable = new CodexThreadService({
+    sessions,
+    allowIndependentAppServer: false,
+    runtimeStateProvider: async () => {
+      throw new Error('desktop app-server offline');
+    }
+  });
+
+  const freshSnapshot = await official.getRuntimeSnapshot();
+  const staleSnapshot = await unavailable.getRuntimeSnapshot();
+
+  assert.equal(freshSnapshot.stale, false);
+  assert.equal(freshSnapshot.sessions[0].state, 'idle');
+  assert.equal(staleSnapshot.stale, true);
+  assert.equal(staleSnapshot.sessions[0].state, 'running');
+  assert.equal(staleSnapshot.sessions[0].source, 'session-file');
+});
+
+test('CodexThreadService strict desktop mode never starts or requests the independent app-server', async () => {
+  const client = new FakeAppServerClient();
+  let initialized = 0;
+  client.initialize = async () => {
+    initialized += 1;
+  };
+  const desktopSession = {
+    id: '019e-desktop-thread',
+    title: '桌面严格会话',
+    updatedAt: '2026-07-29T00:00:00.000Z',
+    relativeTime: '刚刚',
+    projectRoot: 'C:\\work',
+    projectLabel: 'work',
+    source: 'desktop-sidebar',
+    activitySource: 'session-file',
+    activityStatus: 'running',
+    runtimeState: 'running',
+    detailAvailable: true,
+    entries: [{
+      timestamp: '2026-07-29T00:00:00.000Z',
+      type: 'event_msg',
+      role: 'assistant',
+      text: '桌面会话内容'
+    }],
+    entryCount: 1
+  };
+  const sessions = {
+    async listSessions() {
+      return [desktopSession];
+    },
+    async getSession() {
+      return desktopSession;
+    }
+  };
+  const service = new CodexThreadService({
+    client,
+    sessions,
+    projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work' }],
+    allowIndependentAppServer: false,
+    projectHistoryPath: null,
+    runStatePath: null
+  });
+
+  const health = await service.initialize();
+  const listed = await service.listThreads({ limit: 10 });
+  const projects = await service.listProjects();
+  const detail = await service.getThread('019e-desktop-thread');
+
+  assert.deepEqual(health, {
+    kind: 'app_server',
+    enabled: false,
+    state: 'disabled',
+    reason: 'strict_desktop_mode',
+    generation: 0,
+    pendingRequests: 0,
+    reconnectAttempts: 0,
+    reconnectScheduled: false,
+    recoveredRuns: 0,
+    pendingApprovals: 0,
+    pendingUserInputs: 0
+  });
+  assert.equal(initialized, 0);
+  assert.equal(client.calls.length, 0);
+  assert.equal(listed[0].id, '019e-desktop-thread');
+  assert.equal(projects.some((project) => project.id === 'probe'), true);
+  assert.equal(detail.entries[0].text, '桌面会话内容');
+  await assert.rejects(
+    () => service.startThread({ projectId: 'probe', prompt: '不允许分叉' }),
+    /严格桌面模式已禁用独立 App Server/
+  );
+  await assert.rejects(
+    () => service.sendMessage({ threadId: '019e-desktop-thread', text: '不允许旁路' }),
+    /严格桌面模式已禁用独立 App Server/
+  );
+  assert.equal(client.calls.length, 0);
+});
+
+test('CodexThreadService merges app-server projects even when desktop sidebar sessions are available', async () => {
+  const client = new FakeAppServerClient();
+  client.request = async (method, params) => {
+    client.calls.push({ method, params });
+    if (method === 'thread/list') {
+      return {
+        data: [{
+          id: '019e-desktop-thread',
+          name: 'Boss app-server 会话',
+          cwd: 'C:\\projects\\BossAi-All',
+          updatedAt: 1785114000
+        }, {
+          id: '019e-vibe-thread',
+          name: 'Vibelution 会话',
+          cwd: 'C:\\projects\\Vibelution',
+          updatedAt: 1785117600
+        }]
+      };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  };
   const desktopSessions = [{
     id: '019e-desktop-thread',
     title: '桌面侧栏会话',
     updatedAt: '2026-05-29T08:00:00.000Z',
     relativeTime: '1 小时前',
-    projectRoot: 'C:\\work',
-    projectLabel: 'work',
+    projectRoot: 'C:\\projects\\BossAi-All',
+    projectLabel: 'BossAi-All',
+    sidebarSection: 'recent',
     source: 'desktop-sidebar',
     activitySource: 'session-file',
-    pinned: false,
+    pinned: true,
     detailAvailable: true
   }];
   const sessions = {
@@ -168,12 +421,132 @@ test('CodexThreadService prefers desktop sidebar sessions when available', async
       return desktopSessions;
     }
   };
-  const service = new CodexThreadService({ client, sessions });
+  const service = new CodexThreadService({
+    client,
+    sessions,
+    projects: [{
+      id: 'boss',
+      name: 'BossAi-All',
+      root: 'C:\\projects\\BossAi-All'
+    }, {
+      id: 'vibe',
+      name: 'Vibelution',
+      root: 'C:\\projects\\Vibelution'
+    }]
+  });
 
   const listed = await service.listThreads({ limit: 10 });
 
-  assert.deepEqual(listed, desktopSessions);
-  assert.equal(client.calls.some((call) => call.method === 'thread/list'), false);
+  assert.equal(client.calls.some((call) => call.method === 'thread/list'), true);
+  assert.deepEqual(new Set(listed.map((session) => session.id)), new Set([
+    '019e-desktop-thread',
+    '019e-vibe-thread'
+  ]));
+  assert.equal(listed.find((session) => session.id === '019e-desktop-thread').pinned, true);
+  assert.equal(listed.find((session) => session.id === '019e-desktop-thread').title, '桌面侧栏会话');
+  assert.equal(listed.find((session) => session.id === '019e-desktop-thread').projectLabel, 'BossAi-All');
+  assert.equal(listed.find((session) => session.id === '019e-desktop-thread').sidebarSection, 'recent');
+  assert.equal(listed.find((session) => session.id === '019e-vibe-thread').projectLabel, 'Vibelution');
+});
+
+test('CodexThreadService falls back to desktop sessions when app-server thread listing fails', async () => {
+  const client = new FakeAppServerClient();
+  client.request = async (method, params) => {
+    client.calls.push({ method, params });
+    throw new Error('app-server unavailable');
+  };
+  const desktopSession = {
+    id: '019e-local-thread',
+    title: '本地回退会话',
+    updatedAt: '2026-07-27T08:00:00.000Z',
+    relativeTime: '刚刚',
+    projectRoot: 'C:\\projects\\LocalOnly',
+    projectLabel: 'LocalOnly',
+    source: 'desktop-sidebar',
+    activitySource: 'session-file',
+    pinned: false,
+    detailAvailable: true
+  };
+  const service = new CodexThreadService({
+    client,
+    sessions: {
+      async listSessions() {
+        return [desktopSession];
+      }
+    }
+  });
+
+  const listed = await service.listThreads({ limit: 10 });
+
+  assert.deepEqual(listed, [desktopSession]);
+  assert.equal(client.calls.some((call) => call.method === 'thread/list'), true);
+});
+
+test('CodexThreadService discovers and persists projects from paginated app-server cwd values', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-project-catalog-'));
+  const historyPath = path.join(tempRoot, 'projects.json');
+  const projects = [];
+  const client = new FakeAppServerClient();
+  client.request = async (method, params) => {
+    client.calls.push({ method, params });
+    if (method !== 'thread/list') {
+      throw new Error(`Unexpected request ${method}`);
+    }
+    if (!params.cursor) {
+      return {
+        data: [{
+          id: '019e-boss-thread',
+          name: 'Boss 会话',
+          cwd: 'C:\\projects\\BossAi-All',
+          updatedAt: 1785114000
+        }],
+        nextCursor: 'page-2'
+      };
+    }
+    assert.equal(params.cursor, 'page-2');
+    return {
+      data: [{
+        id: '019e-vibe-thread',
+        name: 'Vibelution 会话',
+        cwd: 'C:\\projects\\Vibelution',
+        updatedAt: 1785117600
+      }],
+      nextCursor: null
+    };
+  };
+  try {
+    const service = new CodexThreadService({
+      client,
+      projects,
+      projectHistoryPath: historyPath
+    });
+
+    const listedProjects = await service.listProjects({ limit: 200 });
+
+    assert.deepEqual(listedProjects.map((project) => project.name).sort(), ['BossAi-All', 'Vibelution']);
+    assert.equal(client.calls.filter((call) => call.method === 'thread/list').length, 2);
+    assert.equal(client.calls[1].params.cursor, 'page-2');
+    assert.equal(projects.length, 2);
+
+    const saved = JSON.parse(await fs.readFile(historyPath, 'utf8'));
+    assert.deepEqual(saved.projects.map((project) => project.root).sort(), [
+      'C:\\projects\\BossAi-All',
+      'C:\\projects\\Vibelution'
+    ]);
+
+    const offlineClient = new FakeAppServerClient();
+    offlineClient.request = async () => {
+      throw new Error('offline');
+    };
+    const restored = await new CodexThreadService({
+      client: offlineClient,
+      projects: [],
+      projectHistoryPath: historyPath
+    }).listProjects({ limit: 200 });
+    assert.deepEqual(restored.map((project) => project.name).sort(), ['BossAi-All', 'Vibelution']);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test('CodexThreadService preserves desktop running status when live snapshot is idle', async () => {
@@ -294,24 +667,12 @@ test('CodexThreadService lets completed live task state override stale desktop r
   assert.equal(listed[0].terminalReason, 'completed');
 });
 
-test('CodexThreadService refreshes stale running desktop list entries before returning summaries', async () => {
+test('CodexThreadService does not hydrate full thread history while listing local running sessions', async () => {
   const client = new FakeAppServerClient();
   client.request = async (method, params) => {
     client.calls.push({ method, params });
     if (method === 'thread/read') {
-      return {
-        thread: {
-          id: params.threadId,
-          name: '设置',
-          cwd: 'C:\\work',
-          updatedAt: Date.parse('2026-06-19T14:40:39.000Z') / 1000,
-          turns: [{
-            id: 'turn-1',
-            status: 'completed',
-            completedAt: Date.parse('2026-06-19T14:40:39.000Z') / 1000
-          }]
-        }
-      };
+      throw new Error('full history read must not happen during thread listing');
     }
     throw new Error(`Unexpected request ${method}`);
   };
@@ -341,13 +702,12 @@ test('CodexThreadService refreshes stale running desktop list entries before ret
 
   const listed = await service.listThreads({ limit: 10 });
 
-  assert.equal(client.calls.some((call) => call.method === 'thread/read' && call.params.threadId === '019e-thread'), true);
+  assert.equal(client.calls.some((call) => call.method === 'thread/read'), false);
   assert.equal(listed[0].id, '019e-thread');
-  assert.equal(listed[0].activityStatus, 'completed');
-  assert.equal(listed[0].runtimeState, 'completed');
-  assert.equal(listed[0].canInterrupt, false);
-  assert.equal(listed[0].terminalReason, 'completed');
-  assert.equal(listed[0].activitySource, 'desktop-thread-read');
+  assert.equal(listed[0].activityStatus, 'running');
+  assert.equal(listed[0].runtimeState, 'running');
+  assert.equal(listed[0].canInterrupt, true);
+  assert.equal(listed[0].activitySource, 'session-file');
 });
 
 test('CodexThreadService reads existing thread detail from local rollout before stale app-server snapshot', async () => {
@@ -795,6 +1155,116 @@ test('CodexThreadService blocks deleting a running thread and clears local snaps
   assert.equal(deletion.archivedThreadCount, 1);
   assert.deepEqual(deleted, ['019e-thread']);
   assert.equal(service.liveSessions.has('019e-thread'), false);
+  assert.equal(client.calls.some((call) => call.method === 'thread/archive' && call.params.threadId === '019e-thread'), true);
+});
+
+test('CodexThreadService refuses deletion when App Server reports an externally running thread', async () => {
+  const client = new FakeAppServerClient();
+  client.threadStatus = 'inProgress';
+  const deleted = [];
+  const service = new CodexThreadService({
+    client,
+    projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work' }],
+    sessions: {
+      async deleteSession(threadId) {
+        deleted.push(threadId);
+        return {
+          id: threadId,
+          deletedFiles: [],
+          preservedFiles: ['C:\\Users\\agent\\.codex\\sessions\\rollout-019e-thread.jsonl'],
+          archivedThreadCount: 1,
+          removedIndexRecords: 1,
+          removedGlobalStateEntries: 0,
+          deletedAt: '2026-06-08T00:00:00.000Z'
+        };
+      }
+    }
+  });
+
+  await assert.rejects(
+    () => service.deleteThread('019e-thread'),
+    /会话正在进行中/
+  );
+  assert.deepEqual(deleted, []);
+  assert.equal(client.calls.some((call) => call.method === 'thread/archive'), false);
+});
+
+test('CodexThreadService refuses deletion when a strict desktop session snapshot is still running', async () => {
+  const deleted = [];
+  const service = new CodexThreadService({
+    allowIndependentAppServer: false,
+    projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work' }],
+    sessions: {
+      async getSession(threadId) {
+        return {
+          id: threadId,
+          activityStatus: 'running',
+          runtimeState: 'running',
+          entries: []
+        };
+      },
+      async deleteSession(threadId) {
+        deleted.push(threadId);
+        return {
+          id: threadId,
+          deletedFiles: [],
+          preservedFiles: [],
+          archivedThreadCount: 1,
+          removedIndexRecords: 1,
+          removedGlobalStateEntries: 0,
+          deletedAt: '2026-06-08T00:00:00.000Z'
+        };
+      }
+    }
+  });
+
+  await assert.rejects(
+    () => service.deleteThread('019e-thread'),
+    /会话正在进行中/
+  );
+  assert.deepEqual(deleted, []);
+});
+
+test('CodexThreadService archives a completed strict desktop thread before hiding its local session', async () => {
+  const archived = [];
+  const deleted = [];
+  const service = new CodexThreadService({
+    allowIndependentAppServer: false,
+    projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work' }],
+    archiveThreadProvider: async (threadId) => {
+      archived.push(threadId);
+      return { ok: true };
+    },
+    sessions: {
+      async getSession(threadId) {
+        return {
+          id: threadId,
+          activityStatus: 'completed',
+          runtimeState: 'completed',
+          entries: []
+        };
+      },
+      async deleteSession(threadId) {
+        deleted.push(threadId);
+        return {
+          id: threadId,
+          deletedFiles: [],
+          preservedFiles: ['C:\\Users\\agent\\.codex\\sessions\\rollout-019e-thread.jsonl'],
+          archivedThreadCount: 1,
+          removedIndexRecords: 1,
+          removedGlobalStateEntries: 0,
+          deletedAt: '2026-06-08T00:00:00.000Z'
+        };
+      }
+    }
+  });
+
+  const result = await service.deleteThread('019e-thread');
+
+  assert.deepEqual(archived, ['019e-thread']);
+  assert.deepEqual(deleted, ['019e-thread']);
+  assert.equal(result.officialArchived, true);
+  assert.deepEqual(result.preservedFiles, ['C:\\Users\\agent\\.codex\\sessions\\rollout-019e-thread.jsonl']);
 });
 
 class FakeAppServerClient extends EventEmitter {
@@ -802,6 +1272,7 @@ class FakeAppServerClient extends EventEmitter {
     super();
     this.calls = [];
     this.waiters = [];
+    this.threadStatus = 'completed';
   }
 
   async request(method, params) {
@@ -845,6 +1316,11 @@ class FakeAppServerClient extends EventEmitter {
         }
       };
     }
+    if (method === 'turn/steer') {
+      return {
+        turnId: params.expectedTurnId
+      };
+    }
     if (method === 'thread/read') {
       return {
         thread: {
@@ -854,7 +1330,7 @@ class FakeAppServerClient extends EventEmitter {
           updatedAt: 1779926401,
           turns: [{
             id: 'turn-1',
-            status: 'completed',
+            status: this.threadStatus,
             startedAt: 1779926400,
             completedAt: 1779926401,
             items: [{
@@ -869,6 +1345,9 @@ class FakeAppServerClient extends EventEmitter {
           }]
         }
       };
+    }
+    if (method === 'thread/archive') {
+      return {};
     }
     throw new Error(`Unexpected request ${method}`);
   }

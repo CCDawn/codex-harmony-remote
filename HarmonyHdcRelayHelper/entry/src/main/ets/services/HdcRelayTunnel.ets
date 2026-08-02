@@ -21,7 +21,13 @@ interface RelayHello {
   channelId?: string;
 }
 
+interface SocketErrorLike {
+  code?: number;
+  message?: string;
+}
+
 export class HdcRelayTunnel {
+  private readonly CONNECT_IN_PROGRESS_CODE: number = 2301115;
   private relaySocket: socket.TCPSocket | null = null;
   private hdcdSocket: socket.TCPSocket | null = null;
   private running: boolean = false;
@@ -217,6 +223,9 @@ export class HdcRelayTunnel {
       }
     });
     hdcd.on('error', (error: Error) => {
+      if (this.isConnectInProgress(error)) {
+        return;
+      }
       if (this.running && this.generation === generation) {
         this.onStatus('错误', `hdcd 错误：${this.errorText(error)}`);
         this.closeSockets();
@@ -232,8 +241,41 @@ export class HdcRelayTunnel {
         timeout: 5000
       });
     } catch (error) {
+      if (this.isConnectInProgress(error)) {
+        await this.waitForSocketConnected(hdcd, generation, 5000);
+        return;
+      }
       throw new Error(`连接本机 hdcd 失败：${this.errorText(error)}`);
     }
+  }
+
+  private async waitForSocketConnected(hdcd: socket.TCPSocket, generation: number, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!this.running || this.generation !== generation || this.hdcdSocket !== hdcd) {
+        throw new Error('本机 hdcd 连接已取消');
+      }
+      try {
+        const state = await hdcd.getState();
+        if (state.isConnected) {
+          return;
+        }
+      } catch (_) {
+      }
+      await this.sleep(50);
+    }
+    throw new Error('连接本机 hdcd 超时');
+  }
+
+  private isConnectInProgress(error: Error | Object | string): boolean {
+    if (typeof error !== 'string') {
+      const socketError = error as SocketErrorLike;
+      if (Number(socketError.code ?? 0) === this.CONNECT_IN_PROGRESS_CODE) {
+        return true;
+      }
+    }
+    const detail = this.errorText(error);
+    return detail.includes(`${this.CONNECT_IN_PROGRESS_CODE}`) || detail.includes('Operation in progress');
   }
 
   private async sendToRelay(data: ArrayBuffer): Promise<void> {

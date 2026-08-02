@@ -1,4 +1,8 @@
 import http from 'node:http';
+import {
+  buildDesktopCdpWebSocketOptions,
+  selectCodexDesktopCdpTarget
+} from '../src/codexDesktopCdpClient.js';
 
 const bridgeUrl = (process.env.CODEX_BRIDGE_URL ?? 'http://127.0.0.1:8787').replace(/\/+$/, '');
 const token = process.env.CODEX_BRIDGE_TOKEN ?? '';
@@ -50,10 +54,7 @@ async function fetchDesktopScript() {
 
 async function findCodexCdpTarget() {
   const targets = await getCdpTargets(cdpPort);
-  const pages = targets.filter((target) => target.type === 'page' && target.webSocketDebuggerUrl);
-  return pages.find((target) => target.title === 'Codex')
-    ?? pages.find((target) => /codex/i.test(`${target.title ?? ''} ${target.url ?? ''}`))
-    ?? pages[0];
+  return selectCodexDesktopCdpTarget(targets);
 }
 
 function printManualInstructions(error) {
@@ -129,7 +130,7 @@ class CdpClient {
   }
 
   static async connect(url) {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, [], buildDesktopCdpWebSocketOptions(cdpPort));
     await new Promise((resolve, reject) => {
       socket.onopen = resolve;
       socket.onerror = () => reject(new Error('Failed to connect CDP websocket'));

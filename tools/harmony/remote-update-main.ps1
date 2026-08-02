@@ -12,6 +12,24 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Resolve-CompatiblePowerShellHost {
+  $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentHost -and -not [string]::IsNullOrWhiteSpace([string]$currentHost.Path) -and (Test-Path -LiteralPath ([string]$currentHost.Path))) {
+    return [string]$currentHost.Path
+  }
+  $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source) -and (Test-Path -LiteralPath ([string]$pwsh.Source))) {
+    return [string]$pwsh.Source
+  }
+  $legacy = Get-Command powershell.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($legacy -and -not [string]::IsNullOrWhiteSpace([string]$legacy.Source) -and (Test-Path -LiteralPath ([string]$legacy.Source))) {
+    return [string]$legacy.Source
+  }
+  throw '未找到可用的 PowerShell 主机'
+}
+
+$powerShellHostPath = Resolve-CompatiblePowerShellHost
+
 function Write-Step {
   param([string]$Message)
   Write-Host ""
@@ -54,8 +72,10 @@ function Read-ConfigValue {
 
 function Test-WatcherRunning {
   param([string]$ScriptPath)
-  $name = 'powershell.exe'
-  $processes = @(Get-CimInstance Win32_Process -Filter "Name = '$name'" -ErrorAction SilentlyContinue)
+  $processes = @(
+    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" -ErrorAction SilentlyContinue
+  )
   foreach ($process in $processes) {
     $commandLine = [string]$process.CommandLine
     if (
@@ -80,7 +100,7 @@ function Start-RelayWatcher {
   }
   $logDir = Join-Path $RepoRoot 'logs\hdc-relay'
   New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-  Start-Process -FilePath 'powershell.exe' `
+  Start-Process -FilePath $powerShellHostPath `
     -ArgumentList @('-ExecutionPolicy', 'Bypass', '-File', $ScriptPath, '-ConfigPath', $ConfigPath, '-Watch', '-WatchSeconds', '10') `
     -WorkingDirectory $RepoRoot `
     -WindowStyle Hidden `
@@ -165,7 +185,7 @@ if (-not [string]::IsNullOrWhiteSpace($BridgeUrl)) {
 if (-not [string]::IsNullOrWhiteSpace($BridgeToken)) {
   $deployArgs += @('-BridgeToken', $BridgeToken)
 }
-& powershell @deployArgs
+& $powerShellHostPath @deployArgs
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }

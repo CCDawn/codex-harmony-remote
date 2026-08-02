@@ -8,6 +8,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Resolve-CompatiblePowerShellHost {
+  $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentHost -and -not [string]::IsNullOrWhiteSpace([string]$currentHost.Path) -and (Test-Path -LiteralPath ([string]$currentHost.Path))) {
+    return [string]$currentHost.Path
+  }
+
+  $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source) -and (Test-Path -LiteralPath ([string]$pwsh.Source))) {
+    return [string]$pwsh.Source
+  }
+
+  throw '未找到可用的 PowerShell 主机'
+}
+
+$powerShellHostPath = Resolve-CompatiblePowerShellHost
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
   $ConfigPath = Join-Path $PSScriptRoot 'hdc-relay.local.psd1'
 }
@@ -21,6 +36,14 @@ $relayHost = if ($config.RelayHost) { [string]$config.RelayHost } else { '<your-
 $relayPort = if ($config.RelayPort) { [int]$config.RelayPort } else { 19078 }
 $relayToken = if ($config.Token) { [string]$config.Token } else { '' }
 $bridgeToken = [string]$env:CODEX_BRIDGE_TOKEN
+$bridgeConfigPath = Join-Path ([string]$repoRoot) 'HarmonyCodexRemote\entry\src\main\ets\config\BridgeConfig.ets'
+if ([string]::IsNullOrWhiteSpace($bridgeToken) -and (Test-Path -LiteralPath $bridgeConfigPath)) {
+  $bridgeConfigText = Get-Content -Raw -LiteralPath $bridgeConfigPath
+  $bridgeTokenMatch = [regex]::Match($bridgeConfigText, "DEFAULT_BRIDGE_TOKEN:\s*string\s*=\s*'([^']*)'")
+  if ($bridgeTokenMatch.Success) {
+    $bridgeToken = $bridgeTokenMatch.Groups[1].Value
+  }
+}
 $bridgePort = 8787
 $missingCount = 0
 
@@ -57,7 +80,7 @@ function Start-BridgeProxy {
   $logRoot = Join-Path ([string]$repoRoot) 'logs\startup'
   New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
   $script = Join-Path $PSScriptRoot 'start-hdc-relay.ps1'
-  Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+  Start-Process -WindowStyle Hidden -FilePath $powerShellHostPath -ArgumentList @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', $script,

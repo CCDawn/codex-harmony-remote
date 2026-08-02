@@ -1,13 +1,49 @@
 import { AppLogPayload, BridgeClient } from '../services/BridgeClient';
-import { BridgeEvent, BridgeProject, BridgeTask, BridgeTaskSummary, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileImageUpload, SlashIndexItem, SystemLinkStatus, SystemRepairStatus } from '../model/BridgeModels';
+import { BridgeEvent, BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, BridgeUserInputOption, BridgeUserInputQuestion, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SlashIndexItem, SystemLinkStatus, SystemRepairStatus } from '../model/BridgeModels';
 import { HdcRelayConfig, HdcRelayState, HdcRelayTunnel } from '../services/HdcRelayTunnel';
-import { common, wantAgent } from '@kit.AbilityKit';
+import { ContentActionService } from '../services/ContentActionService';
+import { AttachmentService, PickedMobileFile } from '../services/AttachmentService';
+import { MarkdownReader } from '../components/MarkdownReader';
+import {
+  MarkdownDocumentService,
+  MarkdownReaderDocument
+} from '../services/MarkdownDocumentService';
+import {
+  compactAdjacentSessionToolEntries,
+  parseSessionMarkdownInline,
+  parseSessionMarkdownTable,
+  sessionToolPresentationItems,
+  SessionMarkdownInlineSegment,
+  SessionMarkdownTableData,
+  SessionToolPresentationItem
+} from '../services/SessionPresentationService';
+import {
+  appendOptimisticSessionMessage,
+  OptimisticSessionMessage,
+  optimisticSessionMessagesForTarget,
+  removeOptimisticSessionMessage
+} from '../services/OptimisticMessageService';
+import {
+  AppNotificationService,
+  MonitorNotificationSyncResult,
+  NOTIFICATION_EVENT_ID_STORAGE_KEY,
+  NOTIFICATION_EVENT_TYPE_STORAGE_KEY,
+  NOTIFICATION_REVISION_STORAGE_KEY,
+  NOTIFICATION_SESSION_STORAGE_KEY
+} from '../services/AppNotificationService';
+import { DesktopMonitorPanel } from '../components/DesktopMonitorPanel';
+import {
+  DesktopMonitorDisplayService,
+  DesktopMonitorDisplayState
+} from '../services/DesktopMonitorDisplayService';
+import { StandbyMonitorSnapshot } from '../model/StandbyMonitorModels';
+import { StandbyMonitorSnapshotService } from '../services/StandbyMonitorSnapshotService';
+import { SessionRuntimeStore } from '../services/SessionRuntimeStore';
+import { common, ConfigurationConstant, wantAgent } from '@kit.AbilityKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
-import notificationManager from '@ohos.notificationManager';
-import sensor from '@ohos.sensor';
 import {
   DEFAULT_BRIDGE_TOKEN,
   DEFAULT_BRIDGE_URL,
@@ -19,6 +55,26 @@ import {
   DEFAULT_RELAY_PORT,
   DEFAULT_RELAY_TOKEN
 } from '../config/BridgeConfig';
+import {
+  AppThemeTokens,
+  appThemeTokens,
+  DEFAULT_THEME_MODE,
+  normalizeThemeMode,
+  resolveThemeColor,
+  THEME_MODE_STORAGE_KEY,
+  themeModeLabel
+} from '../theme/AppTheme';
+import {
+  DEFAULT_FONT_SCALE_MODE,
+  FONT_SCALE_STORAGE_KEY,
+  fontScaleLabel,
+  fontScalePercent,
+  normalizeFontScaleMode,
+  scaleFontSize
+} from '../theme/AppTypography';
+
+PersistentStorage.persistProp(THEME_MODE_STORAGE_KEY, DEFAULT_THEME_MODE);
+PersistentStorage.persistProp(FONT_SCALE_STORAGE_KEY, DEFAULT_FONT_SCALE_MODE);
 
 interface PendingSessionImage {
   id: string;
@@ -31,6 +87,8 @@ interface ComposedSessionMessage {
   text: string;
   uploadedImages: PendingSessionImage[];
   failedImages: PendingSessionImage[];
+  uploadedFiles: PickedMobileFile[];
+  failedFiles: PickedMobileFile[];
 }
 
 interface FailedSessionMessage {
@@ -38,8 +96,10 @@ interface FailedSessionMessage {
   sessionId: string;
   isNewSession: boolean;
   projectId: string;
+  submissionId: string;
   text: string;
   images: PendingSessionImage[];
+  files: PickedMobileFile[];
   error: string;
   createdAt: string;
   retrying: boolean;
@@ -54,8 +114,10 @@ interface FailedSessionMessageRecordInput {
   sessionId: string;
   isNewSession: boolean;
   projectId: string;
+  submissionId: string;
   text: string;
   images: PendingSessionImage[];
+  files: PickedMobileFile[];
   error: string;
 }
 
@@ -63,8 +125,10 @@ interface PendingSessionSend {
   sessionId: string;
   isNewSession: boolean;
   projectId: string;
+  submissionId: string;
   text: string;
   images: PendingSessionImage[];
+  files: PickedMobileFile[];
   retryFailedMessageId: string;
 }
 
@@ -88,12 +152,31 @@ interface SessionStructuredField {
 @Entry
 @Component
 struct Index {
+  @StorageLink('codexRemoteThemeMode') themeMode: string = DEFAULT_THEME_MODE;
+  @StorageLink('codexRemoteSystemDarkMode') systemDarkMode: boolean = false;
+  @StorageLink('codexRemoteFontScaleMode') fontScaleMode: string = DEFAULT_FONT_SCALE_MODE;
+  @StorageLink('codexRemoteWindowWidth') sessionWindowWidth: number = 0;
+  @StorageLink('codexRemoteWindowHeight') sessionWindowHeight: number = 0;
+  @StorageLink('codexRemoteActiveSessionId') activeSessionId: string = '';
+  @StorageLink('codexRemoteSessionDraft') sessionMessage: string = '';
+  @StorageLink('codexRemoteSessionSidebarWidth') sessionSidebarWidth: number = 304;
+  @StorageLink('codexRemotePreviewImageUrl') previewImageUrl: string = '';
+  @StorageLink('codexRemoteDesktopPreviewImageUrl') desktopScreenshotPreviewUrl: string = '';
+  @StorageLink('codexRemoteImagePreviewScale') desktopScreenshotScale: number = 1;
+  @StorageLink('codexRemoteImagePreviewRotation') desktopScreenshotRotation: number = 0;
+  @StorageLink('codexRemoteImagePreviewOffsetX') desktopScreenshotOffsetX: number = 0;
+  @StorageLink('codexRemoteImagePreviewOffsetY') desktopScreenshotOffsetY: number = 0;
+  @StorageLink(NOTIFICATION_SESSION_STORAGE_KEY) notificationTargetSessionId: string = '';
+  @StorageLink(NOTIFICATION_EVENT_TYPE_STORAGE_KEY) notificationTargetEventType: string = '';
+  @StorageLink(NOTIFICATION_EVENT_ID_STORAGE_KEY) notificationTargetEventId: string = '';
+  @StorageLink(NOTIFICATION_REVISION_STORAGE_KEY) notificationTargetRevision: string = '';
   @State bridgeUrl: string = DEFAULT_BRIDGE_URL;
   @State bridgeToken: string = DEFAULT_BRIDGE_TOKEN;
   @State prompt: string = '请检查当前项目，修复发现的问题，并用中文说明改动和验证结果';
   @State projects: BridgeProject[] = [];
   @State tasks: BridgeTaskSummary[] = [];
   @State sessions: CodexSessionSummary[] = [];
+  @State sessionsLoadError: string = '';
   @State lastGoodSessionCount: number = 0;
   @State selectedSession: CodexSessionDetail | null = null;
   @State selectedProjectId: string = 'probe';
@@ -103,8 +186,8 @@ struct Index {
   @State activeTab: string = 'sessions';
   @State logSessionId: string = `app-${Date.now()}`;
   @State sessionSidebarCollapsed: boolean = false;
+  @State sessionSidebarUserCollapsed: boolean = false;
   @State collapsedSessionProjects: string[] = [];
-  @State sessionMessage: string = '';
   @State sessionModel: string = '';
   @State desktopDefaultModel: string = '';
   @State availableModels: CodexModelOption[] = [];
@@ -134,6 +217,7 @@ struct Index {
   @State desktopLiveSessionVerified: boolean = false;
   @State desktopLiveChecking: boolean = false;
   @State desktopLiveRestarting: boolean = false;
+  @State isOpeningDesktopSession: boolean = false;
   @State desktopLiveRequiresDesktopCdp: boolean = false;
   @State desktopLiveMobileRecoverable: boolean = true;
   @State desktopLiveFailureClass: string = '';
@@ -146,10 +230,22 @@ struct Index {
   @State systemLinkRecoverableFromPhone: boolean = true;
   @State homeActionMenuVisible: boolean = false;
   @State homeActionMenuSource: string = '';
+  @State themeModeChooserVisible: boolean = false;
+  @State fontScaleChooserVisible: boolean = false;
   @State accountUsagePanelVisible: boolean = false;
   @State isLoadingAccountUsage: boolean = false;
   @State accountUsage: CodexAccountUsage | null = null;
   @State accountUsageError: string = '';
+  @State desktopMonitorVisible: boolean = false;
+  @State desktopMonitorSnapshot: StandbyMonitorSnapshot =
+    StandbyMonitorSnapshotService.defaultSnapshot();
+  @State desktopMonitorCharging: boolean = false;
+  @State desktopMonitorKeepScreenOn: boolean = false;
+  @State desktopMonitorBatteryPercent: number = 0;
+  @State outboxPanelVisible: boolean = false;
+  @State isLoadingOutbox: boolean = false;
+  @State outboxItems: BridgeOutboxItem[] = [];
+  @State outboxDrafts: Record<string, string> = {};
   @State isUploadingImage: boolean = false;
   @State isCapturingDesktopScreenshot: boolean = false;
   @State isAttachingDesktopScreenshot: boolean = false;
@@ -159,15 +255,12 @@ struct Index {
   @State interruptingSessionTargetId: string = '';
   @State composerActionMenuExpanded: boolean = false;
   @State pendingSessionImages: PendingSessionImage[] = [];
+  @State pendingSessionFiles: PickedMobileFile[] = [];
+  @State isPickingFile: boolean = false;
   @State failedSessionMessages: FailedSessionMessage[] = [];
+  @State optimisticSessionMessages: OptimisticSessionMessage[] = [];
   @State sessionComposerFocused: boolean = false;
-  @State previewImageUrl: string = '';
-  @State desktopScreenshotPreviewUrl: string = '';
   @State desktopScreenshotMetaText: string = '';
-  @State desktopScreenshotScale: number = 1;
-  @State desktopScreenshotRotation: number = 0;
-  @State desktopScreenshotOffsetX: number = 0;
-  @State desktopScreenshotOffsetY: number = 0;
   @State sessionAutoFollowBottom: boolean = true;
   @State sessionStatusExpanded: boolean = false;
   @State slashCommandPanelVisible: boolean = false;
@@ -177,11 +270,15 @@ struct Index {
   @State deletingSessionId: string = '';
   @State swipedSessionId: string = '';
   @State swipedSessionOffsetX: number = 0;
+  @State userInputAnswers: Record<string, string> = {};
+  @State remoteFileActionBusy: boolean = false;
+  @State markdownReaderDocument: MarkdownReaderDocument | null = null;
 
   private sessionScroller: Scroller = new Scroller();
   private sessionScrollGeneration: number = 0;
   private pollTimer: number = -1;
   private dashboardTimer: number = -1;
+  private desktopMonitorTimer: number = -1;
   private logFlushTimer: number = -1;
   private relayWatchdogTimer: number = -1;
   private pendingLogs: AppLogPayload[] = [];
@@ -196,6 +293,7 @@ struct Index {
   private lastTasksRefreshAt: number = 0;
   private lastSessionsRefreshAt: number = 0;
   private lastSystemLinkRefreshAt: number = 0;
+  private lastRuntimeContractRefreshAt: number = 0;
   private lastSelectedSessionDetailRefreshAt: number = 0;
   private lastHomeActionToggleAt: number = 0;
   private lastHomeActionToggleSource: string = '';
@@ -203,6 +301,7 @@ struct Index {
   private lastHomeActionMenuActionKey: string = '';
   private homeActionMenuOpenedAt: number = 0;
   private accountUsagePanelOpenedAt: number = 0;
+  private lastDesktopMonitorUsageRefreshAt: number = 0;
   private lastComposerActionToggleAt: number = 0;
   private sessionDetailRequestSeq: number = 0;
   private sampledLogSignatureByEvent: Record<string, string> = {};
@@ -212,11 +311,8 @@ struct Index {
   private desktopScreenshotGestureStartScale: number = 1;
   private desktopScreenshotGestureStartOffsetX: number = 0;
   private desktopScreenshotGestureStartOffsetY: number = 0;
-  private desktopScreenshotSensorActive: boolean = false;
-  private desktopScreenshotLastAutoRotationAt: number = 0;
-  private desktopScreenshotAccelerometerCallback = (data: sensor.AccelerometerResponse): void => {
-    this.handleDesktopScreenshotAccelerometer(data.x, data.y, data.z);
-  };
+  private sessionSidebarResizeStartWidth: number = 304;
+  private adaptiveImagePreviewLandscape: boolean = false;
   private lastDesktopSyncWarningTaskId: string = '';
   private relayAutoStarted: boolean = false;
   private relayRunning: boolean = false;
@@ -234,10 +330,14 @@ struct Index {
   private sessionActivityStatusById: Record<string, string> = {};
   private sessionUpdatedAtById: Record<string, string> = {};
   private clearedRunningSessionUpdatedAtById: Record<string, string> = {};
+  private sessionRuntimeStore: SessionRuntimeStore = new SessionRuntimeStore();
+  private latestRuntimeSnapshot: CodexRuntimeSnapshot | null = null;
   private reasoningEffortLoadedSessionId: string = '';
   private notifiedTaskIds: string[] = [];
   private notifiedSessionCompletionKeys: string[] = [];
-  private notificationRequestCode: number = 31078;
+  private notifiedAttentionKeys: string[] = [];
+  private lastHandledNotificationRevision: string = '';
+  private lastConnectionNotificationAt: number = 0;
   private relayTunnel: HdcRelayTunnel = new HdcRelayTunnel((state: HdcRelayState, detail: string) => {
     if (this.relayStateText !== state || this.relayDetailText !== detail) {
       this.relayStateChangedAt = Date.now();
@@ -252,8 +352,10 @@ struct Index {
   });
 
   aboutToAppear(): void {
+    this.themeMode = normalizeThemeMode(this.themeMode);
+    this.fontScaleMode = normalizeFontScaleMode(this.fontScaleMode);
+    this.applyThemeMode();
     this.appForeground = true;
-    this.sessionMessage = '';
     this.applyKeyboardAvoidMode();
     this.startLogFlusher();
     this.startDashboardRefresh();
@@ -261,6 +363,11 @@ struct Index {
     void this.loadDesktopReasoningDefaults();
     void this.startRelayBackgroundRunning();
     void this.requestNotificationPermission();
+    void this.applyPendingNotificationNavigation();
+    if (this.desktopMonitorVisible) {
+      this.startDesktopMonitorRefresh();
+      void this.syncDesktopMonitorDisplay('foreground');
+    }
     if (DEFAULT_EMBEDDED_RELAY_ENABLED) {
       this.startRelayWatchdog();
       this.startEmbeddedRelayOnce();
@@ -270,13 +377,30 @@ struct Index {
 
   aboutToDisappear(): void {
     this.appForeground = false;
-    this.stopDesktopScreenshotAutoRotation();
+    this.stopDesktopMonitorRefresh();
+    void this.suspendDesktopMonitorDisplay('background');
     this.log('info', 'app.disappear', `taskId=${this.currentTask?.id ?? ''}; status=${this.currentTask?.status ?? 'idle'}`);
     void this.flushLogQueue();
     this.log('info', 'app.background.monitoring.keep_alive', `dashboardTimer=${this.dashboardTimer}; pollTimer=${this.pollTimer}; logFlushTimer=${this.logFlushTimer}`);
   }
 
   onBackPress(): boolean {
+    if (this.hasOpenImagePreview()) {
+      this.closeOpenImagePreview('system_back');
+      return true;
+    }
+    if (this.markdownReaderDocument !== null) {
+      this.closeMarkdownReader('system_back');
+      return true;
+    }
+    if (this.outboxPanelVisible) {
+      this.outboxPanelVisible = false;
+      return true;
+    }
+    if (this.desktopMonitorVisible) {
+      this.closeDesktopMonitor('system_back');
+      return true;
+    }
     if (this.activeTab === 'sessions' && !this.sessionSidebarCollapsed) {
       this.closeSessionSidebar('system_back');
       return true;
@@ -295,7 +419,7 @@ struct Index {
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       if (this.activeTab === 'sessions') {
-        this.SessionPanel()
+        this.SessionWorkspace()
       } else {
         Scroll() {
           Column({ space: 12 }) {
@@ -320,12 +444,6 @@ struct Index {
         .edgeEffect(EdgeEffect.Spring)
       }
 
-      if (this.activeTab === 'sessions') {
-        if (!this.sessionSidebarCollapsed) {
-          this.SessionSidebar()
-        }
-      }
-
       if (this.previewImageUrl.length > 0) {
         this.ImagePreviewOverlay()
       }
@@ -337,12 +455,74 @@ struct Index {
       if (this.accountUsagePanelVisible) {
         this.AccountUsagePanel()
       }
+
+      if (this.outboxPanelVisible) {
+        this.OutboxPanel()
+      }
+
+      if (this.markdownReaderDocument !== null) {
+        this.MarkdownReaderOverlay()
+      }
+
+      if (this.desktopMonitorVisible) {
+        this.DesktopMonitorOverlay()
+      }
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#F7F8FA')
+    .backgroundColor(this.themeColor('#F7F8FA'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.BOTTOM])
+  }
+
+  @Builder
+  DesktopMonitorOverlay() {
+    DesktopMonitorPanel({
+      snapshot: this.desktopMonitorSnapshot,
+      landscape: this.isLandscapeSessionLayout(),
+      charging: this.desktopMonitorCharging,
+      keepScreenOn: this.desktopMonitorKeepScreenOn,
+      batteryPercent: this.desktopMonitorBatteryPercent,
+      onClose: () => {
+        this.closeDesktopMonitor('header_close');
+      },
+      onRefresh: () => {
+        this.refreshDesktopMonitor('manual');
+      }
+    })
+      .width('100%')
+      .height('100%')
+      .zIndex(120)
+  }
+
+  @Builder
+  MarkdownReaderOverlay() {
+    if (this.markdownReaderDocument !== null) {
+      MarkdownReader({
+        document: this.markdownReaderDocument,
+        darkMode: this.usesDarkTheme(),
+        fontScaleMode: this.fontScaleMode,
+        landscape: this.isLandscapeSessionLayout(),
+        onClose: () => {
+          this.closeMarkdownReader('header_back');
+        },
+        onCopy: () => {
+          void this.copyMarkdownReaderText();
+        },
+        onShare: () => {
+          void this.shareMarkdownReaderFile();
+        },
+        onOpenExternal: () => {
+          void this.openMarkdownReaderInOtherApp();
+        },
+        onLinkClick: (href: string) => {
+          this.handleMarkdownReaderLink(href);
+        },
+        onFontScaleChange: (mode: string) => {
+          this.changeFontScaleMode(mode);
+        }
+      })
+    }
   }
 
   @Builder
@@ -350,12 +530,12 @@ struct Index {
     Row() {
       Column({ space: 4 }) {
         Text('Codex 远程控制')
-          .fontSize(22)
+          .fontSize(this.scaledFontSize(22))
           .fontWeight(FontWeight.Bold)
-          .fontColor('#17202A')
+          .fontColor(this.themeColor('#17202A'))
         Text(this.headerMessageText())
-          .fontSize(13)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(13))
+          .fontColor(this.themeColor('#68717D'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
@@ -364,8 +544,8 @@ struct Index {
       Blank()
 
       Text(this.statusLabel(this.currentTask?.status ?? 'idle'))
-        .fontSize(12)
-        .fontColor('#FFFFFF')
+        .fontSize(this.scaledFontSize(12))
+        .fontColor(this.theme().textOnAccent)
         .padding({ left: 10, right: 10, top: 5, bottom: 5 })
         .backgroundColor(this.statusColor(this.currentTask?.status ?? 'idle'))
         .borderRadius(6)
@@ -382,21 +562,21 @@ struct Index {
         this.SummaryMetric('会话', `${this.sessions.length}`)
       }
       Text(this.relaySummaryText())
-        .fontSize(12)
+        .fontSize(this.scaledFontSize(12))
         .fontColor(this.relaySummaryColor())
         .width('100%')
         .maxLines(2)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
       Text(this.currentTaskSummaryText())
-        .fontSize(12)
-        .fontColor('#68717D')
+        .fontSize(this.scaledFontSize(12))
+        .fontColor(this.themeColor('#68717D'))
         .width('100%')
         .maxLines(2)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     .width('100%')
     .padding(12)
-    .backgroundColor('#FFFFFF')
+    .backgroundColor(this.themeColor('#FFFFFF'))
     .borderRadius(8)
   }
 
@@ -404,17 +584,17 @@ struct Index {
   SummaryMetric(label: string, value: string) {
     Column({ space: 3 }) {
       Text(value)
-        .fontSize(18)
+        .fontSize(this.scaledFontSize(18))
         .fontWeight(FontWeight.Bold)
-        .fontColor('#17202A')
+        .fontColor(this.themeColor('#17202A'))
       Text(label)
-        .fontSize(11)
-        .fontColor('#68717D')
+        .fontSize(this.scaledFontSize(11))
+        .fontColor(this.themeColor('#68717D'))
     }
     .layoutWeight(1)
     .height(54)
     .justifyContent(FlexAlign.Center)
-    .backgroundColor('#F7F8FA')
+    .backgroundColor(this.themeColor('#F7F8FA'))
     .borderRadius(6)
   }
 
@@ -433,9 +613,9 @@ struct Index {
     Button(label)
       .height(38)
       .layoutWeight(1)
-      .fontSize(13)
-      .fontColor(this.activeTab === tab ? '#FFFFFF' : '#17202A')
-      .backgroundColor(this.activeTab === tab ? '#1F6FEB' : '#FFFFFF')
+      .fontSize(this.scaledFontSize(13))
+      .fontColor(this.activeTab === tab ? this.theme().textOnAccent : this.themeColor('#17202A'))
+      .backgroundColor(this.activeTab === tab ? this.themeColor('#1F6FEB') : this.themeColor('#FFFFFF'))
       .onClick(() => {
         this.activeTab = tab;
         this.log('info', 'ui.tab.changed', `tab=${tab}`);
@@ -446,14 +626,14 @@ struct Index {
   ConnectionPanel() {
     Column({ space: 10 }) {
       Text('桥接地址')
-        .fontSize(15)
+        .fontSize(this.scaledFontSize(15))
         .fontWeight(FontWeight.Medium)
-        .fontColor('#17202A')
+        .fontColor(this.themeColor('#17202A'))
 
       TextInput({ text: this.bridgeUrl, placeholder: 'http://电脑地址:8787' })
         .height(44)
-        .fontSize(14)
-        .backgroundColor('#FFFFFF')
+        .fontSize(this.scaledFontSize(14))
+        .backgroundColor(this.themeColor('#FFFFFF'))
         .borderRadius(6)
         .onChange((value: string) => {
           this.bridgeUrl = value.trim();
@@ -462,8 +642,8 @@ struct Index {
 
       TextInput({ text: this.bridgeToken, placeholder: '公网访问令牌（本地 USB 可留空）' })
         .height(44)
-        .fontSize(14)
-        .backgroundColor('#FFFFFF')
+        .fontSize(this.scaledFontSize(14))
+        .backgroundColor(this.themeColor('#FFFFFF'))
         .borderRadius(6)
         .type(InputType.Password)
         .onChange((value: string) => {
@@ -491,7 +671,7 @@ struct Index {
           })
       }
     }
-    .cardStyle()
+    .cardStyle(this.theme().surface)
   }
 
   @Builder
@@ -499,41 +679,41 @@ struct Index {
     Column({ space: 10 }) {
       Row() {
         Text('项目实时状态')
-          .fontSize(15)
+          .fontSize(this.scaledFontSize(15))
           .fontWeight(FontWeight.Medium)
-          .fontColor('#17202A')
+          .fontColor(this.themeColor('#17202A'))
         Blank()
         Text(`${this.projects.length} 项目 / ${this.tasks.length} 任务 / ${this.sessions.length} 会话`)
-          .fontSize(12)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(12))
+          .fontColor(this.themeColor('#68717D'))
       }
 
       if (this.projects.length === 0) {
         Text('暂无项目，点击“加载项目”或等待自动刷新')
-          .fontSize(13)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(13))
+          .fontColor(this.themeColor('#68717D'))
       } else {
         ForEach(this.projects, (project: BridgeProject) => {
           Column({ space: 4 }) {
             Row() {
               Text(project.name)
-                .fontSize(14)
+                .fontSize(this.scaledFontSize(14))
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#17202A')
+                .fontColor(this.themeColor('#17202A'))
               Blank()
               Text(project.id)
-                .fontSize(12)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(12))
+                .fontColor(this.themeColor('#68717D'))
             }
             Text(project.root)
-              .fontSize(11)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(11))
+              .fontColor(this.themeColor('#68717D'))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           .width('100%')
           .padding(10)
-          .backgroundColor(project.id === this.selectedProjectId ? '#EAF2FF' : '#F7F8FA')
+          .backgroundColor(project.id === this.selectedProjectId ? this.themeColor('#EAF2FF') : this.themeColor('#F7F8FA'))
           .borderRadius(6)
           .onClick(() => {
             this.selectedProjectId = project.id;
@@ -543,40 +723,76 @@ struct Index {
 
       if (this.tasks.length > 0) {
         Text('最近任务')
-          .fontSize(13)
+          .fontSize(this.scaledFontSize(13))
           .fontWeight(FontWeight.Medium)
-          .fontColor('#17202A')
+          .fontColor(this.themeColor('#17202A'))
         ForEach(this.tasks.slice(0, 5), (task: BridgeTaskSummary) => {
           Column({ space: 4 }) {
             Row() {
               Text(this.statusLabel(task.status))
-                .fontSize(12)
-                .fontColor('#FFFFFF')
+                .fontSize(this.scaledFontSize(12))
+                .fontColor(this.theme().textOnAccent)
                 .padding({ left: 8, right: 8, top: 3, bottom: 3 })
                 .backgroundColor(this.statusColor(task.status))
                 .borderRadius(5)
               Blank()
               Text(task.projectId)
-                .fontSize(12)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(12))
+                .fontColor(this.themeColor('#68717D'))
             }
             Text(task.prompt)
-              .fontSize(12)
-              .fontColor('#17202A')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.themeColor('#17202A'))
               .maxLines(2)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
             Text(`事件 ${task.eventCount} · ${task.updatedAt}`)
-              .fontSize(11)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(11))
+              .fontColor(this.themeColor('#68717D'))
           }
           .width('100%')
           .padding(10)
-          .backgroundColor('#F7F8FA')
+          .backgroundColor(this.themeColor('#F7F8FA'))
           .borderRadius(6)
         }, (task: BridgeTaskSummary) => task.id)
       }
     }
-    .cardStyle()
+    .cardStyle(this.theme().surface)
+  }
+
+  @Builder
+  SessionWorkspace() {
+    if (this.isLandscapeSessionLayout()) {
+      Row() {
+        if (!this.sessionSidebarUserCollapsed) {
+          Column() {
+            this.SessionSidebar()
+          }
+          .width(this.sessionLandscapeSidebarWidth())
+          .height('100%')
+
+          this.SessionSidebarResizeHandle()
+        }
+
+        Column() {
+          this.SessionPanel()
+        }
+        .layoutWeight(1)
+        .height('100%')
+      }
+      .width('100%')
+      .height('100%')
+      .alignItems(VerticalAlign.Top)
+    } else {
+      Stack({ alignContent: Alignment.TopStart }) {
+        this.SessionPanel()
+
+        if (!this.sessionSidebarCollapsed) {
+          this.SessionSidebar()
+        }
+      }
+      .width('100%')
+      .height('100%')
+    }
   }
 
   @Builder
@@ -585,16 +801,20 @@ struct Index {
       Column({ space: 8 }) {
         if (this.selectedSession !== null || this.isNewSessionDraft) {
           Row({ space: 8 }) {
+            if (this.shouldShowSessionHeaderSidebarToggle()) {
+              this.SessionSidebarHeaderToggleButton()
+            }
+
             Column({ space: 3 }) {
               Text(this.sessionPageTitle())
-                .fontSize(16)
+                .fontSize(this.scaledFontSize(16))
                 .fontWeight(FontWeight.Bold)
-                .fontColor('#17202A')
+                .fontColor(this.themeColor('#17202A'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
               Text(this.sessionPageSubtitle())
-                .fontSize(10)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(10))
+                .fontColor(this.themeColor('#68717D'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
@@ -602,21 +822,27 @@ struct Index {
             .layoutWeight(1)
 
             this.ReasoningEffortHeaderButton()
+
+            this.DesktopTakeoverButton()
           }
           .width('100%')
           .height(40)
         } else {
           Row({ space: 8 }) {
+            if (this.shouldShowSessionHeaderSidebarToggle()) {
+              this.SessionSidebarHeaderToggleButton()
+            }
+
             Column({ space: 3 }) {
               Text('Codex 远程')
-                .fontSize(16)
+                .fontSize(this.scaledFontSize(16))
                 .fontWeight(FontWeight.Bold)
-                .fontColor('#17202A')
+                .fontColor(this.themeColor('#17202A'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
               Text(this.sessionMonitorSummaryText())
-                .fontSize(10)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(10))
+                .fontColor(this.themeColor('#68717D'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
@@ -651,7 +877,85 @@ struct Index {
     .width('100%')
     .height('100%')
     .padding({ left: 12, right: 12, top: 12, bottom: 0 })
-    .backgroundColor('#F7F8FA')
+    .backgroundColor(this.themeColor('#F7F8FA'))
+  }
+
+  @Builder
+  SessionSidebarHeaderToggleButton() {
+    Button() {
+      if (this.isLandscapeSessionLayout() && !this.sessionSidebarUserCollapsed) {
+        SymbolGlyph($r('sys.symbol.chevron_left'))
+          .fontSize(18)
+          .fontColor([this.themeColor('#68717D')])
+      } else {
+        SymbolGlyph($r('sys.symbol.open_sidebar'))
+          .fontSize(18)
+          .fontColor([this.themeColor('#68717D')])
+      }
+    }
+    .width(34)
+    .height(34)
+    .backgroundColor(this.themeColor('#F0F2F5'))
+    .borderRadius(17)
+    .onClick(() => {
+      this.toggleSessionSidebarFromHeader();
+    })
+  }
+
+  @Builder
+  DesktopTakeoverButton() {
+    Button() {
+      Row({ space: 4 }) {
+        if (this.isOpeningDesktopSession) {
+          LoadingProgress()
+            .width(12)
+            .height(12)
+            .color(this.themeColor('#1F6FEB'))
+        }
+        Text('桌面')
+          .fontSize(this.scaledFontSize(10))
+          .fontColor(this.themeColor('#1F6FEB'))
+          .maxLines(1)
+      }
+      .justifyContent(FlexAlign.Center)
+    }
+      .width(58)
+      .height(30)
+      .backgroundColor(this.themeColor('#EAF2FF'))
+      .border({ width: 1, color: this.themeColor('#BBD2FF') })
+      .borderRadius(15)
+      .enabled(this.selectedSession !== null && !this.isOpeningDesktopSession)
+      .onClick(() => {
+        void this.openDesktopSelectedSession('conversation_header');
+      })
+  }
+
+  @Builder
+  SessionSidebarResizeHandle() {
+    Stack({ alignContent: Alignment.Center }) {
+      Row()
+        .width(2)
+        .height(52)
+        .backgroundColor(this.themeColor('#DDE3EA'))
+        .borderRadius(1)
+    }
+    .width(12)
+    .height('100%')
+    .backgroundColor(this.themeColor('#F7F8FA'))
+    .gesture(
+      PanGesture({ direction: PanDirection.Horizontal })
+        .onActionStart(() => {
+          this.sessionSidebarResizeStartWidth = this.sessionLandscapeSidebarWidth();
+          this.homeActionMenuVisible = false;
+          this.homeActionMenuSource = '';
+        })
+        .onActionUpdate((event: GestureEvent) => {
+          this.resizeSessionLandscapeSidebar(event.offsetX);
+        })
+        .onActionEnd(() => {
+          this.log('info', 'ui.session_sidebar.resized', `width=${this.sessionSidebarWidth}`);
+        })
+    )
   }
 
   @Builder
@@ -662,19 +966,19 @@ struct Index {
           LoadingProgress()
             .width(12)
             .height(12)
-            .color('#1F6FEB')
+            .color(this.themeColor('#1F6FEB'))
         } else {
           Text(this.modelShortLabel(this.sessionModel))
-            .fontSize(11)
+            .fontSize(this.scaledFontSize(11))
             .fontWeight(FontWeight.Bold)
-            .fontColor('#17202A')
+            .fontColor(this.themeColor('#17202A'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
-        Text(`思考·${this.reasoningEffortShortLabel(this.sessionReasoningEffort)}`)
-          .fontSize(10)
+        Text(`· ${this.reasoningEffortShortLabel(this.sessionReasoningEffort)}`)
+          .fontSize(this.scaledFontSize(10))
           .fontWeight(FontWeight.Medium)
-          .fontColor('#1F6FEB')
+          .fontColor(this.themeColor('#1F6FEB'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
@@ -683,8 +987,8 @@ struct Index {
     }
       .width(166)
       .height(30)
-      .backgroundColor(this.reasoningEffortMenuVisible ? '#EAF2FF' : '#FFFFFF')
-      .border({ width: 1, color: this.reasoningEffortMenuVisible ? '#BBD2FF' : '#DDE3EA' })
+      .backgroundColor(this.reasoningEffortMenuVisible ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
+      .border({ width: 1, color: this.reasoningEffortMenuVisible ? this.themeColor('#BBD2FF') : this.themeColor('#DDE3EA') })
       .borderRadius(15)
       .enabled(this.canChangeReasoningEffort())
       .onClick(() => {
@@ -699,27 +1003,27 @@ struct Index {
   ReasoningEffortMenu() {
     Column({ space: 8 }) {
       Text('模型')
-        .fontSize(11)
+        .fontSize(this.scaledFontSize(11))
         .fontWeight(FontWeight.Bold)
-        .fontColor('#68717D')
+        .fontColor(this.themeColor('#68717D'))
         .width('100%')
       ForEach(this.modelOptionValues(), (option: CodexModelOption) => {
         Button() {
           Row({ space: 8 }) {
             Text(this.sessionModel === this.normalizeModel(option.id) ? '✓' : '')
-              .fontSize(12)
-              .fontColor('#1F6FEB')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.themeColor('#1F6FEB'))
               .width(12)
             Column({ space: 1 }) {
               Text(this.modelLabel(option))
-                .fontSize(12)
+                .fontSize(this.scaledFontSize(12))
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#17202A')
+                .fontColor(this.themeColor('#17202A'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
               Text(this.modelDescription(option))
-                .fontSize(9)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(9))
+                .fontColor(this.themeColor('#68717D'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
@@ -731,8 +1035,8 @@ struct Index {
           .width(210)
           .height(40)
           .padding({ left: 8, right: 8 })
-          .backgroundColor(this.sessionModel === this.normalizeModel(option.id) ? '#EAF2FF' : '#FFFFFF')
-          .border({ width: this.sessionModel === this.normalizeModel(option.id) ? 1 : 0, color: this.sessionModel === this.normalizeModel(option.id) ? '#BBD2FF' : '#FFFFFF' })
+          .backgroundColor(this.sessionModel === this.normalizeModel(option.id) ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
+          .border({ width: this.sessionModel === this.normalizeModel(option.id) ? 1 : 0, color: this.sessionModel === this.normalizeModel(option.id) ? this.themeColor('#BBD2FF') : this.themeColor('#FFFFFF') })
           .borderRadius(9)
           .enabled(!this.isSavingReasoningEffort)
           .onClick(() => {
@@ -743,28 +1047,28 @@ struct Index {
       Row()
         .width('100%')
         .height(1)
-        .backgroundColor('#E6EAF0')
+        .backgroundColor(this.themeColor('#E6EAF0'))
 
       Text('思考强度')
-        .fontSize(11)
+        .fontSize(this.scaledFontSize(11))
         .fontWeight(FontWeight.Bold)
-        .fontColor('#68717D')
+        .fontColor(this.themeColor('#68717D'))
         .width('100%')
       ForEach(this.reasoningEffortValues(), (effort: string) => {
         Button() {
           Row({ space: 8 }) {
             Text(this.sessionReasoningEffort === effort ? '✓' : '')
-              .fontSize(12)
-              .fontColor('#1F6FEB')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.themeColor('#1F6FEB'))
               .width(12)
             Column({ space: 1 }) {
               Text(this.reasoningEffortLabel(effort))
-                .fontSize(12)
+                .fontSize(this.scaledFontSize(12))
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#17202A')
+                .fontColor(this.themeColor('#17202A'))
               Text(this.reasoningEffortDescription(effort))
-                .fontSize(9)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(9))
+                .fontColor(this.themeColor('#68717D'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
@@ -776,8 +1080,8 @@ struct Index {
           .width(210)
           .height(38)
           .padding({ left: 8, right: 8 })
-          .backgroundColor(this.sessionReasoningEffort === effort ? '#EAF2FF' : '#FFFFFF')
-          .border({ width: this.sessionReasoningEffort === effort ? 1 : 0, color: this.sessionReasoningEffort === effort ? '#BBD2FF' : '#FFFFFF' })
+          .backgroundColor(this.sessionReasoningEffort === effort ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
+          .border({ width: this.sessionReasoningEffort === effort ? 1 : 0, color: this.sessionReasoningEffort === effort ? this.themeColor('#BBD2FF') : this.themeColor('#FFFFFF') })
           .borderRadius(9)
           .enabled(!this.isSavingReasoningEffort)
           .onClick(() => {
@@ -787,10 +1091,10 @@ struct Index {
     }
     .width(226)
     .padding(8)
-    .backgroundColor('#FFFFFF')
-    .border({ width: 1, color: '#DDE3EA' })
+    .backgroundColor(this.themeColor('#FFFFFF'))
+    .border({ width: 1, color: this.themeColor('#DDE3EA') })
     .borderRadius(14)
-    .shadow({ radius: 14, color: '#1F232824', offsetX: 0, offsetY: 5 })
+    .shadow({ radius: 14, color: this.themeColor('#1F232824'), offsetX: 0, offsetY: 5 })
     .margin({ top: 42, right: 0 })
     .zIndex(9)
   }
@@ -802,17 +1106,17 @@ struct Index {
         LoadingProgress()
           .width(17)
           .height(17)
-          .color('#1F6FEB')
+          .color(this.themeColor('#1F6FEB'))
       } else {
         SymbolGlyph($r('sys.symbol.plus'))
           .fontSize(20)
-          .fontColor([this.homeActionMenuVisible ? '#1F6FEB' : '#17202A'])
+          .fontColor([this.homeActionMenuVisible ? this.themeColor('#1F6FEB') : this.themeColor('#17202A')])
       }
     }
       .width(36)
       .height(36)
-      .backgroundColor(this.homeActionMenuVisible ? '#EAF2FF' : '#FFFFFF')
-      .border({ width: 1, color: this.homeActionMenuVisible ? '#BBD2FF' : '#DDE3EA' })
+      .backgroundColor(this.homeActionMenuVisible ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
+      .border({ width: 1, color: this.homeActionMenuVisible ? this.themeColor('#BBD2FF') : this.themeColor('#DDE3EA') })
       .borderRadius(18)
       .enabled(!this.isBusy)
       .onClick(() => {
@@ -823,20 +1127,105 @@ struct Index {
   @Builder
   HomeActionMenu(source: string) {
     Column({ space: 6 }) {
-      this.HomeActionMenuItem('usage', '账号用量', '读取 Codex 桌面当前可见套餐信息', '#1F6FEB', source)
-      this.HomeActionMenuItem('new_session', '新建会话', '创建一个真实 Codex 新线程', '#14853D', source)
-      this.HomeActionMenuItem('refresh', '刷新会话', '重新读取会话列表和状态', '#68717D', source)
-      this.HomeActionMenuItem('soft_repair', '恢复链路', '检测 bridge、CDP 与无线 HDC', '#B68A00', source)
-      this.HomeActionMenuItem('hard_restart', '重启 Codex', '需要确认，会重启桌面 Codex', '#B42318', source)
+      this.HomeActionMenuItem('theme', '主题', `当前：${themeModeLabel(this.themeMode)}`, this.theme().accent, source)
+      if (this.themeModeChooserVisible) {
+        this.ThemeModeSelector()
+      }
+      this.HomeActionMenuItem(
+        'font_size',
+        '字体大小',
+        `当前：${fontScaleLabel(this.fontScaleMode)} · ${fontScalePercent(this.fontScaleMode)}%`,
+        this.theme().accent,
+        source
+      )
+      if (this.fontScaleChooserVisible) {
+        this.FontScaleSelector()
+      }
+      this.HomeActionMenuItem('desktop_monitor', '桌面监控', '常亮显示任务、未读与额度', '#5FC7FF', source)
+      this.HomeActionMenuItem('usage', '账号用量', '读取 Codex 桌面当前可见套餐信息', this.themeColor('#1F6FEB'), source)
+      this.HomeActionMenuItem('outbox', '发送队列', '查看、编辑、排序或取消待发送消息', this.themeColor('#7C3AED'), source)
+      this.HomeActionMenuItem('new_session', '新建会话', '创建一个真实 Codex 新线程', this.themeColor('#14853D'), source)
+      this.HomeActionMenuItem('refresh', '刷新会话', '重新读取会话列表和状态', this.themeColor('#68717D'), source)
+      this.HomeActionMenuItem('soft_repair', '恢复链路', '检测 bridge、CDP 与无线 HDC', this.themeColor('#B68A00'), source)
+      this.HomeActionMenuItem('hard_restart', '重启 Codex', '需要确认，会重启桌面 Codex', this.themeColor('#B42318'), source)
     }
-    .width(232)
+    .width(248)
     .padding(8)
-    .backgroundColor('#FFFFFF')
-    .border({ width: 1, color: '#DDE3EA' })
+    .backgroundColor(this.themeColor('#FFFFFF'))
+    .border({ width: 1, color: this.themeColor('#DDE3EA') })
     .borderRadius(14)
-    .shadow({ radius: 16, color: '#1F232824', offsetX: 0, offsetY: 6 })
+    .shadow({ radius: 16, color: this.themeColor('#1F232824'), offsetX: 0, offsetY: 6 })
     .margin({ top: source === 'sidebar_header' ? 60 : 42, right: source === 'sidebar_header' ? 14 : 0 })
     .zIndex(60)
+  }
+
+  @Builder
+  ThemeModeSelector() {
+    Column({ space: 6 }) {
+      Text('选择外观')
+        .fontSize(this.scaledFontSize(10))
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.theme().textSecondary)
+        .width('100%')
+      Row({ space: 6 }) {
+        this.ThemeModeButton('dark', '夜晚')
+        this.ThemeModeButton('light', '浅色')
+        this.ThemeModeButton('system', '跟随系统')
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding({ left: 8, right: 8, top: 2, bottom: 4 })
+  }
+
+  @Builder
+  ThemeModeButton(mode: string, label: string) {
+    Button(label)
+      .layoutWeight(1)
+      .height(30)
+      .fontSize(this.scaledFontSize(10))
+      .fontColor(this.themeMode === mode ? this.theme().textOnAccent : this.theme().textSecondary)
+      .backgroundColor(this.themeMode === mode ? this.theme().accent : this.theme().surfaceMuted)
+      .border({ width: 1, color: this.themeMode === mode ? this.theme().accent : this.theme().border })
+      .borderRadius(8)
+      .onClick(() => {
+        this.changeThemeMode(mode);
+      })
+  }
+
+  @Builder
+  FontScaleSelector() {
+    Column({ space: 6 }) {
+      Text('整体字体大小')
+        .fontSize(this.scaledFontSize(10))
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.theme().textSecondary)
+        .width('100%')
+      Row({ space: 6 }) {
+        this.FontScaleButton('small', '小')
+        this.FontScaleButton('standard', '标准')
+        this.FontScaleButton('large', '大')
+        this.FontScaleButton('extra_large', '特大')
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding({ left: 8, right: 8, top: 2, bottom: 4 })
+  }
+
+  @Builder
+  FontScaleButton(mode: string, label: string) {
+    Button(label)
+      .layoutWeight(1)
+      .height(30)
+      .fontSize(this.scaledFontSize(10))
+      .fontColor(this.fontScaleMode === mode ? this.theme().textOnAccent : this.theme().textSecondary)
+      .backgroundColor(this.fontScaleMode === mode ? this.theme().accent : this.theme().surfaceMuted)
+      .border({ width: 1, color: this.fontScaleMode === mode ? this.theme().accent : this.theme().border })
+      .borderRadius(8)
+      .onClick(() => {
+        this.changeFontScaleMode(mode);
+      })
   }
 
   @Builder
@@ -846,12 +1235,12 @@ struct Index {
         this.HomeActionIcon(action, color)
         Column({ space: 1 }) {
           Text(title)
-            .fontSize(12)
+            .fontSize(this.scaledFontSize(12))
             .fontWeight(FontWeight.Medium)
-            .fontColor('#17202A')
+            .fontColor(this.themeColor('#17202A'))
           Text(description)
-            .fontSize(9)
-            .fontColor('#68717D')
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#68717D'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
@@ -863,7 +1252,7 @@ struct Index {
       .width('100%')
       .height(42)
       .padding({ left: 8, right: 8 })
-      .backgroundColor('#FFFFFF')
+      .backgroundColor(this.themeColor('#FFFFFF'))
       .borderRadius(9)
       .enabled(this.canRunHomeAction(action))
       .onClick(() => {
@@ -874,9 +1263,29 @@ struct Index {
   @Builder
   HomeActionIcon(action: string, color: string) {
     Stack({ alignContent: Alignment.Center }) {
-      if (action === 'usage') {
+      if (action === 'theme') {
+        Text('◐')
+          .fontSize(this.scaledFontSize(14))
+          .fontWeight(FontWeight.Bold)
+          .fontColor(color)
+      } else if (action === 'font_size') {
+        Text('Aa')
+          .fontSize(this.scaledFontSize(10))
+          .fontWeight(FontWeight.Bold)
+          .fontColor(color)
+      } else if (action === 'desktop_monitor') {
+        Text('☾')
+          .fontSize(this.scaledFontSize(14))
+          .fontWeight(FontWeight.Bold)
+          .fontColor(color)
+      } else if (action === 'usage') {
         Text('¥')
-          .fontSize(13)
+          .fontSize(this.scaledFontSize(13))
+          .fontWeight(FontWeight.Bold)
+          .fontColor(color)
+      } else if (action === 'outbox') {
+        Text('列')
+          .fontSize(this.scaledFontSize(11))
           .fontWeight(FontWeight.Bold)
           .fontColor(color)
       } else if (action === 'new_session') {
@@ -885,23 +1294,23 @@ struct Index {
           .fontColor([color])
       } else if (action === 'refresh') {
         Text('↻')
-          .fontSize(15)
+          .fontSize(this.scaledFontSize(15))
           .fontColor(color)
       } else if (action === 'soft_repair') {
         Text('链')
-          .fontSize(12)
+          .fontSize(this.scaledFontSize(12))
           .fontWeight(FontWeight.Bold)
           .fontColor(color)
       } else {
         Text('重')
-          .fontSize(12)
+          .fontSize(this.scaledFontSize(12))
           .fontWeight(FontWeight.Bold)
           .fontColor(color)
       }
     }
     .width(26)
     .height(26)
-    .backgroundColor('#F7F8FA')
+    .backgroundColor(this.themeColor('#F7F8FA'))
     .borderRadius(13)
   }
 
@@ -911,7 +1320,7 @@ struct Index {
       Row()
         .width('100%')
         .height('100%')
-        .backgroundColor('#00000020')
+        .backgroundColor(this.themeColor('#00000020'))
         .onClick(() => {
           this.closeAccountUsagePanel('backdrop');
         })
@@ -920,12 +1329,12 @@ struct Index {
         Row({ space: 8 }) {
           Column({ space: 2 }) {
             Text('Codex 账号用量')
-              .fontSize(16)
+              .fontSize(this.scaledFontSize(16))
               .fontWeight(FontWeight.Bold)
-              .fontColor('#17202A')
+              .fontColor(this.themeColor('#17202A'))
             Text(this.accountUsageSubtitle())
-              .fontSize(10)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(10))
+              .fontColor(this.themeColor('#68717D'))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
@@ -937,16 +1346,16 @@ struct Index {
               LoadingProgress()
                 .width(16)
                 .height(16)
-                .color('#1F6FEB')
+                .color(this.themeColor('#1F6FEB'))
             } else {
               Text('↻')
-                .fontSize(16)
-                .fontColor('#1F6FEB')
+                .fontSize(this.scaledFontSize(16))
+                .fontColor(this.themeColor('#1F6FEB'))
             }
           }
             .width(34)
             .height(34)
-            .backgroundColor('#EAF2FF')
+            .backgroundColor(this.themeColor('#EAF2FF'))
             .borderRadius(17)
             .enabled(!this.isLoadingAccountUsage)
             .onClick(() => {
@@ -955,12 +1364,12 @@ struct Index {
 
           Button() {
             Text('×')
-              .fontSize(20)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(20))
+              .fontColor(this.themeColor('#68717D'))
           }
             .width(34)
             .height(34)
-            .backgroundColor('#F0F2F5')
+            .backgroundColor(this.themeColor('#F0F2F5'))
             .borderRadius(17)
             .onClick(() => {
               this.closeAccountUsagePanel('close_button');
@@ -970,12 +1379,12 @@ struct Index {
 
         if (this.accountUsageError.length > 0) {
           Text(this.accountUsageError)
-            .fontSize(12)
-            .fontColor('#B42318')
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.themeColor('#B42318'))
             .width('100%')
             .padding(10)
-            .backgroundColor('#FFF2F0')
-            .border({ width: 1, color: '#F2C7C3' })
+            .backgroundColor(this.themeColor('#FFF2F0'))
+            .border({ width: 1, color: this.themeColor('#F2C7C3') })
             .borderRadius(8)
         }
 
@@ -988,19 +1397,19 @@ struct Index {
           .width('100%')
         } else if (!this.isLoadingAccountUsage && this.accountUsageError.length === 0) {
           Text('点击刷新读取 Codex 桌面当前可见的套餐和用量信息。')
-            .fontSize(12)
-            .fontColor('#68717D')
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.themeColor('#68717D'))
             .width('100%')
             .padding(10)
-            .backgroundColor('#F7F8FA')
+            .backgroundColor(this.themeColor('#F7F8FA'))
             .borderRadius(8)
         }
       }
       .width('100%')
       .padding({ left: 14, right: 14, top: 14, bottom: 22 })
-      .backgroundColor('#FFFFFF')
+      .backgroundColor(this.themeColor('#FFFFFF'))
       .borderRadius({ topLeft: 18, topRight: 18 })
-      .shadow({ radius: 18, color: '#1F232824', offsetX: 0, offsetY: -4 })
+      .shadow({ radius: 18, color: this.themeColor('#1F232824'), offsetX: 0, offsetY: -4 })
     }
     .width('100%')
     .height('100%')
@@ -1011,20 +1420,20 @@ struct Index {
   AccountUsageItemView(item: CodexAccountUsageItem) {
     Row({ space: 8 }) {
       Text(item.label)
-        .fontSize(11)
+        .fontSize(this.scaledFontSize(11))
         .fontWeight(FontWeight.Bold)
-        .fontColor('#1F6FEB')
+        .fontColor(this.themeColor('#1F6FEB'))
         .width(58)
       Text(item.value)
-        .fontSize(12)
-        .fontColor('#17202A')
+        .fontSize(this.scaledFontSize(12))
+        .fontColor(this.themeColor('#17202A'))
         .layoutWeight(1)
         .maxLines(3)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     .width('100%')
     .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-    .backgroundColor('#F7F8FA')
+    .backgroundColor(this.themeColor('#F7F8FA'))
     .borderRadius(8)
   }
 
@@ -1034,19 +1443,19 @@ struct Index {
       Row()
         .width(18)
         .height(13)
-        .border({ width: 2, color: '#17202A' })
+        .border({ width: 2, color: this.themeColor('#17202A') })
         .borderRadius(3)
 
       Row()
         .width(8)
         .height(2)
-        .backgroundColor('#17202A')
+        .backgroundColor(this.themeColor('#17202A'))
         .translate({ x: 0, y: 8 })
 
       Row()
         .width(4)
         .height(4)
-        .backgroundColor('#1F6FEB')
+        .backgroundColor(this.themeColor('#1F6FEB'))
         .borderRadius(2)
         .translate({ x: 7, y: -4 })
     }
@@ -1062,13 +1471,13 @@ struct Index {
       Row() {
         SymbolGlyph($r('sys.symbol.plus'))
           .fontSize(8)
-          .fontColor(['#FFFFFF'])
+          .fontColor([this.theme().textOnAccent])
       }
       .width(12)
       .height(12)
       .justifyContent(FlexAlign.Center)
       .alignItems(VerticalAlign.Center)
-      .backgroundColor('#14853D')
+      .backgroundColor(this.themeColor('#14853D'))
       .borderRadius(6)
       .translate({ x: 8, y: 7 })
     }
@@ -1083,27 +1492,28 @@ struct Index {
         Row({ space: 8 }) {
           Column({ space: 3 }) {
             Text('会话')
-              .fontSize(24)
+              .fontSize(this.scaledFontSize(24))
               .fontWeight(FontWeight.Bold)
-              .fontColor('#17202A')
+              .fontColor(this.themeColor('#17202A'))
             Text(this.sessionMonitorSummaryText())
-              .fontSize(12)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.themeColor('#68717D'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           .alignItems(HorizontalAlign.Start)
-
-          Blank()
+          .layoutWeight(1)
 
           Button() {
             SymbolGlyph($r('sys.symbol.chevron_left'))
               .fontSize(20)
-              .fontColor(['#17202A'])
+              .fontColor([this.themeColor('#17202A')])
           }
             .width(36)
             .height(36)
-            .backgroundColor('#F0F2F5')
+            .backgroundColor(this.themeColor('#F0F2F5'))
             .borderRadius(18)
-            .enabled(this.selectedSession !== null || this.isNewSessionDraft)
+            .enabled(this.isLandscapeSessionLayout() || this.selectedSession !== null || this.isNewSessionDraft)
             .onClick(() => {
               this.closeSessionSidebar('header_button');
             })
@@ -1113,8 +1523,8 @@ struct Index {
         .width('100%')
 
         Text(this.sessionRefreshHintText())
-          .fontSize(11)
-          .fontColor('#8A95A3')
+          .fontSize(this.scaledFontSize(11))
+          .fontColor(this.themeColor('#8A95A3'))
           .width('100%')
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1122,14 +1532,31 @@ struct Index {
         Refresh({ refreshing: $$this.isPullRefreshingSessions }) {
           if (this.sessions.length === 0) {
             Column({ space: 8 }) {
-              Text('暂无会话')
-                .fontSize(18)
-                .fontWeight(FontWeight.Bold)
-                .fontColor('#17202A')
-              Text('下拉重新读取 Codex 会话。')
-                .fontSize(13)
-                .fontColor('#68717D')
-                .textAlign(TextAlign.Center)
+              if (this.sessionsLoadError.length > 0) {
+                Text('连接会话失败')
+                  .fontSize(this.scaledFontSize(18))
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.themeColor('#D74848'))
+                Text('检查 Bridge 地址和访问凭证后下拉重试。')
+                  .fontSize(this.scaledFontSize(13))
+                  .fontColor(this.themeColor('#68717D'))
+                  .textAlign(TextAlign.Center)
+                Text(this.sessionsLoadError)
+                  .fontSize(this.scaledFontSize(11))
+                  .fontColor(this.themeColor('#8A95A3'))
+                  .textAlign(TextAlign.Center)
+                  .maxLines(3)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              } else {
+                Text('暂无会话')
+                  .fontSize(this.scaledFontSize(18))
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.themeColor('#17202A'))
+                Text('下拉重新读取 Codex 会话。')
+                  .fontSize(this.scaledFontSize(13))
+                  .fontColor(this.themeColor('#68717D'))
+                  .textAlign(TextAlign.Center)
+              }
             }
             .width('100%')
             .height('100%')
@@ -1138,9 +1565,13 @@ struct Index {
             Scroll() {
               Column({ space: 0 }) {
                 this.PinnedSessionGroup()
-                ForEach(this.sessionProjectLabels(), (projectLabel: string) => {
-                  this.SessionProjectGroup(projectLabel)
-                }, (projectLabel: string) => projectLabel)
+                if (this.sessionProjectLabels().length > 0) {
+                  this.SessionSectionLabel('项目')
+                  ForEach(this.sessionProjectLabels(), (projectLabel: string) => {
+                    this.SessionProjectGroup(projectLabel)
+                  }, (projectLabel: string) => projectLabel)
+                }
+                this.RecentSessionGroup()
               }
               .width('100%')
             }
@@ -1158,7 +1589,7 @@ struct Index {
       .width('100%')
       .height('100%')
       .padding({ left: 14, right: 14, top: 18, bottom: 14 })
-      .backgroundColor('#FFFFFF')
+      .backgroundColor(this.themeColor('#FFFFFF'))
 
       if (this.shouldShowHomeActionMenuInSidebar()) {
         this.HomeActionMenu('sidebar_header')
@@ -1166,8 +1597,33 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#FFFFFF')
+    .backgroundColor(this.themeColor('#FFFFFF'))
     .zIndex(20)
+  }
+
+  @Builder
+  SessionSectionLabel(label: string) {
+    Text(label)
+      .fontSize(this.scaledFontSize(12))
+      .fontWeight(FontWeight.Medium)
+      .fontColor(this.themeColor('#8A95A3'))
+      .width('100%')
+      .height(30)
+      .padding({ left: 8, top: 8 })
+  }
+
+  @Builder
+  RecentSessionGroup() {
+    if (this.recentSessions().length > 0) {
+      Column({ space: 0 }) {
+        this.SessionSectionLabel('最近')
+        ForEach(this.recentSessions(), (session: CodexSessionSummary) => {
+          this.SessionSidebarItem(session)
+        }, (session: CodexSessionSummary) => this.sessionSidebarItemKey(session))
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+    }
   }
 
   @Builder
@@ -1176,19 +1632,19 @@ struct Index {
       Column({ space: 0 }) {
         Row({ space: 8 }) {
           Text('置顶')
-            .fontSize(13)
+            .fontSize(this.scaledFontSize(13))
             .fontWeight(FontWeight.Bold)
-            .fontColor('#9A6700')
+            .fontColor(this.themeColor('#9A6700'))
             .maxLines(1)
           Blank()
           Text(this.pinnedGroupMetaText())
-            .fontSize(11)
-            .fontColor('#B68A00')
+            .fontSize(this.scaledFontSize(11))
+            .fontColor(this.themeColor('#B68A00'))
         }
         .width('100%')
         .height(34)
         .padding({ left: 8, right: 6 })
-        .backgroundColor('#FFF8E5')
+        .backgroundColor(this.themeColor('#FFF8E5'))
         .borderRadius(8)
         .margin({ bottom: 3 })
 
@@ -1212,25 +1668,25 @@ struct Index {
         if (this.isSessionProjectCollapsed(projectLabel)) {
           SymbolGlyph($r('sys.symbol.chevron_right'))
             .fontSize(14)
-            .fontColor(['#8A95A3'])
+            .fontColor([this.themeColor('#8A95A3')])
         } else {
           SymbolGlyph($r('sys.symbol.chevron_down'))
             .fontSize(14)
-            .fontColor(['#8A95A3'])
+            .fontColor([this.themeColor('#8A95A3')])
         }
         SymbolGlyph($r('sys.symbol.folder'))
           .fontSize(15)
-          .fontColor(['#8A95A3'])
+          .fontColor([this.themeColor('#8A95A3')])
         Text(projectLabel)
-          .fontSize(13)
+          .fontSize(this.scaledFontSize(13))
           .fontWeight(FontWeight.Medium)
-          .fontColor('#68717D')
+          .fontColor(this.themeColor('#68717D'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
         Blank()
         Text(this.projectGroupMetaText(projectLabel))
-          .fontSize(11)
-          .fontColor('#A0A6AD')
+          .fontSize(this.scaledFontSize(11))
+          .fontColor(this.themeColor('#A0A6AD'))
       }
       .width('100%')
       .height(34)
@@ -1258,16 +1714,16 @@ struct Index {
             LoadingProgress()
               .width(16)
               .height(16)
-              .color('#FFFFFF')
+              .color(this.theme().textOnAccent)
           } else {
             SymbolGlyph($r('sys.symbol.trash'))
               .fontSize(17)
-              .fontColor(['#FFFFFF'])
+              .fontColor([this.theme().textOnAccent])
           }
         }
           .width(64)
           .height(38)
-          .backgroundColor(this.canDeleteSession(session) ? '#D92D20' : '#D0D5DD')
+          .backgroundColor(this.canDeleteSession(session) ? this.themeColor('#D92D20') : this.themeColor('#D0D5DD'))
           .borderRadius(8)
           .enabled(this.canDeleteSession(session))
           .onClick(() => {
@@ -1282,9 +1738,9 @@ struct Index {
         this.SessionActivityBadge(session)
         Column({ space: 0 }) {
           Text(session.title)
-            .fontSize(16)
+            .fontSize(this.scaledFontSize(16))
             .fontWeight(FontWeight.Medium)
-            .fontColor('#17202A')
+            .fontColor(this.themeColor('#17202A'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
@@ -1296,22 +1752,22 @@ struct Index {
             LoadingProgress()
               .width(14)
               .height(14)
-              .color('#D92D20')
+              .color(this.themeColor('#D92D20'))
           }
           Text(this.sessionTimeLabel(session))
-            .fontSize(13)
-            .fontColor(this.isSessionRunning(session.id) ? '#68717D' : '#8A95A3')
+            .fontSize(this.scaledFontSize(13))
+            .fontColor(this.isSessionRunning(session.id) ? this.themeColor('#68717D') : this.themeColor('#8A95A3'))
             .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .textAlign(TextAlign.End)
         }
-        .width(64)
+        .width(this.sessionSidebarTimeWidth())
         .justifyContent(FlexAlign.End)
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
       .height(40)
       .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .backgroundColor(this.selectedSession?.id === session.id ? '#F0ECE9' : '#FFFFFF')
+      .backgroundColor(this.selectedSession?.id === session.id ? this.themeColor('#F0ECE9') : this.themeColor('#FFFFFF'))
       .borderRadius(8)
       .alignItems(VerticalAlign.Center)
       .translate({ x: this.sessionSwipeOffset(session.id), y: 0 })
@@ -1346,7 +1802,7 @@ struct Index {
         LoadingProgress()
           .width(18)
           .height(18)
-          .color('#1F6FEB')
+          .color(this.themeColor('#1F6FEB'))
       }
       .width(22)
       .height(22)
@@ -1356,7 +1812,7 @@ struct Index {
       Circle()
         .width(12)
         .height(12)
-        .fill('#1F6FEB')
+        .fill(this.themeColor('#1F6FEB'))
     } else {
       Row()
         .width(22)
@@ -1371,14 +1827,17 @@ struct Index {
         if (this.visibleNewSessionEntries().length > 0 || this.visibleFailedSessionMessages().length > 0) {
           Column({ space: 6 }) {
             Text('新建会话')
-              .fontSize(14)
+              .fontSize(this.scaledFontSize(14))
               .fontWeight(FontWeight.Medium)
-              .fontColor('#17202A')
+              .fontColor(this.themeColor('#17202A'))
             Scroll(this.sessionScroller) {
               Column({ space: 3 }) {
                 ForEach(this.visibleNewSessionEntries(), (entry: CodexSessionEntry) => {
                   this.SessionEntryCard(entry)
                 }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
+                ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
+                  this.OptimisticSessionMessageCard(message)
+                }, (message: OptimisticSessionMessage) => message.id)
                 ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
                   this.FailedSessionMessageCard(message)
                 }, (message: FailedSessionMessage) => message.id)
@@ -1400,12 +1859,12 @@ struct Index {
         } else {
           Column({ space: 8 }) {
             Text('新建 Codex 会话')
-              .fontSize(20)
+              .fontSize(this.scaledFontSize(20))
               .fontWeight(FontWeight.Bold)
-              .fontColor('#17202A')
+              .fontColor(this.themeColor('#17202A'))
             Text('输入第一条消息后会启动一个真实 Codex 新线程，完成后自动进入新会话。')
-              .fontSize(13)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(13))
+              .fontColor(this.themeColor('#68717D'))
               .textAlign(TextAlign.Center)
           }
           .layoutWeight(1)
@@ -1422,24 +1881,25 @@ struct Index {
       } else if (this.selectedSession === null) {
         Column({ space: 10 }) {
           Text('会话列表')
-            .fontSize(20)
+            .fontSize(this.scaledFontSize(20))
             .fontWeight(FontWeight.Bold)
-            .fontColor('#17202A')
+            .fontColor(this.themeColor('#17202A'))
           Text('请选择一个会话继续操作。')
-            .fontSize(13)
-            .fontColor('#68717D')
+            .fontSize(this.scaledFontSize(13))
+            .fontColor(this.themeColor('#68717D'))
             .textAlign(TextAlign.Center)
           Button() {
             SymbolGlyph($r('sys.symbol.open_sidebar'))
               .fontSize(20)
-              .fontColor(['#FFFFFF'])
+              .fontColor([this.theme().textOnAccent])
           }
             .width(42)
             .height(42)
-            .backgroundColor('#1F6FEB')
+            .backgroundColor(this.themeColor('#1F6FEB'))
             .borderRadius(21)
             .onClick(() => {
               this.sessionSidebarCollapsed = false;
+              this.sessionSidebarUserCollapsed = false;
               this.log('info', 'ui.session_sidebar.toggle', 'collapsed=false; source=empty_state');
             })
         }
@@ -1453,6 +1913,9 @@ struct Index {
             ForEach(this.visibleSessionEntries(), (entry: CodexSessionEntry) => {
               this.SessionEntryCard(entry)
             }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
+            ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
+              this.OptimisticSessionMessageCard(message)
+            }, (message: OptimisticSessionMessage) => message.id)
             ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
               this.FailedSessionMessageCard(message)
             }, (message: FailedSessionMessage) => message.id)
@@ -1482,6 +1945,69 @@ struct Index {
   }
 
   @Builder
+  OptimisticSessionMessageCard(message: OptimisticSessionMessage) {
+    Row() {
+      Blank()
+
+      Column({ space: 5 }) {
+        Row({ space: 6 }) {
+          Text(this.sessionEntryTimeText({
+            timestamp: message.createdAt,
+            type: 'optimistic_user_message',
+            role: 'user',
+            text: message.text
+          }))
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#8A95A3'))
+          Text('你')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.themeColor('#4E6278'))
+          LoadingProgress()
+            .width(11)
+            .height(11)
+            .color(this.themeColor('#1F6FEB'))
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.End)
+
+        if (message.images.length > 0) {
+          ForEach(message.images, (image: PendingSessionImage) => {
+            Row() {
+              Blank()
+              Image(image.uri)
+                .width(72)
+                .height(72)
+                .objectFit(ImageFit.Contain)
+                .backgroundColor('#00000000')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.openImagePreview(image.uri, `optimistic:${message.id}:${image.id}`);
+                })
+            }
+            .width('100%')
+          }, (image: PendingSessionImage) => `${message.id}-${image.id}`)
+        }
+
+        if (message.text.trim().length > 0) {
+          Text(message.text)
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.themeColor('#17202A'))
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 9, bottom: 10 })
+            .backgroundColor(this.themeColor('#EAF4FF'))
+            .border({ width: 1, color: this.themeColor('#CFE3FF') })
+            .borderRadius(10)
+            .copyOption(CopyOptions.LocalDevice)
+        }
+      }
+      .width(this.userTextBubbleWidth(message.text))
+      .constraintSize({ maxWidth: '82%' })
+    }
+    .width('100%')
+    .padding({ top: 3, bottom: 3 })
+  }
+
+  @Builder
   FailedSessionMessageCard(message: FailedSessionMessage) {
     Row({ space: 8 }) {
       Blank()
@@ -1491,16 +2017,16 @@ struct Index {
           LoadingProgress()
             .width(16)
             .height(16)
-            .color('#FFFFFF')
+            .color(this.theme().textOnAccent)
         } else {
           SymbolGlyph($r('sys.symbol.arrow_up'))
             .fontSize(16)
-            .fontColor(['#FFFFFF'])
+            .fontColor([this.theme().textOnAccent])
         }
       }
         .width(32)
         .height(32)
-        .backgroundColor(message.retrying ? '#8A95A3' : '#14853D')
+        .backgroundColor(message.retrying ? this.themeColor('#8A95A3') : this.themeColor('#14853D'))
         .borderRadius(16)
         .enabled(this.canRetryFailedSessionMessage(message))
         .onClick(() => {
@@ -1511,11 +2037,11 @@ struct Index {
         Column({ space: 5 }) {
           Row({ space: 6 }) {
             Text(this.failedSessionMessageTimeText(message))
-              .fontSize(9)
-              .fontColor('#B42318')
+              .fontSize(this.scaledFontSize(9))
+              .fontColor(this.themeColor('#B42318'))
             Text(this.failedSessionMessageStatusText(message))
-              .fontSize(10)
-              .fontColor('#B42318')
+              .fontSize(this.scaledFontSize(10))
+              .fontColor(this.themeColor('#B42318'))
               .fontWeight(FontWeight.Regular)
           }
           .width('100%')
@@ -1529,11 +2055,10 @@ struct Index {
                   .width(54)
                   .height(54)
                   .objectFit(ImageFit.Cover)
-                  .backgroundColor('#ECEFF3')
+                  .backgroundColor(this.themeColor('#ECEFF3'))
                   .borderRadius(8)
                   .onClick(() => {
-                    this.previewImageUrl = image.uri;
-                    this.log('info', 'ui.failed_image.preview.open', `failedId=${message.id}; imageId=${image.id}`);
+                    this.openImagePreview(image.uri, `failed:${message.id}:${image.id}`);
                   })
               }, (image: PendingSessionImage) => `${message.id}-${image.id}`)
             }
@@ -1542,8 +2067,8 @@ struct Index {
 
           if (message.text.trim().length > 0) {
             Text(message.text)
-              .fontSize(12)
-              .fontColor('#17202A')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.themeColor('#17202A'))
               .fontWeight(FontWeight.Regular)
               .width('100%')
               .maxLines(8)
@@ -1552,8 +2077,8 @@ struct Index {
           }
 
           Text(this.compactDisplayText(message.error, 90))
-            .fontSize(9)
-            .fontColor('#B42318')
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#B42318'))
             .width('100%')
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1561,20 +2086,20 @@ struct Index {
         }
         .layoutWeight(1)
         .padding({ left: 12, right: 12, top: 8, bottom: 9 })
-        .backgroundColor('#FFF1F0')
-        .border({ width: 1, color: '#FDA29B' })
+        .backgroundColor(this.themeColor('#FFF1F0'))
+        .border({ width: 1, color: this.themeColor('#FDA29B') })
         .borderRadius(10)
 
         Column({ space: 6 }) {
           Button() {
             SymbolGlyph($r('sys.symbol.xmark'))
               .fontSize(14)
-              .fontColor(['#667085'])
+              .fontColor([this.themeColor('#667085')])
           }
             .width(28)
             .height(28)
-            .backgroundColor('#FFFFFF')
-            .border({ width: 1, color: '#DDE3EA' })
+            .backgroundColor(this.themeColor('#FFFFFF'))
+            .border({ width: 1, color: this.themeColor('#DDE3EA') })
             .borderRadius(14)
             .enabled(true)
             .onClick(() => {
@@ -1597,11 +2122,11 @@ struct Index {
           LoadingProgress()
             .width(11)
             .height(11)
-            .color('#1F6FEB')
+            .color(this.themeColor('#1F6FEB'))
 
           Text(this.sessionEntryDisplayText(entry))
-            .fontSize(10)
-            .fontColor('#52606D')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.themeColor('#52606D'))
             .fontWeight(FontWeight.Regular)
             .layoutWeight(1)
             .maxLines(4)
@@ -1611,36 +2136,38 @@ struct Index {
         .width('100%')
         .alignItems(VerticalAlign.Center)
       }
-      .width('100%')
-      .padding({ left: 4, right: 4, top: 0, bottom: 4 })
+      .width('88%')
+      .padding({ left: 12, right: 0, top: 0, bottom: 4 })
     } else if (entry.type === 'live_agent_status') {
       Column({ space: 5 }) {
         Row({ space: 6 }) {
           Text('Codex')
-            .fontSize(10)
-            .fontColor('#8A95A3')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.themeColor('#8A95A3'))
             .fontWeight(FontWeight.Regular)
           Text(this.sessionEntryTimeText(entry))
-            .fontSize(9)
-            .fontColor('#8A95A3')
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#8A95A3'))
           LoadingProgress()
             .width(12)
             .height(12)
-            .color('#1F6FEB')
+            .color(this.themeColor('#1F6FEB'))
         }
         .width('100%')
 
         Text(this.sessionEntryDisplayText(entry))
-          .fontSize(11)
-          .fontColor('#344054')
+          .fontSize(this.scaledFontSize(11))
+          .fontColor(this.themeColor('#344054'))
           .fontWeight(FontWeight.Regular)
           .width('100%')
           .maxLines(4)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .copyOption(CopyOptions.LocalDevice)
       }
-      .width('100%')
-      .padding({ left: 4, right: 4, top: 1, bottom: 5 })
+      .width('88%')
+      .padding({ left: 12, right: 0, top: 1, bottom: 5 })
+    } else if (entry.role === 'tool') {
+      this.SessionToolEntryView(entry)
     } else if (this.isSessionMetaEntry(entry)) {
       Column({ space: 1 }) {
         Row({ space: 7 }) {
@@ -1648,17 +2175,17 @@ struct Index {
             LoadingProgress()
               .width(11)
               .height(11)
-              .color('#8A949F')
+              .color(this.themeColor('#8A949F'))
           } else {
             Text(this.sessionMetaEntryMark(entry))
-              .fontSize(10)
+              .fontSize(this.scaledFontSize(10))
               .fontColor(this.sessionMetaEntryColor(entry))
               .width(14)
               .textAlign(TextAlign.Center)
           }
 
           Text(this.sessionMetaEntrySummaryText(entry))
-            .fontSize(9)
+            .fontSize(this.scaledFontSize(9))
             .fontColor(this.sessionMetaEntryColor(entry))
             .fontWeight(FontWeight.Regular)
             .layoutWeight(1)
@@ -1668,8 +2195,8 @@ struct Index {
 
           if (this.hasExpandableSessionMetaEntry(entry)) {
             Text(this.isSessionEntryExpanded(entry) ? '⌃' : '⌄')
-              .fontSize(10)
-              .fontColor('#8A949F')
+              .fontSize(this.scaledFontSize(10))
+              .fontColor(this.themeColor('#8A949F'))
               .width(14)
               .textAlign(TextAlign.Center)
           }
@@ -1679,16 +2206,16 @@ struct Index {
 
         if (this.isSessionEntryExpanded(entry) && this.sessionMetaEntryDetailText(entry).length > 0) {
           Text(this.sessionMetaEntryDetailText(entry))
-            .fontSize(8)
-            .fontColor('#667085')
-            .lineHeight(12)
+            .fontSize(this.scaledFontSize(8))
+            .fontColor(this.themeColor('#667085'))
+            .lineHeight(this.scaledLineHeight(12))
             .padding({ left: 21, right: 2, top: 1 })
             .width('100%')
             .copyOption(CopyOptions.LocalDevice)
         }
       }
-      .width('100%')
-      .padding({ left: 8, right: 8, top: 0, bottom: 0 })
+      .width('88%')
+      .padding({ left: 12, right: 0, top: 0, bottom: 0 })
       .onClick(() => {
         if (this.hasExpandableSessionMetaEntry(entry)) {
           this.toggleSessionEntry(entry);
@@ -1700,11 +2227,11 @@ struct Index {
         Column({ space: 5 }) {
           Row({ space: 6 }) {
             Text(this.sessionEntryTimeText(entry))
-              .fontSize(9)
-              .fontColor('#8A95A3')
+              .fontSize(this.scaledFontSize(9))
+              .fontColor(this.themeColor('#8A95A3'))
             Text('你')
-              .fontSize(10)
-              .fontColor('#4E6278')
+              .fontSize(this.scaledFontSize(10))
+              .fontColor(this.themeColor('#4E6278'))
               .fontWeight(FontWeight.Regular)
           }
           .width('100%')
@@ -1721,9 +2248,13 @@ struct Index {
                   .backgroundColor('#00000000')
                   .borderRadius(8)
                   .onClick(() => {
-                    this.previewImageUrl = imageUrl;
-                    this.log('info', 'ui.image.preview.open', `url=${imageUrl}`);
+                    this.openImagePreview(imageUrl, 'user_entry');
                   })
+              }
+              .width('100%')
+              Row() {
+                Blank()
+                this.SessionContentActionRow(entry, imageUrl)
               }
               .width('100%')
             }, (imageUrl: string) => imageUrl)
@@ -1735,29 +2266,40 @@ struct Index {
             }
             .width('100%')
             .padding({ left: 12, right: 12, top: 9, bottom: 10 })
-            .backgroundColor('#EAF4FF')
-            .border({ width: 1, color: '#CFE3FF' })
+            .backgroundColor(this.themeColor('#EAF4FF'))
+            .border({ width: 1, color: this.themeColor('#CFE3FF') })
             .borderRadius(10)
+            Row() {
+              Blank()
+              this.SessionContentActionRow(entry, '')
+            }
+            .width('100%')
           }
         }
         .width(this.userSessionEntryWidth(entry))
+        .constraintSize({ maxWidth: '82%' })
       }
       .width('100%')
     } else {
       Column({ space: 5 }) {
         Row({ space: 6 }) {
+          Row()
+            .width(6)
+            .height(6)
+            .backgroundColor(this.theme().accent)
+            .borderRadius(3)
           Text(this.sessionAssistantEntryLabel(entry))
-            .fontSize(10)
-            .fontColor('#8A95A3')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.themeColor('#8A95A3'))
             .fontWeight(FontWeight.Regular)
           Text(this.sessionEntryTimeText(entry))
-            .fontSize(9)
-            .fontColor('#8A95A3')
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#8A95A3'))
           if (entry.type === 'live_agent_streaming') {
             LoadingProgress()
               .width(12)
               .height(12)
-              .color('#1F6FEB')
+              .color(this.themeColor('#1F6FEB'))
           }
         }
         .width('100%')
@@ -1766,15 +2308,19 @@ struct Index {
           ForEach(this.sessionEntryImages(entry), (imageUrl: string) => {
             Row() {
               Image(imageUrl)
-                .width('64%')
-                .height(260)
+                .width(this.assistantImageEntryWidth())
+                .height(this.assistantImageEntryHeight())
                 .objectFit(ImageFit.Contain)
                 .backgroundColor('#00000000')
                 .borderRadius(8)
                 .onClick(() => {
-                  this.previewImageUrl = imageUrl;
-                  this.log('info', 'ui.image.preview.open', `url=${imageUrl}`);
+                  this.openImagePreview(imageUrl, 'assistant_entry');
                 })
+              Blank()
+            }
+            .width('100%')
+            Row() {
+              this.SessionContentActionRow(entry, imageUrl)
               Blank()
             }
             .width('100%')
@@ -1782,10 +2328,195 @@ struct Index {
         }
 
         this.SessionMarkdownContent(entry, false)
+        if (this.sessionEntryVisibleText(entry).length > 0) {
+          Row() {
+            this.SessionContentActionRow(entry, '')
+            Blank()
+          }
+          .width('100%')
+        }
       }
-      .width('100%')
-      .padding({ left: 4, right: 4, top: 1, bottom: 5 })
+      .width('88%')
+      .padding({ left: 12, right: 0, top: 3, bottom: 8 })
     }
+  }
+
+  @Builder
+  SessionContentActionRow(entry: CodexSessionEntry, imageUrl: string) {
+    Row({ space: 4 }) {
+      Button(imageUrl.length > 0 ? '复制图片' : '复制')
+        .type(ButtonType.Normal)
+        .height(24)
+        .padding({ left: 8, right: 8 })
+        .fontSize(this.scaledFontSize(9))
+        .fontColor(this.themeColor('#8A95A3'))
+        .backgroundColor(Color.Transparent)
+        .borderRadius(6)
+        .onClick(() => {
+          if (imageUrl.length > 0) {
+            void this.copySessionImage(imageUrl);
+          } else {
+            void this.copySessionText(entry);
+          }
+        })
+      Button(imageUrl.length > 0 ? '分享图片' : '分享')
+        .type(ButtonType.Normal)
+        .height(24)
+        .padding({ left: 8, right: 8 })
+        .fontSize(this.scaledFontSize(9))
+        .fontColor(this.theme().accent)
+        .backgroundColor(Color.Transparent)
+        .borderRadius(6)
+        .onClick(() => {
+          if (imageUrl.length > 0) {
+            void this.shareSessionImage(imageUrl);
+          } else {
+            void this.shareSessionText(entry);
+          }
+        })
+    }
+  }
+
+  @Builder
+  SessionToolEntryView(entry: CodexSessionEntry) {
+    Column({ space: 1 }) {
+      if (this.isSessionToolGroup(entry)) {
+        Row({ space: 8 }) {
+          if (this.sessionToolGroupIsRunning(entry)) {
+            LoadingProgress()
+              .width(11)
+              .height(11)
+              .color(this.sessionToolGroupColor(entry))
+          } else {
+            Text('●')
+              .fontSize(this.scaledFontSize(7))
+              .fontColor(this.sessionToolGroupColor(entry))
+              .width(11)
+              .textAlign(TextAlign.Center)
+          }
+
+          Text(this.sessionToolGroupTitle(entry))
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#667085'))
+            .fontWeight(FontWeight.Medium)
+            .lineHeight(this.scaledLineHeight(13))
+            .layoutWeight(1)
+
+          if (this.sessionToolGroupIsCollapsible(entry)) {
+            Button(this.isSessionToolGroupExpanded(entry) ? '收起' : '全部展开')
+              .type(ButtonType.Normal)
+              .height(24)
+              .fontSize(this.scaledFontSize(8))
+              .fontColor(this.themeColor('#667085'))
+              .backgroundColor(Color.Transparent)
+              .padding({ left: 4, right: 4 })
+              .onClick(() => {
+                this.toggleSessionToolGroup(entry);
+              })
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+      }
+
+      if (this.shouldShowSessionToolGroupItems(entry)) {
+        ForEach(sessionToolPresentationItems(entry), (item: SessionToolPresentationItem) => {
+          Column({ space: 2 }) {
+            Row({ space: 7 }) {
+              if (item.status === 'running') {
+                LoadingProgress()
+                  .width(12)
+                  .height(12)
+                  .color(this.themeColor('#8A949F'))
+              } else {
+                Text(this.sessionToolItemMark(item))
+                  .fontSize(this.scaledFontSize(10))
+                  .fontColor(this.sessionToolItemColor(item))
+                  .width(14)
+                  .textAlign(TextAlign.Center)
+              }
+
+              Text(item.verb)
+                .fontSize(this.scaledFontSize(9))
+                .fontColor(this.sessionToolItemColor(item))
+                .fontWeight(FontWeight.Medium)
+                .lineHeight(this.scaledLineHeight(13))
+
+              Text(item.target)
+                .fontSize(this.scaledFontSize(9))
+                .fontColor(this.themeColor('#667085'))
+                .fontFamily('monospace')
+                .lineHeight(this.scaledLineHeight(13))
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .copyOption(CopyOptions.LocalDevice)
+
+              Text(this.sessionToolItemStatusText(item))
+                .fontSize(this.scaledFontSize(8))
+                .fontColor(this.sessionToolItemColor(item))
+                .lineHeight(this.scaledLineHeight(12))
+
+              if (this.hasExpandableSessionToolItem(item)) {
+                Text(this.isSessionToolItemExpanded(entry, item) ? '⌃' : '⌄')
+                  .fontSize(this.scaledFontSize(10))
+                  .fontColor(this.themeColor('#8A949F'))
+                  .width(14)
+                  .textAlign(TextAlign.Center)
+              }
+            }
+            .width('100%')
+            .height(34)
+            .alignItems(VerticalAlign.Center)
+            .onClick(() => {
+              if (this.hasExpandableSessionToolItem(item)) {
+                this.toggleSessionToolItem(entry, item);
+              }
+            })
+
+            if (this.isSessionToolItemExpanded(entry, item)) {
+              Column({ space: 5 }) {
+                Text(item.target)
+                  .fontSize(this.scaledFontSize(8))
+                  .fontColor(this.themeColor('#475467'))
+                  .fontFamily('monospace')
+                  .lineHeight(this.scaledLineHeight(12))
+                  .width('100%')
+                  .copyOption(CopyOptions.LocalDevice)
+
+                if (item.detail.length > 0) {
+                  Text(item.detail)
+                    .fontSize(this.scaledFontSize(8))
+                    .fontColor(this.themeColor('#667085'))
+                    .lineHeight(this.scaledLineHeight(12))
+                    .width('100%')
+                    .copyOption(CopyOptions.LocalDevice)
+                }
+
+                Button('复制')
+                  .type(ButtonType.Normal)
+                  .height(24)
+                  .fontSize(this.scaledFontSize(8))
+                  .fontColor(this.themeColor('#1F6FEB'))
+                  .backgroundColor(Color.Transparent)
+                  .padding({ left: 0, right: 6 })
+                  .onClick(() => {
+                    void this.copySessionPresentationText(item.target, '工具目标');
+                  })
+              }
+              .width('100%')
+              .padding({ left: 21, right: 6, top: 2, bottom: 7 })
+              .backgroundColor(this.themeColor('#F8FAFC'))
+              .borderRadius(7)
+            }
+          }
+          .width('100%')
+          .border({ width: { top: 1 }, color: this.themeColor('#E4E7EC') })
+        }, (item: SessionToolPresentationItem) => this.sessionToolItemKey(entry, item))
+      }
+    }
+    .width('88%')
+    .padding({ left: 12, right: 0, top: 2, bottom: 3 })
   }
 
   @Builder
@@ -1801,81 +2532,94 @@ struct Index {
   @Builder
   SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean) {
     if (block.kind === 'heading') {
-      Text(this.markdownInlineDisplayText(block.text))
-        .fontSize(this.markdownHeadingFontSize(block.level, isUser))
-        .fontColor(isUser ? '#132235' : '#1F2937')
-        .fontWeight(FontWeight.Medium)
-        .lineHeight(this.markdownHeadingLineHeight(block.level, isUser))
-        .width('100%')
-        .copyOption(CopyOptions.LocalDevice)
+      this.SessionMarkdownInlineText(
+        block.text,
+        isUser,
+        this.markdownHeadingFontSize(block.level, isUser),
+        this.markdownHeadingLineHeight(block.level, isUser),
+        true
+      )
     } else if (block.kind === 'code') {
       Column({ space: 3 }) {
-        if (block.language.length > 0) {
-          Text(block.language)
-            .fontSize(8)
-            .fontColor('#667085')
+        Row({ space: 6 }) {
+          Text(block.language.length > 0 ? block.language : '代码')
+            .fontSize(this.scaledFontSize(8))
+            .fontColor(this.themeColor('#667085'))
             .fontWeight(FontWeight.Regular)
+
+          Blank()
+
+          Button('复制')
+            .type(ButtonType.Normal)
+            .height(22)
+            .fontSize(this.scaledFontSize(8))
+            .fontColor(this.themeColor('#1F6FEB'))
+            .backgroundColor(Color.Transparent)
+            .padding({ left: 4, right: 4 })
+            .onClick(() => {
+              void this.copySessionPresentationText(block.text, '代码');
+            })
         }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
         Text(block.text)
-          .fontSize(10)
-          .fontColor('#101828')
-          .lineHeight(14)
+          .fontSize(this.scaledFontSize(10))
+          .fontColor(this.themeColor('#101828'))
+          .fontFamily('monospace')
+          .lineHeight(this.scaledLineHeight(14))
           .width('100%')
           .copyOption(CopyOptions.LocalDevice)
       }
       .width('100%')
       .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .backgroundColor(isUser ? '#DDEEFF' : '#F2F4F7')
-      .border({ width: 1, color: isUser ? '#C2DAF8' : '#E4E7EC' })
+      .backgroundColor(isUser ? this.themeColor('#DDEEFF') : this.themeColor('#F2F4F7'))
+      .border({ width: 1, color: isUser ? this.themeColor('#C2DAF8') : this.themeColor('#E4E7EC') })
       .borderRadius(7)
     } else if (block.kind === 'quote') {
       Row({ space: 7 }) {
         Column()
           .width(3)
-          .height('100%')
-          .backgroundColor('#98A2B3')
+          .alignSelf(ItemAlign.Stretch)
+          .backgroundColor(this.themeColor('#98A2B3'))
           .borderRadius(2)
-        Text(this.markdownInlineDisplayText(block.text))
-          .fontSize(isUser ? 11 : 10)
-          .fontColor('#52606D')
-          .lineHeight(isUser ? 16 : 15)
-          .layoutWeight(1)
-          .copyOption(CopyOptions.LocalDevice)
+        Column() {
+          this.SessionMarkdownInlineText(block.text, isUser, isUser ? 11 : 10, isUser ? 16 : 15, false)
+        }
+        .layoutWeight(1)
       }
       .width('100%')
       .padding({ top: 2, bottom: 2 })
     } else if (block.kind === 'list') {
       Row({ space: 6 }) {
         Text(block.ordered ? `${block.level}.` : '•')
-          .fontSize(isUser ? 11 : 10)
-          .fontColor(isUser ? '#426384' : '#667085')
+          .fontSize(this.scaledFontSize(isUser ? 11 : 10))
+          .fontColor(isUser ? this.themeColor('#426384') : this.themeColor('#667085'))
           .width(16)
           .textAlign(TextAlign.Center)
-        Text(this.markdownInlineDisplayText(block.text))
-          .fontSize(isUser ? 12 : 11)
-          .fontColor(isUser ? '#17202A' : '#22272E')
-          .lineHeight(isUser ? 17 : 16)
-          .layoutWeight(1)
-          .copyOption(CopyOptions.LocalDevice)
+        Column() {
+          this.SessionMarkdownInlineText(block.text, isUser, isUser ? 12 : 11, isUser ? 17 : 16, false)
+        }
+        .layoutWeight(1)
       }
       .width('100%')
       .alignItems(VerticalAlign.Top)
     } else if (block.kind === 'task') {
       Row({ space: 6 }) {
         Text(block.checked ? '☑' : '☐')
-          .fontSize(isUser ? 11 : 10)
-          .fontColor(block.checked ? '#1F6FEB' : '#8A95A3')
+          .fontSize(this.scaledFontSize(isUser ? 11 : 10))
+          .fontColor(block.checked ? this.themeColor('#1F6FEB') : this.themeColor('#8A95A3'))
           .width(16)
           .textAlign(TextAlign.Center)
-        Text(this.markdownInlineDisplayText(block.text))
-          .fontSize(isUser ? 12 : 11)
-          .fontColor(isUser ? '#17202A' : '#22272E')
-          .lineHeight(isUser ? 17 : 16)
-          .layoutWeight(1)
-          .copyOption(CopyOptions.LocalDevice)
+        Column() {
+          this.SessionMarkdownInlineText(block.text, isUser, isUser ? 12 : 11, isUser ? 17 : 16, false)
+        }
+        .layoutWeight(1)
       }
       .width('100%')
       .alignItems(VerticalAlign.Top)
+    } else if (block.kind === 'table') {
+      this.SessionMarkdownTableView(block, isUser)
     } else if (block.kind === 'codex_directive') {
       this.CodexDirectiveBlockView(entry, block)
     } else if (block.kind === 'directive') {
@@ -1883,20 +2627,20 @@ struct Index {
         Row({ space: 6 }) {
           Column() {
             Text('<>')
-              .fontSize(9)
-              .fontColor('#1F6FEB')
+              .fontSize(this.scaledFontSize(9))
+              .fontColor(this.themeColor('#1F6FEB'))
               .fontWeight(FontWeight.Medium)
           }
           .width(28)
           .height(28)
           .justifyContent(FlexAlign.Center)
           .alignItems(HorizontalAlign.Center)
-          .backgroundColor('#EAF4FF')
+          .backgroundColor(this.themeColor('#EAF4FF'))
           .borderRadius(8)
 
           Text(this.markdownDirectiveTitle(block.language))
-            .fontSize(10)
-            .fontColor('#344054')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.themeColor('#344054'))
             .fontWeight(FontWeight.Medium)
             .layoutWeight(1)
             .maxLines(1)
@@ -1904,7 +2648,7 @@ struct Index {
 
           SymbolGlyph(this.isSessionMarkdownBlockExpanded(entry, block) ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
             .fontSize(14)
-            .fontColor(['#667085'])
+            .fontColor([this.themeColor('#667085')])
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -1913,9 +2657,9 @@ struct Index {
           this.MarkdownDirectiveDetailView(block)
         } else {
           Text(this.markdownDirectiveSummary(block))
-            .fontSize(9)
-            .fontColor('#667085')
-            .lineHeight(13)
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#667085'))
+            .lineHeight(this.scaledLineHeight(13))
             .width('100%')
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1924,8 +2668,8 @@ struct Index {
       }
       .width('100%')
       .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .backgroundColor('#F8FAFC')
-      .border({ width: 1, color: '#E4E7EC' })
+      .backgroundColor(this.themeColor('#F8FAFC'))
+      .border({ width: 1, color: this.themeColor('#E4E7EC') })
       .borderRadius(8)
       .onClick(() => {
         this.toggleSessionMarkdownBlock(entry, block);
@@ -1934,17 +2678,114 @@ struct Index {
       Row()
         .height(1)
         .width('100%')
-        .backgroundColor(isUser ? '#CFE3FF' : '#E4E7EC')
+        .backgroundColor(isUser ? this.themeColor('#CFE3FF') : this.themeColor('#E4E7EC'))
         .margin({ top: 3, bottom: 3 })
     } else {
-      Text(this.markdownInlineDisplayText(block.text))
-        .fontSize(isUser ? 12 : 11)
-        .fontColor(isUser ? '#17202A' : '#22272E')
-        .fontWeight(FontWeight.Regular)
-        .lineHeight(isUser ? 17 : 16)
-        .width('100%')
-        .copyOption(CopyOptions.LocalDevice)
+      this.SessionMarkdownInlineText(block.text, isUser, isUser ? 12 : 11, isUser ? 17 : 16, false)
     }
+  }
+
+  @Builder
+  SessionMarkdownInlineText(
+    text: string,
+    isUser: boolean,
+    fontSize: number,
+    lineHeight: number,
+    isHeading: boolean
+  ) {
+    Text() {
+      ForEach(parseSessionMarkdownInline(text), (segment: SessionMarkdownInlineSegment) => {
+        if (segment.kind === 'strong') {
+          Span(segment.text)
+            .fontWeight(FontWeight.Bold)
+        } else if (segment.kind === 'emphasis') {
+          Span(segment.text)
+            .fontStyle(FontStyle.Italic)
+        } else if (segment.kind === 'strike') {
+          Span(segment.text)
+            .decoration({ type: TextDecorationType.LineThrough })
+        } else if (segment.kind === 'code') {
+          Span(segment.text)
+            .fontFamily('monospace')
+            .fontColor(isUser ? this.themeColor('#173B63') : this.themeColor('#344054'))
+            .textBackgroundStyle({
+              color: isUser ? this.themeColor('#CFE3FF') : this.themeColor('#F2F4F7'),
+              radius: 4
+            })
+        } else if (segment.kind === 'link') {
+          Span(segment.text)
+            .fontColor(this.themeColor('#1F6FEB'))
+            .decoration({ type: TextDecorationType.Underline })
+            .onClick(() => {
+              void this.openSessionMarkdownLink(segment.href);
+            })
+        } else {
+          Span(segment.text)
+        }
+      }, (segment: SessionMarkdownInlineSegment) => segment.id)
+    }
+    .fontSize(this.scaledFontSize(fontSize))
+    .fontColor(isUser ? this.themeColor('#17202A') : this.themeColor('#22272E'))
+    .fontWeight(isHeading ? FontWeight.Medium : FontWeight.Regular)
+    .lineHeight(this.scaledLineHeight(lineHeight))
+    .width('100%')
+    .copyOption(CopyOptions.LocalDevice)
+  }
+
+  @Builder
+  SessionMarkdownTableView(block: SessionMarkdownBlock, isUser: boolean) {
+    Column() {
+      Scroll() {
+        Column({ space: 0 }) {
+          Row() {
+            ForEach(parseSessionMarkdownTable(block.text).headers, (cell: string) => {
+              Column() {
+                this.SessionMarkdownInlineText(cell, isUser, isUser ? 10 : 9, isUser ? 15 : 14, true)
+              }
+              .width(this.sessionMarkdownTableColumnWidth(block))
+              .constraintSize({ minHeight: 34 })
+              .alignSelf(ItemAlign.Stretch)
+              .padding({ left: 7, right: 7, top: 6, bottom: 6 })
+              .justifyContent(FlexAlign.Center)
+              .border({ width: 1, color: this.themeColor('#D0D5DD') })
+              .backgroundColor(isUser ? this.themeColor('#DDEEFF') : this.themeColor('#F2F4F7'))
+            }, (cell: string, index: number) => `table-header-${index}-${cell}`)
+          }
+
+          ForEach(parseSessionMarkdownTable(block.text).rows, (row: string[], rowIndex: number) => {
+            Row() {
+              ForEach(row, (cell: string, cellIndex: number) => {
+                Column() {
+                  this.SessionMarkdownInlineText(cell, isUser, isUser ? 10 : 9, isUser ? 15 : 14, false)
+                }
+                .width(this.sessionMarkdownTableColumnWidth(block))
+                .constraintSize({ minHeight: 34 })
+                .alignSelf(ItemAlign.Stretch)
+                .padding({ left: 7, right: 7, top: 6, bottom: 6 })
+                .justifyContent(FlexAlign.Center)
+                .border({ width: 1, color: this.themeColor('#D0D5DD') })
+              }, (cell: string, cellIndex: number) => `table-${rowIndex}-${cellIndex}-${cell}`)
+            }
+          }, (row: string[], rowIndex: number) => `table-row-${rowIndex}-${row.join('|')}`)
+        }
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Auto)
+      .width('100%')
+    }
+    .width('100%')
+    .borderRadius(7)
+  }
+
+  private sessionMarkdownTableColumnWidth(block: SessionMarkdownBlock): number {
+    const columnCount = Math.max(1, parseSessionMarkdownTable(block.text).headers.length);
+    const windowWidth = this.sessionWindowWidthVp();
+    const panelWidth = this.isLandscapeSessionLayout() && !this.sessionSidebarUserCollapsed
+      ? Math.max(0, windowWidth - this.sessionLandscapeSidebarWidth() - 18)
+      : windowWidth;
+    const messageWidth = Math.max(0, panelWidth - 24) * 0.88;
+    const fittedWidth = Math.floor(messageWidth / columnCount);
+    return Math.max(112, Math.min(220, fittedWidth > 0 ? fittedWidth : 128));
   }
 
   @Builder
@@ -1963,17 +2804,17 @@ struct Index {
 
         Column({ space: 2 }) {
           Text(this.codexDirectiveTitle(block.language))
-            .fontSize(11)
-            .fontColor('#1F2937')
+            .fontSize(this.scaledFontSize(11))
+            .fontColor(this.themeColor('#1F2937'))
             .fontWeight(FontWeight.Medium)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
 
           Text(this.codexDirectiveSummary(block))
-            .fontSize(9)
-            .fontColor('#667085')
-            .lineHeight(13)
+            .fontSize(this.scaledFontSize(9))
+            .fontColor(this.themeColor('#667085'))
+            .lineHeight(this.scaledLineHeight(13))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .copyOption(CopyOptions.LocalDevice)
@@ -1983,7 +2824,7 @@ struct Index {
 
         SymbolGlyph(this.isSessionMarkdownBlockExpanded(entry, block) ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
           .fontSize(14)
-          .fontColor(['#667085'])
+          .fontColor([this.themeColor('#667085')])
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
@@ -1994,8 +2835,8 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-    .backgroundColor('#F8FAFC')
-    .border({ width: 1, color: '#E4E7EC' })
+    .backgroundColor(this.themeColor('#F8FAFC'))
+    .border({ width: 1, color: this.themeColor('#E4E7EC') })
     .borderRadius(8)
     .onClick(() => {
       this.toggleSessionMarkdownBlock(entry, block);
@@ -2026,7 +2867,7 @@ struct Index {
         .fontColor([this.codexDirectiveAccentColor(name)])
     } else {
       Text('<>')
-        .fontSize(10)
+        .fontSize(this.scaledFontSize(10))
         .fontColor(this.codexDirectiveAccentColor(name))
         .fontWeight(FontWeight.Medium)
     }
@@ -2059,7 +2900,7 @@ struct Index {
     Column({ space: 2 }) {
       Row({ space: 5 }) {
         Text(field.label)
-          .fontSize(8)
+          .fontSize(this.scaledFontSize(8))
           .fontColor(this.structuredFieldLabelColor(field.kind))
           .fontWeight(FontWeight.Medium)
           .padding({ left: 5, right: 5, top: 1, bottom: 1 })
@@ -2067,11 +2908,11 @@ struct Index {
           .borderRadius(5)
 
         Text(field.value)
-          .fontSize(field.kind === 'code' || field.kind === 'path' ? 9 : 10)
-          .fontColor('#1F2937')
+          .fontSize(this.scaledFontSize(field.kind === 'code' || field.kind === 'path' ? 9 : 10))
+          .fontColor(this.themeColor('#1F2937'))
           .fontWeight(FontWeight.Regular)
           .layoutWeight(1)
-          .lineHeight(14)
+          .lineHeight(this.scaledLineHeight(14))
           .copyOption(CopyOptions.LocalDevice)
       }
       .width('100%')
@@ -2079,9 +2920,9 @@ struct Index {
 
       if (field.meta.length > 0) {
         Text(field.meta)
-          .fontSize(9)
-          .fontColor('#667085')
-          .lineHeight(13)
+          .fontSize(this.scaledFontSize(9))
+          .fontColor(this.themeColor('#667085'))
+          .lineHeight(this.scaledLineHeight(13))
           .width('100%')
           .padding({ left: 48 })
           .copyOption(CopyOptions.LocalDevice)
@@ -2096,15 +2937,15 @@ struct Index {
     Column({ space: 6 }) {
       Row({ space: 8 }) {
         Text(this.statusLabel(this.selectedVisibleTask()?.status ?? 'idle'))
-          .fontSize(10)
-          .fontColor('#FFFFFF')
+          .fontSize(this.scaledFontSize(10))
+          .fontColor(this.theme().textOnAccent)
           .padding({ left: 7, right: 7, top: 2, bottom: 2 })
           .backgroundColor(this.statusColor(this.selectedVisibleTask()?.status ?? 'idle'))
           .borderRadius(4)
 
         Text(this.selectedTaskSummaryText())
-          .fontSize(11)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(11))
+          .fontColor(this.themeColor('#68717D'))
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2114,19 +2955,19 @@ struct Index {
       if (this.pendingApprovalId().length > 0) {
         Column({ space: 8 }) {
           Text('需要你确认')
-            .fontSize(13)
+            .fontSize(this.scaledFontSize(13))
             .fontWeight(FontWeight.Medium)
-            .fontColor('#B42318')
+            .fontColor(this.themeColor('#B42318'))
           Text(this.pendingApprovalSummary())
-            .fontSize(12)
-            .fontColor('#68717D')
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.themeColor('#68717D'))
             .maxLines(3)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           Row({ space: 8 }) {
             Button('同意')
               .height(36)
               .layoutWeight(1)
-              .backgroundColor('#137333')
+              .backgroundColor(this.themeColor('#137333'))
               .onClick(() => {
                 this.log('info', 'ui.click.session_approval', `approvalId=${this.pendingApprovalId()}; decision=approved`);
                 void this.decideApproval(this.pendingApprovalId(), 'approved');
@@ -2134,7 +2975,7 @@ struct Index {
             Button('拒绝')
               .height(36)
               .layoutWeight(1)
-              .backgroundColor('#B42318')
+              .backgroundColor(this.themeColor('#B42318'))
               .onClick(() => {
                 this.log('info', 'ui.click.session_approval', `approvalId=${this.pendingApprovalId()}; decision=denied`);
                 void this.decideApproval(this.pendingApprovalId(), 'denied');
@@ -2143,21 +2984,25 @@ struct Index {
         }
         .width('100%')
         .padding(10)
-        .backgroundColor('#FFF4F2')
+        .backgroundColor(this.themeColor('#FFF4F2'))
         .borderRadius(8)
+      }
+
+      if (this.pendingUserInput() !== null) {
+        this.UserInputForm()
       }
 
       if (this.selectedSessionTaskEventCount() > 0) {
         Row() {
           Text(`任务事件 ${this.selectedSessionTaskEventCount()} 条`)
-            .fontSize(10)
-            .fontColor('#68717D')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.themeColor('#68717D'))
           Blank()
           Button(this.showTaskEventDetails ? '收起详情' : '展开详情')
             .height(26)
-            .fontSize(10)
-            .fontColor('#1F6FEB')
-            .backgroundColor('#EAF2FF')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.themeColor('#1F6FEB'))
+            .backgroundColor(this.themeColor('#EAF2FF'))
             .onClick(() => {
               this.showTaskEventDetails = !this.showTaskEventDetails;
               this.log('info', 'ui.session_task_events.toggle', `expanded=${this.showTaskEventDetails}`);
@@ -2171,14 +3016,14 @@ struct Index {
           ForEach(this.visibleSessionTaskEvents(), (event: BridgeEvent) => {
             Row({ space: 8 }) {
               Text(this.eventLabel(event.type))
-                .fontSize(11)
-                .fontColor('#17202A')
+                .fontSize(this.scaledFontSize(11))
+                .fontColor(this.themeColor('#17202A'))
                 .width(74)
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
               Text(this.eventSummary(event))
-                .fontSize(11)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(11))
+                .fontColor(this.themeColor('#68717D'))
                 .layoutWeight(1)
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2192,7 +3037,7 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 10, right: 10, top: 7, bottom: 7 })
-    .backgroundColor('#FFFFFF')
+    .backgroundColor(this.themeColor('#FFFFFF'))
     .borderRadius(7)
   }
 
@@ -2204,10 +3049,10 @@ struct Index {
           LoadingProgress()
             .width(14)
             .height(14)
-            .color('#1F6FEB')
+            .color(this.themeColor('#1F6FEB'))
         }
         Text(this.sessionFloatingStatusTitle())
-          .fontSize(11)
+          .fontSize(this.scaledFontSize(11))
           .fontWeight(FontWeight.Medium)
           .fontColor(this.sessionFloatingStatusColor())
           .maxLines(1)
@@ -2217,16 +3062,16 @@ struct Index {
         if (this.pendingApprovalId().length > 0) {
           Button('同意')
             .height(24)
-            .fontSize(10)
-            .backgroundColor('#137333')
+            .fontSize(this.scaledFontSize(10))
+            .backgroundColor(this.themeColor('#137333'))
             .onClick(() => {
               this.log('info', 'ui.click.floating_approval', `approvalId=${this.pendingApprovalId()}; decision=approved`);
               void this.decideApproval(this.pendingApprovalId(), 'approved');
             })
           Button('拒绝')
             .height(24)
-            .fontSize(10)
-            .backgroundColor('#B42318')
+            .fontSize(this.scaledFontSize(10))
+            .backgroundColor(this.themeColor('#B42318'))
             .onClick(() => {
               this.log('info', 'ui.click.floating_approval', `approvalId=${this.pendingApprovalId()}; decision=denied`);
               void this.decideApproval(this.pendingApprovalId(), 'denied');
@@ -2236,11 +3081,11 @@ struct Index {
         Button() {
           SymbolGlyph(this.sessionStatusExpanded ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
             .fontSize(14)
-            .fontColor(['#68717D'])
+            .fontColor([this.themeColor('#68717D')])
         }
           .width(26)
           .height(26)
-          .backgroundColor('#F0F2F5')
+          .backgroundColor(this.themeColor('#F0F2F5'))
           .borderRadius(13)
           .onClick(() => {
             this.sessionStatusExpanded = !this.sessionStatusExpanded;
@@ -2252,8 +3097,8 @@ struct Index {
 
       if (this.sessionStatusExpanded) {
         Text(this.sessionFloatingStatusDetail())
-          .fontSize(10)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(10))
+          .fontColor(this.themeColor('#68717D'))
           .width('100%')
           .maxLines(3)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2261,10 +3106,10 @@ struct Index {
     }
     .width('92%')
     .padding({ left: 10, right: 8, top: 7, bottom: 7 })
-    .backgroundColor('#F9FAFB')
-    .border({ width: 1, color: '#E5EAF0' })
+    .backgroundColor(this.themeColor('#F9FAFB'))
+    .border({ width: 1, color: this.themeColor('#E5EAF0') })
     .borderRadius(18)
-    .shadow({ radius: 8, color: '#1F232812', offsetX: 0, offsetY: 2 })
+    .shadow({ radius: 8, color: this.themeColor('#1F232812'), offsetX: 0, offsetY: 2 })
     .alignSelf(ItemAlign.Center)
   }
 
@@ -2273,22 +3118,22 @@ struct Index {
     Column({ space: 8 }) {
       Row() {
         Text(this.slashPanelTitle())
-          .fontSize(12)
+          .fontSize(this.scaledFontSize(12))
           .fontWeight(FontWeight.Medium)
-          .fontColor('#17202A')
+          .fontColor(this.themeColor('#17202A'))
         Blank()
         Text(`${this.visibleSlashItems().length}`)
-          .fontSize(11)
-          .fontColor('#8A95A3')
+          .fontSize(this.scaledFontSize(11))
+          .fontColor(this.themeColor('#8A95A3'))
           .margin({ right: 8 })
         Button() {
           SymbolGlyph($r('sys.symbol.xmark'))
             .fontSize(12)
-            .fontColor(['#68717D'])
+            .fontColor([this.themeColor('#68717D')])
         }
           .width(24)
           .height(24)
-          .backgroundColor('#F0F2F5')
+          .backgroundColor(this.themeColor('#F0F2F5'))
           .borderRadius(12)
           .onClick(() => {
             this.slashCommandPanelVisible = false;
@@ -2302,24 +3147,24 @@ struct Index {
           if (this.visibleSlashItems().length === 0) {
             Column({ space: 4 }) {
               Text('没有匹配项')
-                .fontSize(12)
+                .fontSize(this.scaledFontSize(12))
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#17202A')
+                .fontColor(this.themeColor('#17202A'))
               Text('换个关键词试试，例如 /brt 或 $brt')
-                .fontSize(10)
-                .fontColor('#68717D')
+                .fontSize(this.scaledFontSize(10))
+                .fontColor(this.themeColor('#68717D'))
             }
             .width('100%')
             .height(72)
             .justifyContent(FlexAlign.Center)
             .alignItems(HorizontalAlign.Center)
-            .backgroundColor('#F7F8FA')
+            .backgroundColor(this.themeColor('#F7F8FA'))
             .borderRadius(8)
           } else {
             ForEach(this.visibleSlashItems(), (item: SlashIndexItem) => {
               Row({ space: 8 }) {
                 Text(item.insertText)
-                  .fontSize(12)
+                  .fontSize(this.scaledFontSize(12))
                   .fontWeight(FontWeight.Medium)
                   .fontColor(this.slashItemPrimaryColor(item))
                   .width(92)
@@ -2327,13 +3172,13 @@ struct Index {
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
                 Column({ space: 2 }) {
                   Text(item.title)
-                    .fontSize(11)
+                    .fontSize(this.scaledFontSize(11))
                     .fontWeight(FontWeight.Medium)
                     .fontColor(this.slashItemTitleColor(item))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                   Text(item.description)
-                    .fontSize(10)
+                    .fontSize(this.scaledFontSize(10))
                     .fontColor(this.slashItemDescriptionColor(item))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2342,17 +3187,17 @@ struct Index {
                 .alignItems(HorizontalAlign.Start)
 
                 Text(item.type === 'skill' ? '技能' : '命令')
-                  .fontSize(10)
-                  .fontColor(this.isActiveSlashItem(item) ? '#FFFFFF' : (item.type === 'skill' ? '#9A6700' : '#1F6FEB'))
+                  .fontSize(this.scaledFontSize(10))
+                  .fontColor(this.isActiveSlashItem(item) ? this.theme().textOnAccent : (item.type === 'skill' ? this.themeColor('#9A6700') : this.themeColor('#1F6FEB')))
                   .padding({ left: 5, right: 5, top: 2, bottom: 2 })
-                  .backgroundColor(this.isActiveSlashItem(item) ? '#1F6FEB' : (item.type === 'skill' ? '#FFF8E1' : '#E8F0FE'))
+                  .backgroundColor(this.isActiveSlashItem(item) ? this.themeColor('#1F6FEB') : (item.type === 'skill' ? this.themeColor('#FFF8E1') : this.themeColor('#E8F0FE')))
                   .borderRadius(6)
               }
               .width('100%')
               .height(42)
               .padding({ left: 8, right: 8 })
-              .backgroundColor(this.isActiveSlashItem(item) ? '#E8F0FE' : '#F7F8FA')
-              .border({ width: this.isActiveSlashItem(item) ? 1 : 0, color: this.isActiveSlashItem(item) ? '#1F6FEB' : '#F7F8FA' })
+              .backgroundColor(this.isActiveSlashItem(item) ? this.themeColor('#E8F0FE') : this.themeColor('#F7F8FA'))
+              .border({ width: this.isActiveSlashItem(item) ? 1 : 0, color: this.isActiveSlashItem(item) ? this.themeColor('#1F6FEB') : this.themeColor('#F7F8FA') })
               .borderRadius(8)
               .onClick(() => {
                 this.applySlashItem(item);
@@ -2367,10 +3212,10 @@ struct Index {
     }
     .width('100%')
     .padding(10)
-    .backgroundColor('#FFFFFF')
-    .border({ width: 1, color: '#DDE3EA' })
+    .backgroundColor(this.themeColor('#FFFFFF'))
+    .border({ width: 1, color: this.themeColor('#DDE3EA') })
     .borderRadius(12)
-    .shadow({ radius: 12, color: '#1F232820', offsetX: 0, offsetY: 4 })
+    .shadow({ radius: 12, color: this.themeColor('#1F232820'), offsetX: 0, offsetY: 4 })
     .margin({ bottom: 2 })
   }
 
@@ -2386,15 +3231,16 @@ struct Index {
       }
 
       this.PendingSessionImageStrip()
+      this.PendingSessionFileStrip()
 
       Column({ space: 4 }) {
         Row({ space: 6 }) {
           TextArea({ text: this.sessionMessage, placeholder: '', controller: this.sessionTextAreaController })
             .height(this.sessionComposerTextAreaHeight())
-            .fontSize(12)
-            .fontColor('#17202A')
-            .backgroundColor('#FFFFFF')
-            .border({ width: this.hasActiveComposerToken() ? 1 : 0, color: this.hasActiveComposerToken() ? '#1F6FEB' : '#FFFFFF' })
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.themeColor('#17202A'))
+            .backgroundColor(this.themeColor('#FFFFFF'))
+            .border({ width: this.hasActiveComposerToken() ? 1 : 0, color: this.hasActiveComposerToken() ? this.themeColor('#1F6FEB') : this.themeColor('#FFFFFF') })
             .borderRadius(8)
             .padding({ left: 10, right: 10, top: 6, bottom: 6 })
             .layoutWeight(1)
@@ -2416,7 +3262,7 @@ struct Index {
               Row() {
                 this.ComposerActionPopup()
               }
-                .translate({ x: 0, y: -196 })
+                .translate({ x: 0, y: -234 })
                 .zIndex(1)
             }
 
@@ -2424,12 +3270,12 @@ struct Index {
               Button() {
                 SymbolGlyph($r('sys.symbol.plus'))
                   .fontSize(16)
-                  .fontColor([this.composerActionMenuExpanded ? '#1F6FEB' : '#17202A'])
+                  .fontColor([this.composerActionMenuExpanded ? this.themeColor('#1F6FEB') : this.themeColor('#17202A')])
               }
                 .width(32)
                 .height(32)
-                .backgroundColor(this.composerActionMenuExpanded ? '#EAF2FF' : '#FFFFFF')
-                .border({ width: 1, color: this.composerActionMenuExpanded ? '#BBD2FF' : '#DDE3EA' })
+                .backgroundColor(this.composerActionMenuExpanded ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
+                .border({ width: 1, color: this.composerActionMenuExpanded ? this.themeColor('#BBD2FF') : this.themeColor('#DDE3EA') })
                 .borderRadius(16)
                 .enabled(this.canOpenComposerActionMenu())
                 .onClick(() => {
@@ -2476,7 +3322,7 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 6, right: 6, top: 4, bottom: 1 })
-    .backgroundColor('#F7F8FA')
+    .backgroundColor(this.themeColor('#F7F8FA'))
     .borderRadius(8)
     .margin({ bottom: this.sessionComposerBottomMargin() })
     .translate({ y: this.sessionComposerBottomShift() })
@@ -2490,17 +3336,17 @@ struct Index {
           LoadingProgress()
             .width(15)
             .height(15)
-            .color('#17202A')
+            .color(this.themeColor('#17202A'))
         } else {
           this.DesktopScreenshotButtonIcon()
         }
       }
         .width(32)
         .height(32)
-        .backgroundColor('#FFFFFF')
-        .border({ width: 1, color: '#DDE3EA' })
+        .backgroundColor(this.themeColor('#FFFFFF'))
+        .border({ width: 1, color: this.themeColor('#DDE3EA') })
         .borderRadius(16)
-        .shadow({ radius: 8, color: '#1F232820', offsetX: 0, offsetY: 2 })
+        .shadow({ radius: 8, color: this.themeColor('#1F232820'), offsetX: 0, offsetY: 2 })
         .enabled(this.canCaptureDesktopScreenshot())
         .onClick(() => {
           this.composerActionMenuExpanded = false;
@@ -2513,17 +3359,17 @@ struct Index {
           LoadingProgress()
             .width(15)
             .height(15)
-            .color('#17202A')
+            .color(this.themeColor('#17202A'))
         } else {
           this.DesktopScreenshotAttachButtonIcon()
         }
       }
         .width(32)
         .height(32)
-        .backgroundColor('#FFFFFF')
-        .border({ width: 1, color: '#DDE3EA' })
+        .backgroundColor(this.themeColor('#FFFFFF'))
+        .border({ width: 1, color: this.themeColor('#DDE3EA') })
         .borderRadius(16)
-        .shadow({ radius: 8, color: '#1F232820', offsetX: 0, offsetY: 2 })
+        .shadow({ radius: 8, color: this.themeColor('#1F232820'), offsetX: 0, offsetY: 2 })
         .enabled(this.canAttachDesktopScreenshotDraft())
         .onClick(() => {
           this.composerActionMenuExpanded = false;
@@ -2533,15 +3379,15 @@ struct Index {
 
       Button() {
         Text('↻')
-          .fontSize(18)
-          .fontColor('#17202A')
+          .fontSize(this.scaledFontSize(18))
+          .fontColor(this.themeColor('#17202A'))
       }
         .width(32)
         .height(32)
-        .backgroundColor('#FFFFFF')
-        .border({ width: 1, color: '#DDE3EA' })
+        .backgroundColor(this.themeColor('#FFFFFF'))
+        .border({ width: 1, color: this.themeColor('#DDE3EA') })
         .borderRadius(16)
-        .shadow({ radius: 8, color: '#1F232820', offsetX: 0, offsetY: 2 })
+        .shadow({ radius: 8, color: this.themeColor('#1F232820'), offsetX: 0, offsetY: 2 })
         .enabled(this.selectedSession !== null && !this.isNewSessionDraft)
         .onClick(() => {
           this.composerActionMenuExpanded = false;
@@ -2553,16 +3399,16 @@ struct Index {
 
       Button() {
         Text('/')
-          .fontSize(15)
+          .fontSize(this.scaledFontSize(15))
           .fontWeight(FontWeight.Bold)
-          .fontColor(this.slashCommandPanelVisible ? '#FFFFFF' : '#17202A')
+          .fontColor(this.slashCommandPanelVisible ? this.theme().textOnAccent : this.themeColor('#17202A'))
       }
         .width(32)
         .height(32)
-        .backgroundColor(this.slashCommandPanelVisible ? '#1F6FEB' : '#FFFFFF')
-        .border({ width: 1, color: this.slashCommandPanelVisible ? '#1F6FEB' : '#DDE3EA' })
+        .backgroundColor(this.slashCommandPanelVisible ? this.themeColor('#1F6FEB') : this.themeColor('#FFFFFF'))
+        .border({ width: 1, color: this.slashCommandPanelVisible ? this.themeColor('#1F6FEB') : this.themeColor('#DDE3EA') })
         .borderRadius(16)
-        .shadow({ radius: 8, color: '#1F232820', offsetX: 0, offsetY: 2 })
+        .shadow({ radius: 8, color: this.themeColor('#1F232820'), offsetX: 0, offsetY: 2 })
         .enabled(this.selectedSession !== null || this.isNewSessionDraft)
         .onClick(() => {
           this.composerActionMenuExpanded = false;
@@ -2574,24 +3420,49 @@ struct Index {
           LoadingProgress()
             .width(15)
             .height(15)
-            .color('#17202A')
+            .color(this.themeColor('#17202A'))
         } else {
           SymbolGlyph($r('sys.symbol.ohos_photo'))
             .fontSize(15)
-            .fontColor(['#17202A'])
+            .fontColor([this.themeColor('#17202A')])
         }
       }
         .width(32)
         .height(32)
-        .backgroundColor('#FFFFFF')
-        .border({ width: 1, color: '#DDE3EA' })
+        .backgroundColor(this.themeColor('#FFFFFF'))
+        .border({ width: 1, color: this.themeColor('#DDE3EA') })
         .borderRadius(16)
-        .shadow({ radius: 8, color: '#1F232820', offsetX: 0, offsetY: 2 })
+        .shadow({ radius: 8, color: this.themeColor('#1F232820'), offsetX: 0, offsetY: 2 })
         .enabled(this.canPickSessionImage())
         .onClick(() => {
           this.composerActionMenuExpanded = false;
           this.log('info', 'ui.click.pick_image', `sessionId=${this.selectedSession?.id ?? ''}; isNewSession=${this.isNewSessionDraft}; source=plus_menu`);
           void this.pickSessionImageDraft();
+        })
+
+      Button() {
+        if (this.isPickingFile) {
+          LoadingProgress()
+            .width(15)
+            .height(15)
+            .color(this.themeColor('#17202A'))
+        } else {
+          Text('文')
+            .fontSize(this.scaledFontSize(12))
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.themeColor('#17202A'))
+        }
+      }
+        .width(32)
+        .height(32)
+        .backgroundColor(this.themeColor('#FFFFFF'))
+        .border({ width: 1, color: this.themeColor('#DDE3EA') })
+        .borderRadius(16)
+        .shadow({ radius: 8, color: this.themeColor('#1F232820'), offsetX: 0, offsetY: 2 })
+        .enabled(this.canPickSessionFile())
+        .onClick(() => {
+          this.composerActionMenuExpanded = false;
+          void this.pickSessionFileDraft();
         })
     }
     .alignItems(HorizontalAlign.Center)
@@ -2601,12 +3472,12 @@ struct Index {
   ActiveComposerTokenChip() {
     Row({ space: 6 }) {
       Text('已激活')
-        .fontSize(10)
-        .fontColor('#68717D')
+        .fontSize(this.scaledFontSize(10))
+        .fontColor(this.themeColor('#68717D'))
       Text(this.activeComposerToken())
-        .fontSize(11)
+        .fontSize(this.scaledFontSize(11))
         .fontWeight(FontWeight.Medium)
-        .fontColor('#1F6FEB')
+        .fontColor(this.themeColor('#1F6FEB'))
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
       Blank()
@@ -2614,7 +3485,7 @@ struct Index {
     .width('100%')
     .height(24)
     .padding({ left: 8, right: 8 })
-    .backgroundColor('#E8F0FE')
+    .backgroundColor(this.themeColor('#E8F0FE'))
     .borderRadius(8)
   }
 
@@ -2628,21 +3499,20 @@ struct Index {
               .width(44)
               .height(44)
               .objectFit(ImageFit.Cover)
-              .backgroundColor('#ECEFF3')
+              .backgroundColor(this.themeColor('#ECEFF3'))
               .borderRadius(8)
               .onClick(() => {
-                this.previewImageUrl = image.uri;
-                this.log('info', 'ui.pending_image.preview.open', `id=${image.id}; fileName=${image.fileName}`);
+                this.openImagePreview(image.uri, `pending:${image.id}`);
               })
 
             Button() {
               SymbolGlyph($r('sys.symbol.xmark'))
                 .fontSize(12)
-                .fontColor(['#FFFFFF'])
+                .fontColor([this.theme().textOnAccent])
             }
               .width(22)
               .height(22)
-              .backgroundColor('#B42318')
+              .backgroundColor(this.themeColor('#B42318'))
               .borderRadius(11)
               .onClick(() => {
                 this.removePendingSessionImage(image.id);
@@ -2662,16 +3532,16 @@ struct Index {
     if (this.sessionPrimaryActionMode() === 'interrupt') {
       SymbolGlyph($r('sys.symbol.xmark'))
         .fontSize(18)
-        .fontColor(['#FFFFFF'])
+        .fontColor([this.theme().textOnAccent])
     } else if (this.sessionPrimaryActionMode() === 'sending' || this.sessionPrimaryActionMode() === 'interrupting') {
       LoadingProgress()
         .width(18)
         .height(18)
-        .color('#FFFFFF')
+        .color(this.theme().textOnAccent)
     } else {
       SymbolGlyph($r('sys.symbol.arrow_up'))
         .fontSize(18)
-        .fontColor(['#FFFFFF'])
+        .fontColor([this.theme().textOnAccent])
     }
   }
 
@@ -2684,30 +3554,25 @@ struct Index {
         .backgroundColor('#000000')
         .opacity(0.78)
         .onClick(() => {
-          this.previewImageUrl = '';
-          this.log('info', 'ui.image.preview.close', 'source=backdrop');
+          this.closeImagePreview('backdrop');
         })
 
-      Image(this.previewImageUrl)
-        .width('94%')
-        .height('78%')
-        .objectFit(ImageFit.Contain)
-        .backgroundColor('#111111')
-        .borderRadius(8)
+      this.AdaptiveImagePreviewContent(this.previewImageUrl)
+
+      this.AdaptiveImagePreviewRotateButton('image')
 
       Button() {
         SymbolGlyph($r('sys.symbol.xmark'))
           .fontSize(18)
-          .fontColor(['#FFFFFF'])
+          .fontColor([this.theme().textOnAccent])
       }
         .width(40)
         .height(40)
-        .backgroundColor('#1F2328')
+        .backgroundColor(this.themeColor('#1F2328'))
         .borderRadius(20)
-        .position({ x: '86%', y: 20 })
+        .position({ x: this.adaptiveImagePreviewCloseButtonX(), y: 20 })
         .onClick(() => {
-          this.previewImageUrl = '';
-          this.log('info', 'ui.image.preview.close', 'source=button');
+          this.closeImagePreview('button');
         })
     }
     .width('100%')
@@ -2721,61 +3586,26 @@ struct Index {
       Column()
         .width('100%')
         .height('100%')
-        .opacity(0.01)
+        .backgroundColor('#000000')
+        .opacity(0.78)
         .onClick(() => {
           this.closeDesktopScreenshotPreview('backdrop');
         })
 
-      Stack({ alignContent: Alignment.Center }) {
-        Image(this.desktopScreenshotPreviewUrl)
-          .width('100%')
-          .height('100%')
-          .objectFit(ImageFit.Contain)
-          .scale({ x: this.desktopScreenshotScale, y: this.desktopScreenshotScale })
-          .translate({ x: this.desktopScreenshotOffsetX, y: this.desktopScreenshotOffsetY })
-          .rotate({ angle: this.desktopScreenshotRotation })
-      }
-        .width('100%')
-        .height('100%')
-        .clip(true)
-        .gesture(
-          GestureGroup(GestureMode.Parallel,
-            PinchGesture()
-              .onActionStart(() => {
-                this.desktopScreenshotGestureStartScale = this.desktopScreenshotScale;
-              })
-              .onActionUpdate((event: GestureEvent) => {
-                this.setDesktopScreenshotScale(this.desktopScreenshotGestureStartScale * event.scale);
-              }),
-            PanGesture()
-              .onActionStart(() => {
-                this.desktopScreenshotGestureStartOffsetX = this.desktopScreenshotOffsetX;
-                this.desktopScreenshotGestureStartOffsetY = this.desktopScreenshotOffsetY;
-              })
-              .onActionUpdate((event: GestureEvent) => {
-                this.desktopScreenshotOffsetX = this.desktopScreenshotGestureStartOffsetX + event.offsetX;
-                this.desktopScreenshotOffsetY = this.desktopScreenshotGestureStartOffsetY + event.offsetY;
-              })
-          )
-        )
-        .gesture(
-          TapGesture({ count: 2 })
-            .onAction(() => {
-              this.resetDesktopScreenshotPreviewTransform();
-              this.log('info', 'desktop.screenshot.preview.reset', 'source=double_tap');
-            })
-        )
+      this.AdaptiveImagePreviewContent(this.desktopScreenshotPreviewUrl)
+
+      this.AdaptiveImagePreviewRotateButton('desktop_screenshot')
 
       Button() {
         SymbolGlyph($r('sys.symbol.xmark'))
           .fontSize(16)
-          .fontColor(['#1F2328'])
+          .fontColor([this.themeColor('#1F2328')])
       }
         .width(34)
         .height(34)
         .backgroundColor('rgba(255, 255, 255, 0.72)')
         .borderRadius(17)
-        .position({ x: '88%', y: 18 })
+        .position({ x: this.adaptiveImagePreviewCloseButtonX(), y: 18 })
         .onClick(() => {
           this.closeDesktopScreenshotPreview('button');
         })
@@ -2786,33 +3616,412 @@ struct Index {
   }
 
   @Builder
+  PendingSessionFileStrip() {
+    if (this.pendingSessionFiles.length > 0) {
+      Column({ space: 5 }) {
+        ForEach(this.pendingSessionFiles, (file: PickedMobileFile) => {
+          Row({ space: 7 }) {
+            Text('文')
+              .fontSize(this.scaledFontSize(10))
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.themeColor('#1F6FEB'))
+              .width(24)
+              .height(24)
+              .textAlign(TextAlign.Center)
+              .backgroundColor(this.themeColor('#EAF2FF'))
+              .borderRadius(6)
+            Column({ space: 1 }) {
+              Text(file.fileName)
+                .fontSize(this.scaledFontSize(10))
+                .fontColor(this.themeColor('#17202A'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(this.formatAttachmentBytes(file.bytes))
+                .fontSize(this.scaledFontSize(8))
+                .fontColor(this.themeColor('#68717D'))
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Button('移除')
+              .height(26)
+              .fontSize(this.scaledFontSize(9))
+              .fontColor(this.themeColor('#B42318'))
+              .backgroundColor(this.themeColor('#FFF4F2'))
+              .onClick(() => {
+                this.removePendingSessionFile(file.id);
+              })
+          }
+          .width('100%')
+          .padding({ left: 7, right: 7, top: 5, bottom: 5 })
+          .backgroundColor(this.themeColor('#FFFFFF'))
+          .border({ width: 1, color: this.themeColor('#DDE3EA') })
+          .borderRadius(7)
+        }, (file: PickedMobileFile) => file.id)
+      }
+      .width('100%')
+    }
+  }
+
+  @Builder
+  UserInputForm() {
+    Column({ space: 10 }) {
+      Row() {
+        Text('需要你回答')
+          .fontSize(this.scaledFontSize(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.themeColor('#1F6FEB'))
+        Blank()
+        Text(`${this.pendingUserInput()?.questions.length ?? 0} 个问题`)
+          .fontSize(this.scaledFontSize(10))
+          .fontColor(this.themeColor('#68717D'))
+      }
+      .width('100%')
+
+      ForEach(this.pendingUserInput()?.questions ?? [], (question: BridgeUserInputQuestion) => {
+        Column({ space: 7 }) {
+          if (question.header.length > 0) {
+            Text(question.header)
+              .fontSize(this.scaledFontSize(10))
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.themeColor('#68717D'))
+              .width('100%')
+          }
+          Text(question.question)
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.themeColor('#17202A'))
+            .width('100%')
+
+          if (question.options !== null) {
+            ForEach(question.options, (option: BridgeUserInputOption) => {
+              Button() {
+                Row({ space: 8 }) {
+                  Text(this.userInputAnswer(question.id) === option.label ? '●' : '○')
+                    .fontSize(this.scaledFontSize(11))
+                    .fontColor(this.themeColor('#1F6FEB'))
+                  Column({ space: 1 }) {
+                    Text(option.label)
+                      .fontSize(this.scaledFontSize(11))
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor(this.themeColor('#17202A'))
+                      .width('100%')
+                    if (option.description.length > 0) {
+                      Text(option.description)
+                        .fontSize(this.scaledFontSize(9))
+                        .fontColor(this.themeColor('#68717D'))
+                        .width('100%')
+                    }
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+                }
+                .width('100%')
+              }
+              .width('100%')
+              .height(option.description.length > 0 ? 46 : 36)
+              .backgroundColor(this.userInputAnswer(question.id) === option.label ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
+              .border({ width: 1, color: this.userInputAnswer(question.id) === option.label ? this.themeColor('#8AB4F8') : this.themeColor('#DDE3EA') })
+              .borderRadius(7)
+              .onClick(() => {
+                this.setUserInputAnswer(question.id, option.label);
+              })
+            }, (option: BridgeUserInputOption) => `${question.id}:${option.label}`)
+          }
+
+          if (question.options === null || question.isOther) {
+            TextInput({
+              text: this.userInputAnswer(question.id),
+              placeholder: question.isSecret ? '请输入保密答案' : '请输入答案'
+            })
+              .height(40)
+              .fontSize(this.scaledFontSize(11))
+              .type(question.isSecret ? InputType.Password : InputType.Normal)
+              .backgroundColor(this.themeColor('#FFFFFF'))
+              .border({ width: 1, color: this.themeColor('#DDE3EA') })
+              .borderRadius(7)
+              .onChange((value: string) => {
+                this.setUserInputAnswer(question.id, value);
+              })
+          }
+        }
+        .width('100%')
+        .padding(9)
+        .backgroundColor(this.themeColor('#F9FAFB'))
+        .borderRadius(7)
+      }, (question: BridgeUserInputQuestion) => question.id)
+
+      Button('提交回答')
+        .width('100%')
+        .height(38)
+        .enabled(this.canAnswerPendingUserInput())
+        .backgroundColor(this.canAnswerPendingUserInput() ? this.themeColor('#1F6FEB') : this.themeColor('#8A95A3'))
+        .onClick(() => {
+          void this.answerPendingUserInput();
+        })
+    }
+    .width('100%')
+    .padding(10)
+    .backgroundColor(this.themeColor('#F2F7FF'))
+    .border({ width: 1, color: this.themeColor('#BBD2FF') })
+    .borderRadius(8)
+  }
+
+  @Builder
+  OutboxPanel() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Row()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(this.themeColor('#00000030'))
+        .onClick(() => {
+          this.outboxPanelVisible = false;
+        })
+
+      Column({ space: 10 }) {
+        Row({ space: 8 }) {
+          Column({ space: 2 }) {
+            Text('发送队列')
+              .fontSize(this.scaledFontSize(16))
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.themeColor('#17202A'))
+            Text('每个会话严格按顺序发送；修改只影响尚未提交的消息')
+              .fontSize(this.scaledFontSize(9))
+              .fontColor(this.themeColor('#68717D'))
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+          Button('刷新')
+            .height(32)
+            .fontSize(this.scaledFontSize(10))
+            .enabled(!this.isLoadingOutbox)
+            .onClick(() => {
+              void this.loadOutbox();
+            })
+          Button('关闭')
+            .height(32)
+            .fontSize(this.scaledFontSize(10))
+            .onClick(() => {
+              this.outboxPanelVisible = false;
+            })
+        }
+        .width('100%')
+
+        if (this.isLoadingOutbox) {
+          LoadingProgress()
+            .width(28)
+            .height(28)
+            .color(this.themeColor('#1F6FEB'))
+        } else if (this.outboxItems.length === 0) {
+          Text('当前没有待发送消息')
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.themeColor('#68717D'))
+            .width('100%')
+            .padding(16)
+            .textAlign(TextAlign.Center)
+        } else {
+          Scroll() {
+            Column({ space: 8 }) {
+              ForEach(this.outboxItems, (item: BridgeOutboxItem) => {
+                this.OutboxItemCard(item)
+              }, (item: BridgeOutboxItem) => item.id)
+            }
+            .width('100%')
+          }
+          .width('100%')
+          .height(this.isLandscapeSessionLayout() ? 320 : 480)
+          .scrollBar(BarState.Auto)
+        }
+      }
+      .width(this.isLandscapeSessionLayout() ? '72%' : '100%')
+      .padding({ left: 14, right: 14, top: 14, bottom: 22 })
+      .backgroundColor(this.themeColor('#FFFFFF'))
+      .borderRadius({ topLeft: 18, topRight: 18 })
+      .shadow({ radius: 18, color: this.themeColor('#1F232824'), offsetX: 0, offsetY: -4 })
+    }
+    .width('100%')
+    .height('100%')
+    .zIndex(90)
+  }
+
+  @Builder
+  OutboxItemCard(item: BridgeOutboxItem) {
+    Column({ space: 7 }) {
+      Row({ space: 7 }) {
+        Text(this.outboxStatusLabel(item.status))
+          .fontSize(this.scaledFontSize(9))
+          .fontColor(this.themeColor('#1F6FEB'))
+          .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+          .backgroundColor(this.themeColor('#EAF2FF'))
+          .borderRadius(5)
+        Text(item.threadId.length > 0 ? this.shortSessionId(item.threadId) : '新会话')
+          .fontSize(this.scaledFontSize(9))
+          .fontColor(this.themeColor('#68717D'))
+        Blank()
+        Text(`尝试 ${item.attemptCount}`)
+          .fontSize(this.scaledFontSize(9))
+          .fontColor(this.themeColor('#68717D'))
+      }
+      .width('100%')
+
+      TextArea({ text: this.outboxDraft(item), placeholder: '待发送消息' })
+        .width('100%')
+        .height(72)
+        .fontSize(this.scaledFontSize(11))
+        .backgroundColor(this.themeColor('#F7F8FA'))
+        .borderRadius(7)
+        .enabled(item.status === 'queued' || item.status === 'failed')
+        .onChange((value: string) => {
+          this.setOutboxDraft(item.id, value);
+        })
+
+      if (item.error.length > 0) {
+        Text(item.error)
+          .fontSize(this.scaledFontSize(9))
+          .fontColor(this.themeColor('#B42318'))
+          .width('100%')
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+
+      Row({ space: 6 }) {
+        Button('保存')
+          .height(30)
+          .fontSize(this.scaledFontSize(9))
+          .enabled(this.outboxDraft(item).trim().length > 0 && this.outboxDraft(item) !== item.text)
+          .onClick(() => {
+            void this.saveOutboxItem(item);
+          })
+        Button('上移')
+          .height(30)
+          .fontSize(this.scaledFontSize(9))
+          .onClick(() => {
+            void this.moveOutboxItem(item, 'up');
+          })
+        Button('下移')
+          .height(30)
+          .fontSize(this.scaledFontSize(9))
+          .onClick(() => {
+            void this.moveOutboxItem(item, 'down');
+          })
+        if (item.status === 'failed' || item.status === 'uncertain') {
+          Button('重试')
+            .height(30)
+            .fontSize(this.scaledFontSize(9))
+            .onClick(() => {
+              void this.retryOutboxItem(item);
+            })
+        }
+        Button('取消')
+          .height(30)
+          .fontSize(this.scaledFontSize(9))
+          .fontColor(this.themeColor('#B42318'))
+          .onClick(() => {
+            void this.cancelOutboxItem(item);
+          })
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding(10)
+    .backgroundColor(this.themeColor('#FFFFFF'))
+    .border({ width: 1, color: this.themeColor('#DDE3EA') })
+    .borderRadius(9)
+  }
+
+  @Builder
+  AdaptiveImagePreviewContent(imageUrl: string) {
+    Stack({ alignContent: Alignment.Center }) {
+      Image(imageUrl)
+        .width('100%')
+        .height('100%')
+        .objectFit(ImageFit.Contain)
+        .backgroundColor(this.themeColor('#111111'))
+        .borderRadius(8)
+        .scale({ x: this.desktopScreenshotScale, y: this.desktopScreenshotScale })
+        .translate({ x: this.desktopScreenshotOffsetX, y: this.desktopScreenshotOffsetY })
+        .rotate({ angle: this.desktopScreenshotRotation })
+    }
+    .width(this.adaptiveImagePreviewWidth())
+    .height(this.adaptiveImagePreviewHeight())
+    .clip(true)
+    .onAreaChange(() => {
+      this.handleAdaptiveImagePreviewAreaChange();
+    })
+    .gesture(
+      GestureGroup(GestureMode.Parallel,
+        PinchGesture()
+          .onActionStart(() => {
+            this.desktopScreenshotGestureStartScale = this.desktopScreenshotScale;
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.setDesktopScreenshotScale(this.desktopScreenshotGestureStartScale * event.scale);
+          }),
+        PanGesture()
+          .onActionStart(() => {
+            this.desktopScreenshotGestureStartOffsetX = this.desktopScreenshotOffsetX;
+            this.desktopScreenshotGestureStartOffsetY = this.desktopScreenshotOffsetY;
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.desktopScreenshotOffsetX = this.desktopScreenshotGestureStartOffsetX + event.offsetX;
+            this.desktopScreenshotOffsetY = this.desktopScreenshotGestureStartOffsetY + event.offsetY;
+          })
+      )
+    )
+    .gesture(
+      TapGesture({ count: 2 })
+        .onAction(() => {
+          this.resetDesktopScreenshotPreviewTransform();
+          this.log('info', 'image.preview.reset', 'source=double_tap');
+        })
+    )
+  }
+
+  @Builder
+  AdaptiveImagePreviewRotateButton(source: string) {
+    Button() {
+      Text('↻')
+        .fontSize(this.scaledFontSize(18))
+        .fontWeight(FontWeight.Bold)
+        .fontColor(this.theme().textOnAccent)
+    }
+    .width(36)
+    .height(36)
+    .backgroundColor(this.themeColor('#1F2328'))
+    .borderRadius(18)
+    .position({ x: this.adaptiveImagePreviewRotateButtonX(), y: 20 })
+    .onClick(() => {
+      this.rotateDesktopScreenshot(90);
+      this.log('info', 'image.preview.manual_rotate', `source=${source}; rotation=${this.desktopScreenshotRotation}`);
+    })
+  }
+
+  @Builder
   TaskPanel() {
     Column({ space: 10 }) {
       Row() {
         Text('任务')
-          .fontSize(15)
+          .fontSize(this.scaledFontSize(15))
           .fontWeight(FontWeight.Medium)
-          .fontColor('#17202A')
+          .fontColor(this.themeColor('#17202A'))
         Blank()
         Text(this.selectedProjectId)
-          .fontSize(12)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(12))
+          .fontColor(this.themeColor('#68717D'))
       }
 
       if (this.projects.length > 0) {
         ForEach(this.projects, (project: BridgeProject) => {
           Row() {
             Text(project.name)
-              .fontSize(14)
-              .fontColor(project.id === this.selectedProjectId ? '#FFFFFF' : '#17202A')
+              .fontSize(this.scaledFontSize(14))
+              .fontColor(project.id === this.selectedProjectId ? this.theme().textOnAccent : this.themeColor('#17202A'))
             Blank()
             Text(project.id)
-              .fontSize(12)
-              .fontColor(project.id === this.selectedProjectId ? '#DDEBFF' : '#68717D')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(project.id === this.selectedProjectId ? this.themeColor('#DDEBFF') : this.themeColor('#68717D'))
           }
           .width('100%')
           .padding(10)
-          .backgroundColor(project.id === this.selectedProjectId ? '#1F6FEB' : '#F0F2F5')
+          .backgroundColor(project.id === this.selectedProjectId ? this.themeColor('#1F6FEB') : this.themeColor('#F0F2F5'))
           .borderRadius(6)
           .onClick(() => {
             this.selectedProjectId = project.id;
@@ -2822,8 +4031,8 @@ struct Index {
 
       TextArea({ text: this.prompt, placeholder: '请输入要交给 Codex 的代码任务' })
         .height(108)
-        .fontSize(14)
-        .backgroundColor('#FFFFFF')
+        .fontSize(this.scaledFontSize(14))
+        .backgroundColor(this.themeColor('#FFFFFF'))
         .borderRadius(6)
         .onChange((value: string) => {
           this.prompt = value;
@@ -2838,45 +4047,45 @@ struct Index {
           void this.createTask();
         })
     }
-    .cardStyle()
+    .cardStyle(this.theme().surface)
   }
 
   @Builder
   StatusPanel() {
     Column({ space: 10 }) {
       Text('状态')
-        .fontSize(15)
+        .fontSize(this.scaledFontSize(15))
         .fontWeight(FontWeight.Medium)
-        .fontColor('#17202A')
+        .fontColor(this.themeColor('#17202A'))
 
       Text(this.message)
-        .fontSize(13)
-        .fontColor('#68717D')
+        .fontSize(this.scaledFontSize(13))
+        .fontColor(this.themeColor('#68717D'))
         .width('100%')
 
       if (this.currentTask !== null) {
         Text(`任务：${this.currentTask.id}`)
-          .fontSize(12)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(12))
+          .fontColor(this.themeColor('#68717D'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
 
         if (this.pendingApprovalId().length > 0) {
           Column({ space: 8 }) {
             Text('需要确认')
-              .fontSize(14)
+              .fontSize(this.scaledFontSize(14))
               .fontWeight(FontWeight.Medium)
-              .fontColor('#B42318')
+              .fontColor(this.themeColor('#B42318'))
 
             Text(this.pendingApprovalSummary())
-              .fontSize(12)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.themeColor('#68717D'))
 
             Row({ space: 10 }) {
               Button('同意')
                 .height(38)
                 .layoutWeight(1)
-                .backgroundColor('#137333')
+                .backgroundColor(this.themeColor('#137333'))
                 .onClick(() => {
                   this.log('info', 'ui.click.approval', `approvalId=${this.pendingApprovalId()}; decision=approved`);
                   void this.decideApproval(this.pendingApprovalId(), 'approved');
@@ -2884,7 +4093,7 @@ struct Index {
               Button('拒绝')
                 .height(38)
                 .layoutWeight(1)
-                .backgroundColor('#B42318')
+                .backgroundColor(this.themeColor('#B42318'))
                 .onClick(() => {
                   this.log('info', 'ui.click.approval', `approvalId=${this.pendingApprovalId()}; decision=denied`);
                   void this.decideApproval(this.pendingApprovalId(), 'denied');
@@ -2893,48 +4102,48 @@ struct Index {
           }
           .width('100%')
           .padding(12)
-          .backgroundColor('#FFF4F2')
+          .backgroundColor(this.themeColor('#FFF4F2'))
           .borderRadius(6)
         }
       }
     }
-    .cardStyle()
+    .cardStyle(this.theme().surface)
   }
 
   @Builder
   EventPanel() {
     Column({ space: 8 }) {
       Text('事件')
-        .fontSize(15)
+        .fontSize(this.scaledFontSize(15))
         .fontWeight(FontWeight.Medium)
-        .fontColor('#17202A')
+        .fontColor(this.themeColor('#17202A'))
 
       if (this.currentTask === null || this.currentTask.events.length === 0) {
         Text('暂无任务事件')
-          .fontSize(13)
-          .fontColor('#68717D')
+          .fontSize(this.scaledFontSize(13))
+          .fontColor(this.themeColor('#68717D'))
       } else {
         ForEach(this.visibleEvents(), (event: BridgeEvent) => {
           Column({ space: 3 }) {
             Text(this.eventLabel(event.type))
-              .fontSize(13)
+              .fontSize(this.scaledFontSize(13))
               .fontWeight(FontWeight.Medium)
-              .fontColor('#17202A')
+              .fontColor(this.themeColor('#17202A'))
             Text(this.eventSummary(event))
-              .fontSize(12)
-              .fontColor('#68717D')
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.themeColor('#68717D'))
               .maxLines(2)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           .width('100%')
           .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-          .backgroundColor('#F7F8FA')
+          .backgroundColor(this.themeColor('#F7F8FA'))
           .borderRadius(6)
         }, (event: BridgeEvent) => event.id)
       }
     }
     .layoutWeight(1)
-    .cardStyle()
+    .cardStyle(this.theme().surface)
   }
 
   private async loadProjects(): Promise<void> {
@@ -2947,7 +4156,7 @@ struct Index {
       }
       this.tasks = await BridgeClient.listTasks(this.normalizedBridgeUrl(), this.bridgeToken);
       this.lastTasksRefreshAt = now;
-      this.applyLatestSessions(await BridgeClient.listSessions(this.normalizedBridgeUrl(), this.bridgeToken), 'loadProjects');
+      this.applyLatestSessions(await this.loadCanonicalSessionSummaries('loadProjects'), 'loadProjects');
       this.lastSessionsRefreshAt = now;
       await this.refreshSlashIndex();
       this.message = `已加载 ${this.projects.length} 个项目`;
@@ -3049,11 +4258,22 @@ struct Index {
     const targetProjectLabel = this.selectedSession.projectLabel ?? '未归类';
     const outgoing = this.sessionMessage.trim();
     const draftImages = this.pendingSessionImages.slice();
+    const draftFiles = this.pendingSessionFiles.slice();
     const guidanceSend = this.hasRunningTaskForSession(targetSessionId);
     let targetFingerprint: CodexSessionFingerprint | null = this.selectedSessionFingerprint();
+    const submissionId = this.submissionIdForRetry(retryFailedMessageId);
     let sent = false;
     this.isSendingSessionMessage = true;
     this.sendingSessionTargetId = targetSessionId;
+    this.beginOptimisticSessionSend(
+      targetSessionId,
+      false,
+      this.selectedProjectId,
+      submissionId,
+      outgoing,
+      draftImages,
+      retryFailedMessageId
+    );
     try {
       await this.guard('sendSessionMessage', async () => {
         if (this.selectedSession === null || this.selectedSession.id !== targetSessionId) {
@@ -3062,7 +4282,7 @@ struct Index {
           return;
         }
         this.message = guidanceSend
-          ? `正在发送引导并打断：${targetProjectLabel} / ${targetSessionTitle}`
+          ? `正在追加引导：${targetProjectLabel} / ${targetSessionTitle}`
           : `正在发送到 Codex 官方会话：${targetProjectLabel} / ${targetSessionTitle}`;
         if (targetFingerprint === null || targetFingerprint.filePath.length === 0) {
           const refreshed = await BridgeClient.getSession(this.normalizedBridgeUrl(), targetSessionId, this.bridgeToken);
@@ -3080,12 +4300,15 @@ struct Index {
           this.log('error', 'session.send.blocked', `reason=missing_fingerprint; sessionId=${targetSessionId}`);
           return;
         }
-        const desktopReady = await this.ensureDesktopLiveReadyForSend(targetSessionId, 'send_session');
-        if (!desktopReady) {
-          this.log('warn', 'session.send.blocked', `reason=desktop_live_not_ready_after_mobile_repair; sessionId=${targetSessionId}; state=${this.desktopLiveState}; verified=${this.desktopLiveSessionVerified}`);
-          return;
+        const requiresDesktopLive = await this.requiresDesktopLiveForSend(targetSessionId, 'send_session');
+        if (requiresDesktopLive) {
+          const desktopReady = await this.ensureDesktopLiveReadyForSend(targetSessionId, 'send_session');
+          if (!desktopReady) {
+            this.log('warn', 'session.send.blocked', `reason=desktop_live_not_ready_after_mobile_repair; sessionId=${targetSessionId}; state=${this.desktopLiveState}; verified=${this.desktopLiveSessionVerified}`);
+            return;
+          }
         }
-        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages);
+        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles);
         const messageText = composed.text;
         this.clearLocalRunningOverride(targetSessionId);
         this.currentTask = await BridgeClient.sendCodexThreadMessage(
@@ -3096,8 +4319,11 @@ struct Index {
           this.bridgeToken,
           targetFingerprint,
           this.sessionReasoningEffort,
-          this.sessionModel
+          this.sessionModel,
+          submissionId
         );
+        this.completeOptimisticSessionSend(submissionId);
+        this.applyTaskExecutionContract(this.currentTask, targetSessionId, 'send_session_created');
         sent = true;
         this.lastDesktopSyncWarningTaskId = '';
         this.activeSessionTaskId = this.currentTask.id;
@@ -3106,8 +4332,10 @@ struct Index {
           sessionId: targetSessionId,
           isNewSession: false,
           projectId: this.selectedProjectId,
+          submissionId,
           text: outgoing,
           images: draftImages,
+          files: draftFiles,
           retryFailedMessageId
         });
         this.rememberTaskForSession(targetSessionId, this.currentTask.id, this.currentTask.status);
@@ -3116,9 +4344,9 @@ struct Index {
           ? `引导已提交，正在确认 Codex 接收`
           : `消息已提交，正在确认 Codex 接收`;
         this.sessionMessage = '';
-        this.clearPendingSessionImages(composed.uploadedImages);
-        if (composed.failedImages.length > 0) {
-          this.message = `文字已发送，${composed.failedImages.length} 张图片上传失败，图片已保留可重试`;
+        this.restoreUnsentSessionAttachments(composed.failedImages, composed.failedFiles);
+        if (composed.failedImages.length > 0 || composed.failedFiles.length > 0) {
+          this.message = `文字已发送，${composed.failedImages.length} 张图片、${composed.failedFiles.length} 个文件上传失败，附件已保留`;
         }
         this.dismissSessionKeyboardAfterSend('send_session');
         this.showTaskEventDetails = false;
@@ -3133,13 +4361,16 @@ struct Index {
         return true;
       }
       if (!sent) {
+        this.completeOptimisticSessionSend(submissionId);
         this.rememberFailedSessionMessageAfterSendFailure({
           failedId: retryFailedMessageId,
           sessionId: targetSessionId,
           isNewSession: false,
           projectId: this.selectedProjectId,
+          submissionId,
           text: outgoing,
           images: draftImages,
+          files: draftFiles,
           error: this.message
         });
       }
@@ -3161,13 +4392,24 @@ struct Index {
     }
     const outgoing = this.sessionMessage.trim();
     const draftImages = this.pendingSessionImages.slice();
+    const draftFiles = this.pendingSessionFiles.slice();
+    const submissionId = this.submissionIdForRetry(retryFailedMessageId);
     let sent = false;
     this.isSendingSessionMessage = true;
     this.sendingSessionTargetId = '__new_session__';
+    this.beginOptimisticSessionSend(
+      '__new_session__',
+      true,
+      this.selectedProjectId,
+      submissionId,
+      outgoing,
+      draftImages,
+      retryFailedMessageId
+    );
     try {
       const guardOk = await this.guard('sendNewSessionMessage', async () => {
         this.message = '正在创建 Codex 官方会话';
-        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages);
+        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles);
         const messageText = composed.text;
         this.currentTask = await BridgeClient.startCodexThread(
           this.normalizedBridgeUrl(),
@@ -3175,23 +4417,27 @@ struct Index {
           messageText,
           this.bridgeToken,
           this.sessionReasoningEffort,
-          this.sessionModel
+          this.sessionModel,
+          submissionId
         );
+        this.completeOptimisticSessionSend(submissionId);
         sent = true;
         this.lastDesktopSyncWarningTaskId = '';
         this.rememberPendingSessionSend(this.currentTask.id, {
           sessionId: '__new_session__',
           isNewSession: true,
           projectId: this.selectedProjectId,
+          submissionId,
           text: outgoing,
           images: draftImages,
+          files: draftFiles,
           retryFailedMessageId
         });
         this.message = '新会话已发送，正在唤醒 Codex';
         this.sessionMessage = '';
-        this.clearPendingSessionImages(composed.uploadedImages);
-        if (composed.failedImages.length > 0) {
-          this.message = `新会话文字已发送，${composed.failedImages.length} 张图片上传失败，图片已保留可重试`;
+        this.restoreUnsentSessionAttachments(composed.failedImages, composed.failedFiles);
+        if (composed.failedImages.length > 0 || composed.failedFiles.length > 0) {
+          this.message = `新会话文字已发送，${composed.failedImages.length} 张图片、${composed.failedFiles.length} 个文件上传失败，附件已保留`;
         }
         this.dismissSessionKeyboardAfterSend('send_new_session');
         this.newSessionTaskId = this.currentTask.id;
@@ -3210,13 +4456,16 @@ struct Index {
         return true;
       }
       if (!guardOk) {
+        this.completeOptimisticSessionSend(submissionId);
         this.rememberFailedSessionMessageAfterSendFailure({
           failedId: retryFailedMessageId,
           sessionId: '__new_session__',
           isNewSession: true,
           projectId: this.selectedProjectId,
+          submissionId,
           text: outgoing,
           images: draftImages,
+          files: draftFiles,
           error: this.message
         });
       }
@@ -3234,11 +4483,12 @@ struct Index {
     const activeTask = this.currentTask;
     const activeTaskId = activeTask.id;
     const activeSessionId = this.taskSessionId(activeTask);
+    const afterSeq = this.currentTaskEventCursor(activeTask);
     let task: BridgeTask;
     try {
-      task = activeTask.desktopSync?.status === 'app_server_official'
-        ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), activeTaskId, this.bridgeToken)
-        : await BridgeClient.getTask(this.normalizedBridgeUrl(), activeTaskId, this.bridgeToken);
+      task = this.taskUsesCodexRunApi(activeTask)
+        ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), activeTaskId, this.bridgeToken, afterSeq)
+        : await BridgeClient.getTask(this.normalizedBridgeUrl(), activeTaskId, this.bridgeToken, afterSeq);
     } catch (error) {
       if (this.errorText(error).indexOf('Unknown task') >= 0 || this.errorText(error).indexOf('HTTP 404') >= 0) {
         if (this.currentTask === null || this.currentTask.id !== activeTaskId) {
@@ -3263,23 +4513,36 @@ struct Index {
       this.log('info', 'task.refresh.result_ignored', `taskId=${activeTaskId}; sessionId=${activeSessionId}; reason=stale_request`);
       return;
     }
+    this.handoffPendingSessionSend(activeTaskId, task);
+    task = this.mergeTaskEventPage(activeTask, task);
+    if (task.eventGap === true) {
+      this.log('warn', 'task.event_cursor.gap', `taskId=${activeTaskId}; sessionId=${activeSessionId}; afterSeq=${afterSeq}; nextSeq=${task.eventCursor ?? 0}`);
+      if (activeSessionId.length > 0 && this.selectedSession?.id === activeSessionId) {
+        await this.loadSessionDetail(activeSessionId);
+      }
+    }
     const previousStatus = this.currentTask.status;
     const previousEventCount = this.currentTaskEventCount(this.currentTask);
     this.currentTask = task;
+    this.applyTaskExecutionContract(task, activeSessionId, 'task_refresh');
     this.syncSessionTaskMarkers(task);
     this.message = `任务${this.statusLabel(task.status)}：${this.currentTaskSummaryText()}`;
     const nextEventCount = this.currentTaskEventCount(task);
     const taskChanged = previousStatus !== task.status || nextEventCount !== previousEventCount;
     this.updateTaskPollCadence(taskChanged, task.status, nextEventCount);
+    if (task.hasMoreEvents === true) {
+      this.taskPollDelayMs = 50;
+    }
     if (nextEventCount !== previousEventCount) {
       this.scrollSessionToBottomIfFollowing(30, 'task_events');
     }
-    if (task.desktopSync && task.desktopSync.status !== 'app_server_official' && task.desktopSync.desktopLive === false && this.lastDesktopSyncWarningTaskId !== task.id) {
+    if (task.desktopSync && !this.taskUsesAppServer(task) && task.desktopSync.desktopLive === false && this.lastDesktopSyncWarningTaskId !== task.id) {
       this.lastDesktopSyncWarningTaskId = task.id;
       this.log('warn', 'desktop.sync.file_only', `taskId=${task.id}; status=${task.desktopSync.status}; message=${task.desktopSync.message ?? ''}`);
     }
     if (previousStatus !== task.status) {
       this.log('info', 'task.status.changed', `taskId=${task.id}; previousStatus=${previousStatus}; status=${task.status}; eventCount=${nextEventCount}`);
+      void this.publishTaskAttentionNotification(task, previousStatus);
     }
     if (this.isTaskTerminalStatus(task.status)) {
       this.markSessionRunningLocallyCleared(this.taskSessionId(task));
@@ -3356,7 +4619,7 @@ struct Index {
     try {
       await this.guard('interruptTask', async () => {
         this.message = '正在中断当前会话';
-        const interrupted = this.currentTask?.desktopSync?.status === 'app_server_official'
+        const interrupted = this.currentTask !== null && this.taskUsesCodexRunApi(this.currentTask)
           ? await BridgeClient.interruptCodexRun(this.normalizedBridgeUrl(), taskId, this.bridgeToken)
           : await BridgeClient.interruptTask(this.normalizedBridgeUrl(), taskId, this.bridgeToken);
         this.currentTask = interrupted;
@@ -3400,11 +4663,14 @@ struct Index {
         this.message = '正在中断当前会话';
         let interrupted: BridgeTask;
         if (this.currentTask !== null && taskId.length > 0 && this.currentTask.id === taskId) {
-          interrupted = this.currentTask.desktopSync?.status === 'app_server_official'
+          interrupted = this.taskUsesCodexRunApi(this.currentTask)
             ? await BridgeClient.interruptCodexRun(this.normalizedBridgeUrl(), taskId, this.bridgeToken)
             : await BridgeClient.interruptTask(this.normalizedBridgeUrl(), taskId, this.bridgeToken);
         } else if (taskId.length > 0) {
-          interrupted = await BridgeClient.interruptTask(this.normalizedBridgeUrl(), taskId, this.bridgeToken);
+          const taskSummary = this.tasks.find((task: BridgeTaskSummary) => task.id === taskId);
+          interrupted = taskSummary !== undefined && this.taskUsesCodexRunApi(taskSummary)
+            ? await BridgeClient.interruptCodexRun(this.normalizedBridgeUrl(), taskId, this.bridgeToken)
+            : await BridgeClient.interruptTask(this.normalizedBridgeUrl(), taskId, this.bridgeToken);
         } else {
           interrupted = await BridgeClient.interruptCodexThread(this.normalizedBridgeUrl(), targetSessionId, this.bridgeToken);
         }
@@ -3441,7 +4707,7 @@ struct Index {
 
   private async pickSessionImageDraft(): Promise<void> {
     if (!this.canPickSessionImage()) {
-      this.message = '当前不能添加图片，请先选择会话或等待任务结束';
+      this.message = '当前不能添加图片，请先选择一个可发送的会话';
       this.log('info', 'session.image.blocked', `currentTaskId=${this.currentTask?.id ?? ''}; status=${this.currentTask?.status ?? 'idle'}`);
       return;
     }
@@ -3509,6 +4775,50 @@ struct Index {
     }
   }
 
+  private async pickSessionFileDraft(): Promise<void> {
+    if (!this.canPickSessionFile()) {
+      this.message = '当前不能添加文件';
+      return;
+    }
+    this.isPickingFile = true;
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const file = await AttachmentService.pickDocument(context);
+      if (file === null) {
+        this.message = '已取消选择文件';
+        return;
+      }
+      this.pendingSessionFiles = [...this.pendingSessionFiles, file];
+      this.message = `已添加文件：${file.fileName}`;
+      this.log('info', 'session.file.pending_added', `fileName=${file.fileName}; bytes=${file.bytes}; count=${this.pendingSessionFiles.length}`);
+    } catch (error) {
+      this.message = `添加文件失败：${this.errorText(error)}`;
+      this.log('error', 'session.file.failed', `message=${this.errorText(error)}`);
+    } finally {
+      this.isPickingFile = false;
+    }
+  }
+
+  private removePendingSessionFile(fileId: string): void {
+    this.pendingSessionFiles = this.pendingSessionFiles.filter((file: PickedMobileFile) => file.id !== fileId);
+    this.message = '已移除文件';
+  }
+
+  private clearPendingSessionFiles(sentFiles: PickedMobileFile[]): void {
+    const sentIds = sentFiles.map((file: PickedMobileFile) => file.id);
+    this.pendingSessionFiles = this.pendingSessionFiles.filter((file: PickedMobileFile) => sentIds.indexOf(file.id) < 0);
+  }
+
+  private formatAttachmentBytes(bytes: number): string {
+    if (bytes < 1024) {
+      return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+      return `${Math.round(bytes / 1024)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
   private removePendingSessionImage(imageId: string): void {
     const before = this.pendingSessionImages.length;
     this.pendingSessionImages = this.pendingSessionImages.filter((image: PendingSessionImage) => image.id !== imageId);
@@ -3524,10 +4834,12 @@ struct Index {
     this.pendingSessionImages = this.pendingSessionImages.filter((image: PendingSessionImage) => sentIds.indexOf(image.id) < 0);
   }
 
-  private async composeOutgoingSessionMessage(text: string, images: PendingSessionImage[]): Promise<ComposedSessionMessage> {
+  private async composeOutgoingSessionMessage(text: string, images: PendingSessionImage[], files: PickedMobileFile[]): Promise<ComposedSessionMessage> {
     const parts: string[] = [];
     const uploadedImages: PendingSessionImage[] = [];
     const failedImages: PendingSessionImage[] = [];
+    const uploadedFiles: PickedMobileFile[] = [];
+    const failedFiles: PickedMobileFile[] = [];
     if (text.trim().length > 0) {
       parts.push(text.trim());
     }
@@ -3557,6 +4869,28 @@ struct Index {
     if (failedImages.length > 0) {
       parts.push(`手机端有 ${failedImages.length} 张图片上传失败，未附加到本次消息。请直接说明无法查看这些失败图片，不要假设图片内容。`);
     }
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        this.message = `正在上传文件 ${index + 1}/${files.length}`;
+        const uploaded: MobileFileUpload = await BridgeClient.uploadMobileFile(
+          this.normalizedBridgeUrl(),
+          file.fileName,
+          file.mimeType,
+          AttachmentService.readAsBase64(file.uri),
+          this.bridgeToken
+        );
+        parts.push(uploaded.messageText);
+        uploadedFiles.push(file);
+        this.log('info', 'session.file.uploaded', `filePath=${uploaded.filePath}; bytes=${uploaded.bytes}; mimeType=${uploaded.mimeType}; index=${index}`);
+      } catch (error) {
+        failedFiles.push(file);
+        this.log('error', 'session.file.upload.failed', `fileName=${file.fileName}; index=${index}; message=${this.errorText(error)}`);
+      }
+    }
+    if (failedFiles.length > 0) {
+      parts.push(`手机端有 ${failedFiles.length} 个文件上传失败，未附加到本次消息。`);
+    }
     const joined = parts.join('\n\n').trim();
     if (joined.length === 0) {
       throw new Error('图片上传失败，且没有可发送的文字内容');
@@ -3564,7 +4898,9 @@ struct Index {
     return {
       text: this.rawSessionMessage(joined),
       uploadedImages,
-      failedImages
+      failedImages,
+      uploadedFiles,
+      failedFiles
     };
   }
 
@@ -3709,6 +5045,64 @@ struct Index {
     }
   }
 
+  private submissionIdForRetry(retryFailedMessageId: string): string {
+    if (retryFailedMessageId.length > 0) {
+      const failed = this.failedSessionMessages.find((message: FailedSessionMessage) => message.id === retryFailedMessageId);
+      if (failed && failed.submissionId.length > 0) {
+        return failed.submissionId;
+      }
+    }
+    return this.createSessionSubmissionId();
+  }
+
+  private createSessionSubmissionId(): string {
+    return `phone-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+  }
+
+  private beginOptimisticSessionSend(
+    sessionId: string,
+    isNewSession: boolean,
+    projectId: string,
+    submissionId: string,
+    text: string,
+    images: PendingSessionImage[],
+    retryFailedMessageId: string
+  ): string {
+    if (retryFailedMessageId.length > 0) {
+      return '';
+    }
+    const optimistic: OptimisticSessionMessage = {
+      id: `optimistic-${submissionId}`,
+      sessionId,
+      isNewSession,
+      projectId,
+      submissionId,
+      text,
+      images: images.slice(),
+      createdAt: new Date().toISOString()
+    };
+    this.optimisticSessionMessages = appendOptimisticSessionMessage(this.optimisticSessionMessages, optimistic);
+    this.sessionMessage = '';
+    this.pendingSessionImages = [];
+    this.pendingSessionFiles = [];
+    this.log('info', 'session.message.optimistic.created', `submissionId=${submissionId}; sessionId=${sessionId}; isNew=${isNewSession}; images=${images.length}`);
+    this.scrollSessionToBottom(20);
+    return optimistic.id;
+  }
+
+  private completeOptimisticSessionSend(submissionId: string): void {
+    const before = this.optimisticSessionMessages.length;
+    this.optimisticSessionMessages = removeOptimisticSessionMessage(this.optimisticSessionMessages, submissionId);
+    if (this.optimisticSessionMessages.length < before) {
+      this.log('info', 'session.message.optimistic.completed', `submissionId=${submissionId}`);
+    }
+  }
+
+  private restoreUnsentSessionAttachments(images: PendingSessionImage[], files: PickedMobileFile[]): void {
+    this.pendingSessionImages = images.slice();
+    this.pendingSessionFiles = files.slice();
+  }
+
   private rememberFailedSessionMessageAfterSendFailure(input: FailedSessionMessageRecordInput): void {
     if (input.failedId.length > 0) {
       if (this.isFailedSessionRetryCanceled(input.failedId)) {
@@ -3727,8 +5121,10 @@ struct Index {
       sessionId: input.sessionId,
       isNewSession: input.isNewSession,
       projectId: input.projectId,
+      submissionId: input.submissionId.length > 0 ? input.submissionId : this.createSessionSubmissionId(),
       text: input.text,
       images: input.images.slice(),
+      files: input.files.slice(),
       error: input.error,
       createdAt: new Date().toISOString(),
       retrying: false,
@@ -3743,6 +5139,7 @@ struct Index {
     ];
     this.sessionMessage = '';
     this.pendingSessionImages = [];
+    this.pendingSessionFiles = [];
     this.message = '发送失败，已保留消息，将自动重传，点 X 可取消';
     this.log('warn', 'session.message.failed.remembered', `failedId=${id}; sessionId=${input.sessionId}; isNew=${input.isNewSession}; images=${input.images.length}; error=${input.error}`);
     this.scheduleFailedSessionAutoRetry(id, 'new_failure');
@@ -3755,6 +5152,31 @@ struct Index {
     }
     this.pendingSessionSendsByTaskId[taskId] = pending;
     this.log('info', 'session.message.pending.remembered', `taskId=${taskId}; sessionId=${pending.sessionId}; isNew=${pending.isNewSession}; images=${pending.images.length}`);
+  }
+
+  private handoffPendingSessionSend(previousTaskId: string, task: BridgeTask): void {
+    if (previousTaskId.length === 0 || task.id.length === 0 || previousTaskId === task.id) {
+      return;
+    }
+    const pending = this.pendingSessionSendsByTaskId[previousTaskId];
+    if (!pending) {
+      return;
+    }
+    const next: Record<string, PendingSessionSend> = {};
+    Object.keys(this.pendingSessionSendsByTaskId).forEach((id: string) => {
+      if (id !== previousTaskId) {
+        next[id] = this.pendingSessionSendsByTaskId[id];
+      }
+    });
+    next[task.id] = pending;
+    this.pendingSessionSendsByTaskId = next;
+    if (this.activeSessionTaskId === previousTaskId) {
+      this.activeSessionTaskId = task.id;
+    }
+    if (this.newSessionTaskId === previousTaskId) {
+      this.newSessionTaskId = task.id;
+    }
+    this.log('info', 'session.message.pending.handed_off', `previousTaskId=${previousTaskId}; taskId=${task.id}; sessionId=${pending.sessionId}`);
   }
 
   private clearPendingSessionSend(taskId: string): void {
@@ -3794,8 +5216,10 @@ struct Index {
         sessionId: pending.sessionId,
         isNewSession: pending.isNewSession,
         projectId: pending.projectId,
+        submissionId: pending.submissionId,
         text: pending.text,
         images: pending.images,
+        files: pending.files,
         error: '',
         createdAt: task.createdAt,
         retrying: false,
@@ -3818,8 +5242,10 @@ struct Index {
       sessionId: pending.sessionId,
       isNewSession: pending.isNewSession,
       projectId: pending.projectId,
+      submissionId: pending.submissionId,
       text: pending.text,
       images: pending.images,
+      files: pending.files,
       error
     });
     this.clearPendingSessionSend(task.id);
@@ -3902,8 +5328,10 @@ struct Index {
         sessionId: message.sessionId,
         isNewSession: message.isNewSession,
         projectId: message.projectId,
+        submissionId: message.submissionId,
         text: message.text,
         images: message.images,
+        files: message.files,
         error: message.error,
         createdAt: message.createdAt,
         retrying: message.retrying,
@@ -3950,8 +5378,10 @@ struct Index {
       sessionId: message.sessionId,
       isNewSession: message.isNewSession,
       projectId: message.projectId,
+      submissionId: message.submissionId,
       text: message.text,
       images: message.images.slice(),
+      files: message.files.slice(),
       error: message.error,
       createdAt: message.createdAt,
       retrying: true,
@@ -4002,8 +5432,10 @@ struct Index {
         sessionId: message.sessionId,
         isNewSession: message.isNewSession,
         projectId: message.projectId,
+        submissionId: message.submissionId,
         text: message.text,
         images: message.images,
+        files: message.files,
         error: error.length > 0 ? error : message.error,
         createdAt: message.createdAt,
         retrying,
@@ -4040,15 +5472,18 @@ struct Index {
     }
     const previousText = this.sessionMessage;
     const previousImages = this.pendingSessionImages.slice();
+    const previousFiles = this.pendingSessionFiles.slice();
     this.sessionMessage = attempt.text;
     this.pendingSessionImages = attempt.images.slice();
-    this.log('info', 'session.message.failed.retry', `failedId=${attempt.id}; source=${source}; sessionId=${attempt.sessionId}; isNew=${attempt.isNewSession}; images=${attempt.images.length}`);
+    this.pendingSessionFiles = attempt.files.slice();
+    this.log('info', 'session.message.failed.retry', `failedId=${attempt.id}; source=${source}; sessionId=${attempt.sessionId}; isNew=${attempt.isNewSession}; images=${attempt.images.length}; files=${attempt.files.length}`);
     const ok = attempt.isNewSession
       ? await this.sendNewSessionMessage(attempt.id)
       : await this.sendMessageToSelectedSession(attempt.id);
     if (!ok) {
       this.sessionMessage = previousText;
       this.pendingSessionImages = previousImages;
+      this.pendingSessionFiles = previousFiles;
       this.updateFailedSessionMessage(attempt.id, false, this.message);
       this.scheduleFailedSessionAutoRetry(attempt.id, 'retry_failed');
     }
@@ -4124,9 +5559,10 @@ struct Index {
         this.log('warn', 'task.timeout_adopt.none', `source=${source}; targetSessionId=${targetSessionId}`);
         return false;
       }
-      const task = summary.desktopSync?.status === 'app_server_official'
+      const task = this.taskUsesCodexRunApi(summary)
         ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), summary.id, this.bridgeToken)
         : await BridgeClient.getTask(this.normalizedBridgeUrl(), summary.id, this.bridgeToken);
+      this.handoffPendingSessionSend(summary.id, task);
       this.currentTask = task;
       this.activeSessionTaskId = task.id;
       this.activeSessionTaskTitle = this.activeTaskTitleFromSummary(summary);
@@ -4228,6 +5664,12 @@ struct Index {
     this.isRefreshingDashboard = true;
     try {
       const now = Date.now();
+      if (force || now - this.lastRuntimeContractRefreshAt > 60000) {
+        const targetSessionId = (!this.isNewSessionDraft && this.selectedSession !== null) ? this.selectedSession.id : '';
+        const runtime = await BridgeClient.getRuntimeStatus(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId);
+        this.lastRuntimeContractRefreshAt = now;
+        this.log('info', 'runtime.contract.negotiated', `mode=${runtime.mode}; execution=${runtime.existingThreadExecution}; protocol=${runtime.protocol?.protocolVersion ?? 0}; bridgeVersion=${runtime.protocol?.bridgeVersion ?? ''}`);
+      }
       const shouldRefreshProjects = force || this.projects.length === 0 || now - this.lastProjectsRefreshAt > 120000;
       const hasAnyRunning = this.hasAnyRunningSession();
       const shouldRefreshTasks = force || this.tasks.length === 0 || now - this.lastTasksRefreshAt > (hasAnyRunning ? 10000 : 20000);
@@ -4252,10 +5694,13 @@ struct Index {
       await this.adoptSelectedSessionTaskFromSummaries(this.tasks);
       await this.adoptRunningTaskFromSummaries(this.tasks);
       if (shouldRefreshSessions) {
-        const latestSessions = await BridgeClient.listSessions(this.normalizedBridgeUrl(), this.bridgeToken);
+        const latestSessions = await this.loadCanonicalSessionSummaries('dashboard');
         this.lastSessionsRefreshAt = now;
         this.reconcileSessionActivityMonitor(latestSessions);
         this.applyLatestSessions(latestSessions, 'dashboard');
+        void this.publishStandbyMonitorSnapshot('sessions_dashboard', true);
+        await this.restoreActiveSessionIfNeeded();
+        await this.applyPendingNotificationNavigation();
       }
       if (force || now - this.lastSystemLinkRefreshAt > 60000) {
         try {
@@ -4276,6 +5721,9 @@ struct Index {
     } catch (err) {
       this.message = err instanceof Error ? err.message : String(err);
       this.dashboardFailureCount += 1;
+      if (this.dashboardFailureCount === 1) {
+        void this.publishConnectionNotification();
+      }
       if (this.dashboardFailureCount <= 3 || this.dashboardFailureCount % 10 === 0) {
         this.log('error', 'dashboard.refresh.failed', `count=${this.dashboardFailureCount}; message=${this.message}`);
       }
@@ -4303,19 +5751,107 @@ struct Index {
     }
   }
 
+  private async publishStandbyMonitorSnapshot(source: string, connected: boolean): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const previous = await StandbyMonitorSnapshotService.loadSnapshot(context);
+      const snapshot = StandbyMonitorSnapshotService.buildSnapshot(
+        this.sessions,
+        this.runningSessionIds,
+        this.unreadCompletedSessionIds,
+        this.accountUsage,
+        connected,
+        previous.layoutMode,
+        previous.formLocation,
+        this.latestRuntimeSnapshot,
+        this.sessionMonitorRevision
+      );
+      const nextDesktopMonitorSnapshot = StandbyMonitorSnapshotService.buildSnapshot(
+        this.sessions,
+        this.runningSessionIds,
+        this.unreadCompletedSessionIds,
+        this.accountUsage,
+        connected,
+        this.isLandscapeSessionLayout() ? 'landscape' : 'portrait',
+        'app_monitor',
+        this.latestRuntimeSnapshot,
+        this.sessionMonitorRevision
+      );
+      if (!StandbyMonitorSnapshotService.isSameAppMonitorRender(
+        this.desktopMonitorSnapshot,
+        nextDesktopMonitorSnapshot
+      )) {
+        this.desktopMonitorSnapshot = nextDesktopMonitorSnapshot;
+      }
+      await StandbyMonitorSnapshotService.publish(context, snapshot);
+      let notificationResult: MonitorNotificationSyncResult = {
+        action: 'skipped',
+        state: 'not_attempted'
+      };
+      try {
+        notificationResult = await AppNotificationService.syncMonitorSnapshot(snapshot);
+      } catch (notificationError) {
+        this.log(
+          'warn',
+          'standby_monitor.notification.failed',
+          `source=${source}; message=${this.errorText(notificationError)}`
+        );
+      }
+      this.log(
+        'info',
+        'standby_monitor.snapshot.published',
+        `source=${source}; running=${snapshot.runningCount}; unread=${snapshot.unreadCount}; connected=${connected}; notificationAction=${notificationResult.action}; notificationState=${notificationResult.state}; liveView=disabled`
+      );
+    } catch (error) {
+      this.log(
+        'warn',
+        'standby_monitor.snapshot.skipped',
+        `source=${source}; message=${this.errorText(error)}`
+      );
+    }
+  }
+
+  private async loadCanonicalSessionSummaries(source: string): Promise<CodexSessionSummary[]> {
+    const sessions = await BridgeClient.listSessions(this.normalizedBridgeUrl(), this.bridgeToken);
+    try {
+      const runtime = await BridgeClient.getRuntimeSnapshot(this.normalizedBridgeUrl(), this.bridgeToken);
+      const applied = this.sessionRuntimeStore.apply(runtime);
+      this.latestRuntimeSnapshot = this.sessionRuntimeStore.snapshot();
+      this.log(
+        'info',
+        'runtime.snapshot.synced',
+        `source=${source}; epoch=${runtime.epoch}; revision=${runtime.revision}; applied=${applied}; sessions=${runtime.sessions.length}`
+      );
+      return this.sessionRuntimeStore.mergeSessions(sessions);
+    } catch (error) {
+      this.sessionRuntimeStore.markStale();
+      this.latestRuntimeSnapshot = this.sessionRuntimeStore.snapshot();
+      this.log('warn', 'runtime.snapshot.refresh.failed', `source=${source}; message=${this.errorText(error)}`);
+      return this.latestRuntimeSnapshot === null
+        ? sessions
+        : this.sessionRuntimeStore.mergeSessions(sessions);
+    }
+  }
+
   private async refreshSessions(source: string = 'manual'): Promise<void> {
     if (source === 'pull') {
       this.isPullRefreshingSessions = true;
     }
     try {
-      const latestSessions = await BridgeClient.listSessions(this.normalizedBridgeUrl(), this.bridgeToken);
+      const latestSessions = await this.loadCanonicalSessionSummaries(source);
+      this.sessionsLoadError = '';
       this.lastSessionsRefreshAt = Date.now();
       this.reconcileSessionActivityMonitor(latestSessions);
       this.applyLatestSessions(latestSessions, source);
+      void this.publishStandbyMonitorSnapshot(`sessions_${source}`, true);
+      await this.restoreActiveSessionIfNeeded();
+      await this.applyPendingNotificationNavigation();
       this.message = `已刷新 ${this.sessions.length} 个会话`;
       this.log('info', 'sessions.loaded', `source=${source}; count=${this.sessions.length}`);
     } catch (err) {
-      this.message = err instanceof Error ? err.message : String(err);
+      this.sessionsLoadError = this.errorText(err);
+      this.message = this.sessionsLoadError;
+      void this.publishStandbyMonitorSnapshot(`sessions_${source}`, false);
       this.log('error', 'sessions.load.failed', `message=${this.message}`);
     } finally {
       if (source === 'pull') {
@@ -4347,6 +5883,7 @@ struct Index {
         return;
       }
       this.selectedSession = detail;
+      this.activeSessionId = sessionId;
       this.applySessionActivitySnapshot(detail, 'detail');
       this.lastSelectedSessionDetailRefreshAt = Date.now();
       this.markSessionRead(sessionId);
@@ -4362,6 +5899,24 @@ struct Index {
       this.message = err instanceof Error ? err.message : String(err);
       this.log('error', 'session.detail.failed', `sessionId=${sessionId}; message=${this.message}`);
     }
+  }
+
+  private async restoreActiveSessionIfNeeded(): Promise<void> {
+    if (this.activeSessionId.length === 0 || this.isNewSessionDraft) {
+      return;
+    }
+    if (this.selectedSession !== null && this.selectedSession.id === this.activeSessionId) {
+      return;
+    }
+    const sessionId = this.activeSessionId;
+    this.log('info', 'session.rotation_restore.started', `sessionId=${sessionId}`);
+    await this.loadSessionDetail(sessionId);
+    if (this.activeSessionId !== sessionId || this.selectedSession === null || this.selectedSession.id !== sessionId) {
+      return;
+    }
+    this.sessionSidebarCollapsed = !this.isLandscapeSessionLayout();
+    this.sessionSidebarUserCollapsed = false;
+    this.log('info', 'session.rotation_restore.completed', `sessionId=${sessionId}; layout=${this.isLandscapeSessionLayout() ? 'landscape' : 'portrait'}`);
   }
 
   private async refreshSelectedSessionDetail(): Promise<void> {
@@ -4479,7 +6034,7 @@ struct Index {
   }
 
   private sessionComposerTextAreaHeight(): number {
-    if (this.pendingSessionImages.length > 0 || this.hasActiveComposerToken()) {
+    if (this.pendingSessionImages.length > 0 || this.pendingSessionFiles.length > 0 || this.hasActiveComposerToken()) {
       return 78;
     }
     if (this.sessionComposerFocused || this.sessionMessage.trim().length > 0) {
@@ -4715,9 +6270,10 @@ struct Index {
       return;
     }
     try {
-      const task = running.desktopSync?.status === 'app_server_official'
+      const task = this.taskUsesCodexRunApi(running)
         ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), running.id, this.bridgeToken)
         : await BridgeClient.getTask(this.normalizedBridgeUrl(), running.id, this.bridgeToken);
+      this.handoffPendingSessionSend(running.id, task);
       this.currentTask = task;
       this.activeSessionTaskId = task.id;
       this.activeSessionTaskTitle = this.activeTaskTitleFromSummary(running);
@@ -4756,10 +6312,16 @@ struct Index {
       return;
     }
     try {
-      const task = summary.desktopSync?.status === 'app_server_official'
+      const task = this.taskUsesCodexRunApi(summary)
         ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), summary.id, this.bridgeToken)
         : await BridgeClient.getTask(this.normalizedBridgeUrl(), summary.id, this.bridgeToken);
+      this.handoffPendingSessionSend(summary.id, task);
       if (this.selectedSession === null || this.selectedSession.id !== currentSelected) {
+        return;
+      }
+      if (this.failedTaskHasCanonicalCompletion(task)) {
+        this.currentTask = task;
+        this.log('info', 'task.selected_session.adopt.skipped_canonical_completion', `taskId=${task.id}; sessionId=${currentSelected}`);
         return;
       }
       this.currentTask = task;
@@ -4867,6 +6429,39 @@ struct Index {
       return task.eventCount;
     }
     return task.events.length;
+  }
+
+  private currentTaskEventCursor(task: BridgeTask | null): number {
+    if (task === null) {
+      return 0;
+    }
+    if (typeof task.eventCursor === 'number') {
+      return task.eventCursor;
+    }
+    let cursor = 0;
+    task.events.forEach((event: BridgeEvent) => {
+      if (typeof event.seq === 'number' && event.seq > cursor) {
+        cursor = event.seq;
+      }
+    });
+    return cursor;
+  }
+
+  private mergeTaskEventPage(previous: BridgeTask, incoming: BridgeTask): BridgeTask {
+    if (incoming.eventGap === true) {
+      return incoming;
+    }
+    const events: BridgeEvent[] = [];
+    const ids: Set<string> = new Set<string>();
+    previous.events.concat(incoming.events).forEach((event: BridgeEvent) => {
+      if (ids.has(event.id)) {
+        return;
+      }
+      ids.add(event.id);
+      events.push(event);
+    });
+    incoming.events = events;
+    return incoming;
   }
 
   private updateTaskPollCadence(changed: boolean, status: string, eventCount: number): void {
@@ -5020,7 +6615,7 @@ struct Index {
 
   private normalizedSessionActivityStatus(status: string): string {
     const normalized = status.trim().toLowerCase();
-    if (normalized === 'running' || normalized === 'inprogress' || normalized === 'in_progress' || normalized === 'queued' || normalized === 'waiting_approval') {
+    if (normalized === 'running' || normalized === 'inprogress' || normalized === 'in_progress' || normalized === 'queued' || normalized === 'waiting_approval' || normalized === 'waiting_input' || normalized === 'recovering') {
       return 'running';
     }
     if (normalized === 'completed' || normalized === 'complete' || normalized === 'failed' || normalized === 'interrupted') {
@@ -5292,6 +6887,7 @@ struct Index {
 
   private bumpSessionMonitorRevision(): void {
     this.sessionMonitorRevision = this.sessionMonitorRevision + 1;
+    this.syncNotificationBadge('session_monitor_revision');
   }
 
   private isSessionCurrentlyRead(sessionId: string): boolean {
@@ -5299,7 +6895,18 @@ struct Index {
   }
 
   private isTaskRunningStatus(status: string): boolean {
-    return status === 'running' || status === 'queued' || status === 'waiting_approval';
+    return status === 'running' || status === 'queued' || status === 'waiting_approval' || status === 'waiting_input' || status === 'recovering';
+  }
+
+  private taskUsesAppServer(task: BridgeTask | BridgeTaskSummary): boolean {
+    return task.runtime?.kind === 'app_server'
+      || task.desktopSync?.status === 'app_server_official'
+      || task.desktopSync?.status === 'app_server_fallback';
+  }
+
+  private taskUsesCodexRunApi(task: BridgeTask | BridgeTaskSummary): boolean {
+    return this.taskUsesAppServer(task)
+      || task.runtime?.kind === 'durable_outbox';
   }
 
   private isTaskTerminalStatus(status: string): boolean {
@@ -5322,6 +6929,12 @@ struct Index {
       if (latestSelected !== undefined) {
         this.selectedSession.activityStatus = latestSelected.activityStatus;
         this.selectedSession.activityUpdatedAt = latestSelected.activityUpdatedAt;
+        this.selectedSession.runtimeState = latestSelected.runtimeState;
+        this.selectedSession.runtimeSource = latestSelected.runtimeSource;
+        this.selectedSession.runtimeUpdatedAt = latestSelected.runtimeUpdatedAt;
+        this.selectedSession.activeTurnId = latestSelected.activeTurnId;
+        this.selectedSession.canInterrupt = latestSelected.canInterrupt;
+        this.selectedSession.terminalReason = latestSelected.terminalReason;
         this.selectedSession.updatedAt = latestSelected.updatedAt;
         this.selectedSession.lastVisibleRole = latestSelected.lastVisibleRole;
         this.applySessionActivitySnapshot(latestSelected, source);
@@ -5494,7 +7107,7 @@ struct Index {
       return this.modelDisplayName(model);
     }
     if (this.desktopDefaultModel.length > 0) {
-      return `自动·${this.modelDisplayName(this.desktopDefaultModel)}`;
+      return this.modelDisplayName(this.desktopDefaultModel);
     }
     return '自动模型';
   }
@@ -5536,7 +7149,15 @@ struct Index {
   }
 
   private reasoningEffortShortLabel(value: string): string {
-    return this.reasoningEffortDisplayLabel(value);
+    const effort = this.normalizeReasoningEffort(value);
+    if (effort.length > 0) {
+      return this.reasoningEffortLabel(effort);
+    }
+    const desktopDefault = this.normalizeReasoningEffort(this.desktopDefaultReasoningEffort);
+    if (desktopDefault.length > 0) {
+      return this.reasoningEffortLabel(desktopDefault);
+    }
+    return '自动';
   }
 
   private reasoningEffortDescription(value: string): string {
@@ -5781,6 +7402,8 @@ struct Index {
       this.slashCommandPanelVisible = false;
     } else {
       this.homeActionMenuOpenedAt = 0;
+      this.themeModeChooserVisible = false;
+      this.fontScaleChooserVisible = false;
     }
     this.log('info', 'ui.home_action_menu.toggle', `visible=${this.homeActionMenuVisible}; source=${source}; owner=${this.homeActionMenuSource}`);
   }
@@ -5790,7 +7413,7 @@ struct Index {
   }
 
   private shouldShowHomeActionMenuInSidebar(): boolean {
-    return this.homeActionMenuVisible && this.homeActionMenuSource === 'sidebar_header' && !this.sessionSidebarCollapsed;
+    return this.homeActionMenuVisible && this.homeActionMenuSource === 'sidebar_header' && this.isSessionSidebarVisible();
   }
 
   private shouldIgnoreHomeActionToggle(source: string): boolean {
@@ -5824,6 +7447,9 @@ struct Index {
     if (action === 'usage') {
       return !this.isLoadingAccountUsage;
     }
+    if (action === 'outbox') {
+      return !this.isLoadingOutbox;
+    }
     if (action === 'new_session') {
       return this.canStartNewSessionDraft();
     }
@@ -5843,12 +7469,34 @@ struct Index {
     if (this.shouldIgnoreHomeActionMenuAction(action, source)) {
       return;
     }
+    if (action === 'theme') {
+      this.themeModeChooserVisible = !this.themeModeChooserVisible;
+      this.fontScaleChooserVisible = false;
+      this.log('info', 'ui.theme.menu.toggle', `visible=${this.themeModeChooserVisible}; source=${source}`);
+      return;
+    }
+    if (action === 'font_size') {
+      this.fontScaleChooserVisible = !this.fontScaleChooserVisible;
+      this.themeModeChooserVisible = false;
+      this.log('info', 'ui.font_scale.menu.toggle', `visible=${this.fontScaleChooserVisible}; source=${source}`);
+      return;
+    }
     this.homeActionMenuVisible = false;
     this.homeActionMenuSource = '';
     this.homeActionMenuOpenedAt = 0;
+    this.themeModeChooserVisible = false;
+    this.fontScaleChooserVisible = false;
     this.log('info', 'ui.home_action_menu.action', `action=${action}; source=${source}`);
+    if (action === 'desktop_monitor') {
+      this.openDesktopMonitor(source);
+      return;
+    }
     if (action === 'usage') {
       this.openAccountUsagePanel(source);
+      return;
+    }
+    if (action === 'outbox') {
+      this.openOutboxPanel(source);
       return;
     }
     if (action === 'new_session') {
@@ -5866,6 +7514,157 @@ struct Index {
     if (action === 'hard_restart') {
       this.confirmHardRestartCodexFromPhone(`home_action_${source}`);
     }
+  }
+
+  private openDesktopMonitor(source: string): void {
+    this.accountUsagePanelVisible = false;
+    this.outboxPanelVisible = false;
+    this.reasoningEffortMenuVisible = false;
+    this.composerActionMenuExpanded = false;
+    this.desktopMonitorVisible = true;
+    this.startDesktopMonitorRefresh();
+    void this.syncDesktopMonitorDisplay(`open_${source}`);
+    this.refreshDesktopMonitor(`open_${source}`);
+    this.log('info', 'desktop_monitor.opened', `source=${source}`);
+  }
+
+  private closeDesktopMonitor(source: string): void {
+    this.desktopMonitorVisible = false;
+    this.desktopMonitorKeepScreenOn = false;
+    this.stopDesktopMonitorRefresh();
+    void this.suspendDesktopMonitorDisplay(`close_${source}`);
+    this.log('info', 'desktop_monitor.closed', `source=${source}`);
+  }
+
+  private startDesktopMonitorRefresh(): void {
+    this.stopDesktopMonitorRefresh();
+    if (!this.desktopMonitorVisible || !this.appForeground) {
+      return;
+    }
+    this.desktopMonitorTimer = setInterval(() => {
+      void this.refreshDesktopMonitorCycle('timer');
+    }, 10_000);
+  }
+
+  private stopDesktopMonitorRefresh(): void {
+    if (this.desktopMonitorTimer >= 0) {
+      clearInterval(this.desktopMonitorTimer);
+      this.desktopMonitorTimer = -1;
+    }
+  }
+
+  private refreshDesktopMonitor(source: string): void {
+    void this.refreshDesktopMonitorCycle(source);
+  }
+
+  private async refreshDesktopMonitorCycle(source: string): Promise<void> {
+    if (!this.desktopMonitorVisible) {
+      return;
+    }
+    const now = Date.now();
+    if (this.accountUsage === null || now - this.lastDesktopMonitorUsageRefreshAt >= 60_000) {
+      await this.loadCodexAccountUsage(`desktop_monitor_${source}`);
+    }
+    await this.refreshDashboard(true);
+    await this.publishStandbyMonitorSnapshot(`desktop_monitor_${source}`, true);
+    await this.syncDesktopMonitorDisplay(`refresh_${source}`);
+  }
+
+  private async syncDesktopMonitorDisplay(source: string): Promise<void> {
+    if (!this.desktopMonitorVisible || !this.appForeground) {
+      return;
+    }
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const state: DesktopMonitorDisplayState =
+        await DesktopMonitorDisplayService.enter(context);
+      this.desktopMonitorCharging = state.charging;
+      this.desktopMonitorKeepScreenOn = state.keepScreenOn;
+      this.desktopMonitorBatteryPercent = state.batteryPercent;
+      this.log(
+        'info',
+        'desktop_monitor.display.ready',
+        `source=${source}; charging=${state.charging}; keepScreenOn=${state.keepScreenOn}; battery=${state.batteryPercent}; brightness=system`
+      );
+    } catch (error) {
+      this.desktopMonitorKeepScreenOn = false;
+      this.log(
+        'warn',
+        'desktop_monitor.display.failed',
+        `source=${source}; message=${this.errorText(error)}`
+      );
+    }
+  }
+
+  private async suspendDesktopMonitorDisplay(source: string): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      await DesktopMonitorDisplayService.leave(context);
+      this.desktopMonitorKeepScreenOn = false;
+      this.log('info', 'desktop_monitor.display.suspended', `source=${source}`);
+    } catch (error) {
+      this.log(
+        'warn',
+        'desktop_monitor.display.suspend_failed',
+        `source=${source}; message=${this.errorText(error)}`
+      );
+    }
+  }
+
+  private usesDarkTheme(): boolean {
+    const mode = normalizeThemeMode(this.themeMode);
+    if (mode === 'light') {
+      return false;
+    }
+    if (mode === 'system') {
+      return this.systemDarkMode;
+    }
+    return true;
+  }
+
+  private theme(): AppThemeTokens {
+    return appThemeTokens(this.usesDarkTheme());
+  }
+
+  private themeColor(lightColor: string): string {
+    return resolveThemeColor(lightColor, this.usesDarkTheme());
+  }
+
+  private scaledFontSize(size: number): number {
+    return scaleFontSize(size, this.fontScaleMode);
+  }
+
+  private scaledLineHeight(size: number): number {
+    return scaleFontSize(size, this.fontScaleMode);
+  }
+
+  private applyThemeMode(): void {
+    const context = getContext(this) as common.UIAbilityContext;
+    let colorMode: ConfigurationConstant.ColorMode = ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    if (this.themeMode === 'light') {
+      colorMode = ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT;
+    } else if (this.themeMode === 'system') {
+      colorMode = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
+    }
+    context.setColorMode(colorMode);
+    this.log('info', 'ui.theme.apply', `mode=${this.themeMode}; dark=${this.usesDarkTheme()}`);
+  }
+
+  private changeThemeMode(mode: string): void {
+    this.themeMode = normalizeThemeMode(mode);
+    this.applyThemeMode();
+    this.themeModeChooserVisible = false;
+    this.homeActionMenuVisible = false;
+    this.homeActionMenuSource = '';
+    this.homeActionMenuOpenedAt = 0;
+    this.message = `已切换为${themeModeLabel(this.themeMode)}主题`;
+    this.log('info', 'ui.theme.changed', `mode=${this.themeMode}`);
+  }
+
+  private changeFontScaleMode(mode: string): void {
+    this.fontScaleMode = normalizeFontScaleMode(mode);
+    this.message = `字体大小：${fontScaleLabel(this.fontScaleMode)} · ${fontScalePercent(this.fontScaleMode)}%`;
+    this.log('info', 'ui.font_scale.changed', `mode=${this.fontScaleMode}; percent=${fontScalePercent(this.fontScaleMode)}`);
   }
 
   private openAccountUsagePanel(source: string): void {
@@ -5895,6 +7694,8 @@ struct Index {
     try {
       const usage = await BridgeClient.getCodexAccountUsage(this.normalizedBridgeUrl(), this.bridgeToken);
       this.accountUsage = usage;
+      this.lastDesktopMonitorUsageRefreshAt = Date.now();
+      void this.publishStandbyMonitorSnapshot(`usage_${source}`, true);
       if (usage.ok) {
         this.message = 'Codex 账号用量已刷新';
       } else {
@@ -5909,6 +7710,91 @@ struct Index {
     } finally {
       this.isLoadingAccountUsage = false;
     }
+  }
+
+  private openOutboxPanel(source: string): void {
+    this.outboxPanelVisible = true;
+    this.log('info', 'outbox.panel.open', `source=${source}`);
+    void this.loadOutbox();
+  }
+
+  private async loadOutbox(): Promise<void> {
+    if (this.isLoadingOutbox) {
+      return;
+    }
+    this.isLoadingOutbox = true;
+    try {
+      const threadId = this.selectedSession?.id ?? '';
+      this.outboxItems = await BridgeClient.listOutbox(this.normalizedBridgeUrl(), threadId, this.bridgeToken);
+      const drafts: Record<string, string> = {};
+      this.outboxItems.forEach((item: BridgeOutboxItem) => {
+        drafts[item.id] = item.text;
+      });
+      this.outboxDrafts = drafts;
+      this.log('info', 'outbox.loaded', `threadId=${threadId}; count=${this.outboxItems.length}`);
+    } catch (error) {
+      this.message = `发送队列读取失败：${this.errorText(error)}`;
+      this.log('error', 'outbox.load.failed', this.errorText(error));
+    } finally {
+      this.isLoadingOutbox = false;
+    }
+  }
+
+  private outboxDraft(item: BridgeOutboxItem): string {
+    return this.outboxDrafts[item.id] ?? item.text;
+  }
+
+  private setOutboxDraft(itemId: string, value: string): void {
+    const next: Record<string, string> = {};
+    Object.keys(this.outboxDrafts).forEach((key: string) => {
+      next[key] = this.outboxDrafts[key];
+    });
+    next[itemId] = value;
+    this.outboxDrafts = next;
+  }
+
+  private async saveOutboxItem(item: BridgeOutboxItem): Promise<void> {
+    try {
+      await BridgeClient.updateOutboxItem(this.normalizedBridgeUrl(), item.id, this.outboxDraft(item).trim(), this.bridgeToken);
+      await this.loadOutbox();
+    } catch (error) {
+      this.message = `队列保存失败：${this.errorText(error)}`;
+    }
+  }
+
+  private async moveOutboxItem(item: BridgeOutboxItem, direction: string): Promise<void> {
+    try {
+      await BridgeClient.moveOutboxItem(this.normalizedBridgeUrl(), item.id, direction, this.bridgeToken);
+      await this.loadOutbox();
+    } catch (error) {
+      this.message = `队列排序失败：${this.errorText(error)}`;
+    }
+  }
+
+  private async cancelOutboxItem(item: BridgeOutboxItem): Promise<void> {
+    try {
+      await BridgeClient.cancelOutboxItem(this.normalizedBridgeUrl(), item.id, this.bridgeToken);
+      await this.loadOutbox();
+    } catch (error) {
+      this.message = `取消失败：${this.errorText(error)}`;
+    }
+  }
+
+  private async retryOutboxItem(item: BridgeOutboxItem): Promise<void> {
+    try {
+      await BridgeClient.retryOutboxItem(this.normalizedBridgeUrl(), item.id, this.bridgeToken);
+      await this.loadOutbox();
+    } catch (error) {
+      this.message = `重试失败：${this.errorText(error)}`;
+    }
+  }
+
+  private outboxStatusLabel(status: string): string {
+    if (status === 'queued') return '待发送';
+    if (status === 'dispatching') return '发送中';
+    if (status === 'failed') return '失败';
+    if (status === 'uncertain') return '待核对';
+    return status;
   }
 
   private accountUsageSubtitle(): string {
@@ -5990,7 +7876,20 @@ struct Index {
     this.systemLinkSeverity = link.severity ?? '';
     this.systemLinkRecoverableFromPhone = link.recoverableFromPhone !== false;
     this.lastSystemLinkRefreshAt = Date.now();
-    if (link.desktop) {
+    if (link.executionMode === 'app_server' || link.desktopRequired === false) {
+      this.desktopLiveState = 'not_required';
+      this.desktopLiveMessage = 'App Server 主链路已就绪，无需桌面 CDP';
+      this.desktopLiveReason = '';
+      this.desktopLiveCurrentSessionId = '';
+      this.desktopLiveTargetSessionId = targetSessionId;
+      this.desktopLiveSessionVerified = false;
+      this.desktopLiveRequiresDesktopCdp = false;
+      this.desktopLiveMobileRecoverable = true;
+      this.desktopLiveFailureClass = '';
+      this.desktopLiveRecoveryHint = '';
+      this.desktopLiveProcessMode = '';
+      this.desktopLiveCdpPort = 0;
+    } else if (link.desktop) {
       this.applyDesktopLiveStatus(link.desktop, targetSessionId);
     }
     this.applyRelayStatusFromSystemLink(link);
@@ -6093,13 +7992,35 @@ struct Index {
       || this.desktopLiveProcessMode === 'missing';
   }
 
+  private async requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean> {
+    try {
+      const runtime: BridgeRuntimeStatus = await BridgeClient.getRuntimeStatus(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId);
+      const requiresDesktop = runtime.existingThreadExecution !== 'app_server';
+      if (!requiresDesktop) {
+        this.applyAppServerPrimaryStatus(targetSessionId, source, runtime.existingThreadExecution);
+      }
+      this.log('info', 'runtime.send.contract', `source=${source}; sessionId=${targetSessionId}; mode=${runtime.mode}; execution=${runtime.existingThreadExecution}; appServerState=${runtime.appServer?.state ?? ''}; requiresDesktop=${requiresDesktop}`);
+      return requiresDesktop;
+    } catch (error) {
+      const message = this.errorText(error);
+      if (message.indexOf('Bridge 协议不兼容') >= 0) {
+        this.message = message;
+        this.log('error', 'runtime.send.contract.incompatible', `source=${source}; sessionId=${targetSessionId}; message=${message}`);
+        throw new Error(message);
+      }
+      this.log('warn', 'runtime.send.contract.fallback_desktop', `source=${source}; sessionId=${targetSessionId}; message=${message}`);
+      return true;
+    }
+  }
+
   private async ensureDesktopLiveReadyForSend(targetSessionId: string, source: string): Promise<boolean> {
     this.message = '正在检查并恢复桌面链路';
     try {
       const status: DesktopLiveStatus = await BridgeClient.getDesktopLiveStatus(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, true);
       this.applyDesktopLiveStatus(status, targetSessionId);
-      this.log(status.desktopLive && status.sessionVerified ? 'info' : 'warn', 'desktop.live.preflight', `source=${source}; state=${this.desktopLiveState}; verified=${this.desktopLiveSessionVerified}; recoveryAttempted=${status.recoveryAttempted === true}; recoveryOk=${status.recoveryOk === true}; mobileRecoverable=${this.desktopLiveMobileRecoverable}; failureClass=${this.desktopLiveFailureClass}; processMode=${this.desktopLiveProcessMode}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}`);
-      if (status.desktopLive === true && status.sessionVerified === true) {
+      const targetReady = status.sessionVerified === true || status.targetVerified === true;
+      this.log(status.desktopLive && targetReady ? 'info' : 'warn', 'desktop.live.preflight', `source=${source}; state=${this.desktopLiveState}; visibleSessionVerified=${status.sessionVerified === true}; targetVerified=${status.targetVerified === true}; sendReady=${this.desktopLiveSessionVerified}; recoveryAttempted=${status.recoveryAttempted === true}; recoveryOk=${status.recoveryOk === true}; mobileRecoverable=${this.desktopLiveMobileRecoverable}; failureClass=${this.desktopLiveFailureClass}; processMode=${this.desktopLiveProcessMode}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}`);
+      if (status.desktopLive === true && targetReady) {
         return true;
       }
       this.message = this.desktopLiveBlockedText();
@@ -6129,13 +8050,51 @@ struct Index {
     this.desktopLiveReason = status.reason ?? status.recoveryError ?? '';
     this.desktopLiveCurrentSessionId = status.currentSessionId ?? '';
     this.desktopLiveTargetSessionId = status.targetSessionId ?? targetSessionId;
-    this.desktopLiveSessionVerified = status.sessionVerified === true;
+    this.desktopLiveSessionVerified = status.sessionVerified === true || status.targetVerified === true;
     this.desktopLiveRequiresDesktopCdp = status.requiresDesktopCdp === true;
     this.desktopLiveMobileRecoverable = status.mobileRecoverable !== false;
     this.desktopLiveFailureClass = status.failureClass ?? '';
     this.desktopLiveRecoveryHint = status.recoveryHint ?? '';
     this.desktopLiveProcessMode = status.desktopProcessMode ?? '';
     this.desktopLiveCdpPort = status.cdpPort ?? 0;
+  }
+
+  private applyTaskExecutionContract(task: BridgeTask, targetSessionId: string, source: string): void {
+    if (this.taskUsesAppServer(task)) {
+      this.applyAppServerPrimaryStatus(targetSessionId, source, 'app_server');
+      return;
+    }
+    const sync = task.desktopSync;
+    if (sync && sync.desktopLive === true) {
+      this.desktopLiveState = sync.sessionVerified === false && sync.targetVerified !== true ? 'ready' : 'verified';
+      this.desktopLiveMessage = sync.message ?? '桌面实时通道已连接';
+      this.desktopLiveReason = '';
+      this.desktopLiveCurrentSessionId = sync.currentSessionId ?? targetSessionId;
+      this.desktopLiveTargetSessionId = sync.targetSessionId ?? targetSessionId;
+      this.desktopLiveSessionVerified = sync.sessionVerified !== false || sync.targetVerified === true;
+      this.desktopLiveRequiresDesktopCdp = false;
+      this.desktopLiveMobileRecoverable = true;
+      this.desktopLiveFailureClass = '';
+      this.desktopLiveRecoveryHint = '';
+      this.desktopLiveProcessMode = sync.mode ?? this.desktopLiveProcessMode;
+      this.log('info', 'desktop.live.task_contract_applied', `source=${source}; taskId=${task.id}; sessionId=${targetSessionId}; status=${sync.status}; verified=${this.desktopLiveSessionVerified}`);
+    }
+  }
+
+  private applyAppServerPrimaryStatus(targetSessionId: string, source: string, execution: string): void {
+    this.desktopLiveState = 'not_required';
+    this.desktopLiveMessage = 'App Server 主链路已就绪，无需桌面 CDP';
+    this.desktopLiveReason = '';
+    this.desktopLiveCurrentSessionId = targetSessionId;
+    this.desktopLiveTargetSessionId = targetSessionId;
+    this.desktopLiveSessionVerified = false;
+    this.desktopLiveRequiresDesktopCdp = false;
+    this.desktopLiveMobileRecoverable = true;
+    this.desktopLiveFailureClass = '';
+    this.desktopLiveRecoveryHint = '';
+    this.desktopLiveProcessMode = execution;
+    this.desktopLiveCdpPort = 0;
+    this.log('info', 'desktop.live.not_required', `source=${source}; execution=${execution}; sessionId=${targetSessionId}`);
   }
 
   private async syncDesktopAndRefresh(source: string): Promise<void> {
@@ -6147,10 +8106,13 @@ struct Index {
   }
 
   private async openDesktopSelectedSession(source: string): Promise<void> {
-    if (this.selectedSession === null) {
+    if (this.selectedSession === null || this.isOpeningDesktopSession) {
       return;
     }
     const sessionId = this.selectedSession.id;
+    this.isOpeningDesktopSession = true;
+    this.message = '正在请求桌面打开当前会话';
+    this.log('info', 'desktop.session.open.requested', `source=${source}; sessionId=${sessionId}`);
     try {
       await BridgeClient.openDesktopSession(this.normalizedBridgeUrl(), sessionId, this.bridgeToken);
       this.message = '已请求桌面 Codex 切到当前会话';
@@ -6158,6 +8120,8 @@ struct Index {
     } catch (error) {
       this.message = `桌面会话同步失败：${this.errorText(error)}`;
       this.log('error', 'desktop.session.open.failed', `source=${source}; sessionId=${sessionId}; message=${this.errorText(error)}`);
+    } finally {
+      this.isOpeningDesktopSession = false;
     }
   }
 
@@ -6201,11 +8165,6 @@ struct Index {
     if (this.isUploadingImage || this.isBusy) {
       return false;
     }
-    if (!this.isNewSessionDraft
-      && this.selectedSession !== null
-      && this.hasBridgeRunningTaskForSession(this.selectedSession.id)) {
-      return false;
-    }
     if (!this.isNewSessionDraft && this.selectedSession === null) {
       return false;
     }
@@ -6216,6 +8175,10 @@ struct Index {
       return true;
     }
     return true;
+  }
+
+  private canPickSessionFile(): boolean {
+    return !this.isPickingFile && this.canPickSessionImage();
   }
 
   private canOpenComposerActionMenu(): boolean {
@@ -6230,6 +8193,58 @@ struct Index {
     }
     this.lastComposerActionToggleAt = now;
     return false;
+  }
+
+  private adaptiveImagePreviewWidth(): string {
+    return this.isLandscapeSessionLayout() ? '88%' : '92%';
+  }
+
+  private adaptiveImagePreviewHeight(): string {
+    return this.isLandscapeSessionLayout() ? '90%' : '75%';
+  }
+
+  private adaptiveImagePreviewRotateButtonX(): string {
+    return this.isLandscapeSessionLayout() ? '89%' : '78%';
+  }
+
+  private adaptiveImagePreviewCloseButtonX(): string {
+    return this.isLandscapeSessionLayout() ? '94%' : '86%';
+  }
+
+  private openImagePreview(imageUrl: string, source: string): void {
+    this.resetDesktopScreenshotPreviewTransform();
+    this.adaptiveImagePreviewLandscape = this.isLandscapeSessionLayout();
+    this.previewImageUrl = imageUrl;
+    this.log('info', 'ui.image.preview.open', `source=${source}; landscape=${this.adaptiveImagePreviewLandscape}`);
+  }
+
+  private closeImagePreview(source: string): void {
+    this.previewImageUrl = '';
+    this.resetDesktopScreenshotPreviewTransform();
+    this.log('info', 'ui.image.preview.close', `source=${source}`);
+  }
+
+  private hasOpenImagePreview(): boolean {
+    return this.previewImageUrl.length > 0 || this.desktopScreenshotPreviewUrl.length > 0;
+  }
+
+  private closeOpenImagePreview(source: string): void {
+    if (this.desktopScreenshotPreviewUrl.length > 0) {
+      this.closeDesktopScreenshotPreview(source);
+      return;
+    }
+    this.closeImagePreview(source);
+  }
+
+  private handleAdaptiveImagePreviewAreaChange(): void {
+    const landscape = this.isLandscapeSessionLayout();
+    if (landscape === this.adaptiveImagePreviewLandscape) {
+      return;
+    }
+    this.adaptiveImagePreviewLandscape = landscape;
+    this.desktopScreenshotOffsetX = 0;
+    this.desktopScreenshotOffsetY = 0;
+    this.log('info', 'image.preview.orientation_changed', `landscape=${landscape}; scale=${this.desktopScreenshotScale}; rotation=${this.desktopScreenshotRotation}`);
   }
 
   private canCaptureDesktopScreenshot(): boolean {
@@ -6261,10 +8276,10 @@ struct Index {
         throw new Error('桌面截图为空');
       }
       this.desktopScreenshotPreviewUrl = this.desktopScreenshotDataUri(image);
+      this.adaptiveImagePreviewLandscape = this.isLandscapeSessionLayout();
       const sizeText = image.width && image.height ? `${image.width}x${image.height}` : '主显示器';
       this.desktopScreenshotMetaText = `桌面截图 ${sizeText}，${image.bytes} 字节`;
       this.message = '已获取桌面截图';
-      this.startDesktopScreenshotAutoRotation();
       this.log('info', 'desktop.screenshot.preview.open', `bytes=${image.bytes}; width=${image.width ?? 0}; height=${image.height ?? 0}; durationMs=${Date.now() - startedAt}`);
     } catch (error) {
       this.message = `获取桌面截图失败：${this.errorText(error)}`;
@@ -6275,7 +8290,6 @@ struct Index {
   }
 
   private closeDesktopScreenshotPreview(source: string): void {
-    this.stopDesktopScreenshotAutoRotation();
     this.desktopScreenshotPreviewUrl = '';
     this.desktopScreenshotMetaText = '';
     this.resetDesktopScreenshotPreviewTransform();
@@ -6296,66 +8310,6 @@ struct Index {
     const nextRotation = (this.desktopScreenshotRotation + delta) % 360;
     this.desktopScreenshotRotation = nextRotation < 0 ? nextRotation + 360 : nextRotation;
     this.log('info', 'desktop.screenshot.preview.rotate', `rotation=${this.desktopScreenshotRotation}`);
-  }
-
-  private startDesktopScreenshotAutoRotation(): void {
-    if (this.desktopScreenshotSensorActive) {
-      return;
-    }
-    try {
-      sensor.on(sensor.SensorId.ACCELEROMETER, this.desktopScreenshotAccelerometerCallback, { interval: 'ui' });
-      this.desktopScreenshotSensorActive = true;
-      this.desktopScreenshotLastAutoRotationAt = 0;
-      this.log('info', 'desktop.screenshot.preview.sensor.start', 'accelerometer=on');
-    } catch (error) {
-      this.log('warn', 'desktop.screenshot.preview.sensor.failed', this.errorText(error));
-    }
-  }
-
-  private stopDesktopScreenshotAutoRotation(): void {
-    if (!this.desktopScreenshotSensorActive) {
-      return;
-    }
-    try {
-      sensor.off(sensor.SensorId.ACCELEROMETER, this.desktopScreenshotAccelerometerCallback);
-      this.log('info', 'desktop.screenshot.preview.sensor.stop', 'accelerometer=off');
-    } catch (error) {
-      this.log('warn', 'desktop.screenshot.preview.sensor.stop_failed', this.errorText(error));
-    } finally {
-      this.desktopScreenshotSensorActive = false;
-    }
-  }
-
-  private handleDesktopScreenshotAccelerometer(x: number, y: number, z: number): void {
-    if (this.desktopScreenshotPreviewUrl.length === 0) {
-      return;
-    }
-    const now = Date.now();
-    if (now - this.desktopScreenshotLastAutoRotationAt < 700) {
-      return;
-    }
-    const absX = Math.abs(x);
-    const absY = Math.abs(y);
-    const absZ = Math.abs(z);
-    if (absZ > 8 || (absX < 5.8 && absY < 5.8)) {
-      return;
-    }
-
-    let targetRotation = this.desktopScreenshotRotation;
-    if (absY >= absX) {
-      targetRotation = y < -5.8 ? 180 : 0;
-    } else {
-      targetRotation = x > 5.8 ? 90 : 270;
-    }
-    if (targetRotation === this.desktopScreenshotRotation) {
-      return;
-    }
-
-    this.desktopScreenshotRotation = targetRotation;
-    this.desktopScreenshotOffsetX = 0;
-    this.desktopScreenshotOffsetY = 0;
-    this.desktopScreenshotLastAutoRotationAt = now;
-    this.log('info', 'desktop.screenshot.preview.auto_rotate', `rotation=${targetRotation}; x=${x.toFixed(2)}; y=${y.toFixed(2)}; z=${z.toFixed(2)}`);
   }
 
   private resetDesktopScreenshotPreviewTransform(): void {
@@ -6395,7 +8349,9 @@ struct Index {
   }
 
   private hasSessionDraftContent(): boolean {
-    return this.sessionMessage.trim().length > 1 || this.pendingSessionImages.length > 0;
+    return this.sessionMessage.trim().length > 1
+      || this.pendingSessionImages.length > 0
+      || this.pendingSessionFiles.length > 0;
   }
 
   private isSendingCurrentSessionMessage(): boolean {
@@ -6657,10 +8613,8 @@ struct Index {
 
   private async requestNotificationPermission(): Promise<void> {
     try {
-      const enabled = await notificationManager.isNotificationEnabled();
-      if (!enabled) {
-        await notificationManager.requestEnableNotification();
-      }
+      const enabled = await AppNotificationService.requestPermission();
+      await AppNotificationService.syncBadgeNumber(this.unreadCompletedSessionIds.length);
       this.log('info', 'notification.permission.ready', `enabled=${enabled}`);
     } catch (error) {
       this.log('warn', 'notification.permission.failed', this.errorText(error));
@@ -6708,34 +8662,90 @@ struct Index {
   }
 
   private async publishBasicCompletionNotification(sessionId: string, title: string, failed: boolean, previousStatus: string, source: string): Promise<void> {
-    const safeTitle = title.length > 0 ? title : 'Codex 会话';
     try {
-      const agent = await wantAgent.getWantAgent({
-        wants: [{
-          bundleName: 'com.codex.remote.app',
-          abilityName: 'EntryAbility'
-        }],
-        actionType: wantAgent.OperationType.START_ABILITY,
-        requestCode: this.notificationRequestCode,
-        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      });
-      this.notificationRequestCode += 1;
-      await notificationManager.publish({
-        id: this.notificationRequestCode,
-        wantAgent: agent,
-        content: {
-          notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
-          normal: {
-            title: failed ? 'Codex 回答失败' : 'Codex 已完成回答',
-            text: `${safeTitle} ${failed ? '需要查看错误' : '已有新回复'}`,
-            additionalText: '点击打开会话'
-          }
-        }
-      });
-      this.log('info', 'notification.session.completed', `sessionId=${sessionId}; failed=${failed}; previous=${previousStatus}; source=${source}; title=${safeTitle}`);
+      await AppNotificationService.publish({
+        type: failed ? 'failed' : 'completed',
+        sessionId,
+        eventId: ''
+      }, this.unreadCompletedSessionIds.length);
+      this.log('info', 'notification.session.completed', `sessionId=${sessionId}; failed=${failed}; previous=${previousStatus}; source=${source}; privacy=generic`);
     } catch (error) {
       this.log('error', 'notification.session.failed', `sessionId=${sessionId}; source=${source}; message=${this.errorText(error)}`);
     }
+  }
+
+  private async publishTaskAttentionNotification(task: BridgeTask, previousStatus: string): Promise<void> {
+    if (task.status !== 'waiting_approval' && task.status !== 'waiting_input') {
+      return;
+    }
+    const sessionId = this.taskSessionId(task);
+    const requestId = task.status === 'waiting_input'
+      ? (task.pendingUserInput?.id ?? task.id)
+      : (this.pendingApprovalId() || task.id);
+    const type = task.status === 'waiting_input' ? 'user_input_required' : 'approval_required';
+    const key = `${type}:${sessionId}:${requestId}`;
+    if (this.notifiedAttentionKeys.indexOf(key) >= 0) {
+      return;
+    }
+    this.notifiedAttentionKeys = [...this.notifiedAttentionKeys, key].slice(-100);
+    try {
+      await AppNotificationService.publish(
+        { type, sessionId, eventId: requestId },
+        this.unreadCompletedSessionIds.length
+      );
+      this.log('info', 'notification.attention.published', `type=${type}; sessionId=${sessionId}; eventId=${requestId}; previous=${previousStatus}`);
+    } catch (error) {
+      this.log('warn', 'notification.attention.failed', `type=${type}; sessionId=${sessionId}; message=${this.errorText(error)}`);
+    }
+  }
+
+  private async publishConnectionNotification(): Promise<void> {
+    if (Date.now() - this.lastConnectionNotificationAt < 300000) {
+      return;
+    }
+    this.lastConnectionNotificationAt = Date.now();
+    try {
+      await AppNotificationService.publish({
+        type: 'connection_error',
+        sessionId: this.selectedSession?.id ?? '',
+        eventId: ''
+      }, this.unreadCompletedSessionIds.length);
+      this.log('warn', 'notification.connection.published', 'privacy=generic');
+    } catch (error) {
+      this.log('warn', 'notification.connection.failed', this.errorText(error));
+    }
+  }
+
+  private async applyPendingNotificationNavigation(): Promise<void> {
+    const revision = this.notificationTargetRevision.trim();
+    const sessionId = this.notificationTargetSessionId.trim();
+    if (revision.length === 0 || revision === this.lastHandledNotificationRevision || sessionId.length === 0) {
+      return;
+    }
+    const target = this.sessions.find((session: CodexSessionSummary) => session.id === sessionId);
+    if (!target) {
+      return;
+    }
+    this.lastHandledNotificationRevision = revision;
+    this.activeTab = 'sessions';
+    this.showTaskEventDetails = this.notificationTargetEventId.trim().length > 0;
+    await this.openSession(target);
+    this.scrollSessionToBottomIfFollowing(80, 'notification_deep_link');
+    this.log('info', 'notification.deep_link.opened', `sessionId=${sessionId}; type=${this.notificationTargetEventType}; eventId=${this.notificationTargetEventId}`);
+    this.notificationTargetSessionId = '';
+    this.notificationTargetEventType = '';
+    this.notificationTargetEventId = '';
+  }
+
+  private syncNotificationBadge(source: string): void {
+    void AppNotificationService.syncBadgeNumber(this.unreadCompletedSessionIds.length)
+      .catch((error: Error) => {
+        this.log(
+          'warn',
+          'notification.badge.sync_failed',
+          `source=${source}; unread=${this.unreadCompletedSessionIds.length}; message=${this.errorText(error)}`
+        );
+      });
   }
 
   private async startRelayBackgroundRunning(): Promise<void> {
@@ -6771,15 +8781,332 @@ struct Index {
 
   private relaySummaryColor(): string {
     if (this.relayStateText === '转发中' || this.relayStateText === '已配对') {
-      return '#137333';
+      return this.themeColor('#137333');
     }
     if (this.relayStateText === '错误') {
-      return '#B42318';
+      return this.themeColor('#B42318');
     }
     if (this.relayStateText === '等待电脑' || this.relayStateText === '连接中' || this.relayStateText === '重连中') {
-      return '#A15C00';
+      return this.themeColor('#A15C00');
     }
-    return '#68717D';
+    return this.themeColor('#68717D');
+  }
+
+  private async copySessionText(entry: CodexSessionEntry): Promise<void> {
+    const text = this.sessionEntryVisibleText(entry);
+    try {
+      await ContentActionService.copyText(text);
+      this.message = '文本已复制';
+      this.log('info', 'session.content.text_copied', `length=${text.length}`);
+    } catch (error) {
+      this.message = `复制文本失败：${this.errorText(error)}`;
+      this.log('error', 'session.content.text_copy_failed', `message=${this.errorText(error)}`);
+    }
+  }
+
+  private async copySessionPresentationText(text: string, label: string): Promise<void> {
+    try {
+      await ContentActionService.copyText(text);
+      this.message = `${label}已复制`;
+      this.log('info', 'session.presentation.text_copied', `label=${label}; length=${text.length}`);
+    } catch (error) {
+      this.message = `复制${label}失败：${this.errorText(error)}`;
+      this.log('error', 'session.presentation.text_copy_failed', `label=${label}; message=${this.errorText(error)}`);
+    }
+  }
+
+  private async shareSessionText(entry: CodexSessionEntry): Promise<void> {
+    const text = this.sessionEntryVisibleText(entry);
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      await ContentActionService.shareText(context, text, this.selectedSession?.title ?? 'Codex 消息');
+      this.message = '已打开系统分享';
+      this.log('info', 'session.content.text_shared', `length=${text.length}`);
+    } catch (error) {
+      this.message = `分享文本失败：${this.errorText(error)}`;
+      this.log('error', 'session.content.text_share_failed', `message=${this.errorText(error)}`);
+    }
+  }
+
+  private async copySessionImage(imageUrl: string): Promise<void> {
+    try {
+      await ContentActionService.copyImage(imageUrl, this.bridgeToken);
+      this.message = '图片已复制';
+      this.log('info', 'session.content.image_copied', `url=${imageUrl}`);
+    } catch (error) {
+      this.message = `复制图片失败：${this.errorText(error)}`;
+      this.log('error', 'session.content.image_copy_failed', `url=${imageUrl}; message=${this.errorText(error)}`);
+    }
+  }
+
+  private async shareSessionImage(imageUrl: string): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      await ContentActionService.shareImage(
+        context,
+        imageUrl,
+        this.bridgeToken,
+        this.selectedSession?.title ?? 'Codex 图片'
+      );
+      this.message = '已打开系统分享';
+      this.log('info', 'session.content.image_shared', `url=${imageUrl}`);
+    } catch (error) {
+      this.message = `分享图片失败：${this.errorText(error)}`;
+      this.log('error', 'session.content.image_share_failed', `url=${imageUrl}; message=${this.errorText(error)}`);
+    }
+  }
+
+  private async openSessionMarkdownLink(href: string): Promise<void> {
+    const remotePath = String(href ?? '').trim();
+    const sessionId = this.selectedSession?.id ?? '';
+    if (this.remoteFileActionBusy) {
+      this.message = '正在处理另一个电脑端文件';
+      return;
+    }
+    if (sessionId.length === 0) {
+      this.message = '请先打开文件所在的会话';
+      return;
+    }
+    if (!this.isDesktopFileLink(remotePath)) {
+      this.message = '当前只支持下载会话中的电脑端本地文件';
+      this.log('warn', 'session.remote_file.unsupported_link', `scheme=${this.linkScheme(remotePath)}`);
+      return;
+    }
+
+    this.remoteFileActionBusy = true;
+    this.message = '正在读取电脑端文件信息';
+    try {
+      const file = await BridgeClient.getRemoteSessionFileMetadata(
+        this.normalizedBridgeUrl(),
+        sessionId,
+        remotePath,
+        this.bridgeToken
+      );
+      this.confirmRemoteFileDownload(file, remotePath, sessionId);
+      this.message = '';
+    } catch (error) {
+      const detail = this.errorText(error);
+      this.message = `无法下载文件：${detail}`;
+      this.showRemoteFileError('无法下载文件', detail);
+      this.log('error', 'session.remote_file.metadata_failed', `message=${detail}`);
+    } finally {
+      this.remoteFileActionBusy = false;
+    }
+  }
+
+  private showRemoteFileError(title: string, detail: string): void {
+    AlertDialog.show({
+      title,
+      message: detail,
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      primaryButton: {
+        value: '知道了',
+        action: () => {}
+      }
+    });
+  }
+
+  private confirmRemoteFileDownload(file: RemoteSessionFile, remotePath: string, sessionId: string): void {
+    const markdownFile = MarkdownDocumentService.isMarkdownFile(file);
+    AlertDialog.show({
+      title: '下载电脑端文件？',
+      message: markdownFile
+        ? `文件：${file.fileName}\n大小：${this.formatAttachmentBytes(file.bytes)}\n来源：当前 Codex 会话\n\n确认后将下载到手机，并在应用内 Markdown 阅读器中打开。远程图片不会自动加载。`
+        : `文件：${file.fileName}\n大小：${this.formatAttachmentBytes(file.bytes)}\n来源：当前 Codex 会话\n\n确认后将下载到手机，并打开支持该格式的应用。`,
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          this.log('info', 'session.remote_file.cancelled', `fileName=${file.fileName}`);
+        }
+      },
+      secondaryButton: {
+        value: '下载并打开',
+        action: () => {
+          void this.downloadAndOpenRemoteFile(file, remotePath, sessionId);
+        }
+      }
+    });
+  }
+
+  private async downloadAndOpenRemoteFile(
+    file: RemoteSessionFile,
+    remotePath: string,
+    sessionId: string
+  ): Promise<void> {
+    if (this.remoteFileActionBusy) {
+      this.message = '正在处理另一个电脑端文件';
+      return;
+    }
+    this.remoteFileActionBusy = true;
+    this.message = `正在下载 ${file.fileName}`;
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      const downloadUrl = BridgeClient.remoteSessionFileDownloadUrl(
+        this.normalizedBridgeUrl(),
+        sessionId,
+        remotePath
+      );
+      const downloaded = await ContentActionService.downloadRemoteFile(
+        context,
+        downloadUrl,
+        this.bridgeToken,
+        file
+      );
+      this.log('info', 'session.remote_file.downloaded', `fileName=${file.fileName}; bytes=${downloaded.bytes}`);
+      this.message = `${file.fileName} 已下载到手机`;
+      if (MarkdownDocumentService.isMarkdownFile(downloaded)) {
+        try {
+          const document = MarkdownDocumentService.readDownloadedMarkdown(downloaded);
+          document.sourceRemotePath = remotePath;
+          document.sourceSessionId = sessionId;
+          this.markdownReaderDocument = document;
+          this.message = `${file.fileName} 已在 Markdown 阅读器中打开`;
+          this.log(
+            'info',
+            'session.remote_file.markdown_opened',
+            `fileName=${file.fileName}; bytes=${downloaded.bytes}; headings=${document.outline.length}`
+          );
+          return;
+        } catch (error) {
+          this.log(
+            'warn',
+            'session.remote_file.markdown_open_failed',
+            `fileName=${file.fileName}; message=${this.errorText(error)}`
+          );
+          this.message = `${file.fileName} 已下载，应用内阅读失败，正在尝试其他应用`;
+        }
+      }
+      try {
+        await ContentActionService.openRemoteFile(context, downloaded);
+        this.message = `${file.fileName} 已下载并打开`;
+        this.log('info', 'session.remote_file.opened', `fileName=${file.fileName}; openType=${file.openType}`);
+      } catch (error) {
+        this.message = `${file.fileName} 已下载，但没有找到可打开此格式的应用`;
+        this.log('warn', 'session.remote_file.open_failed', `fileName=${file.fileName}; message=${this.errorText(error)}`);
+      }
+    } catch (error) {
+      this.message = `下载文件失败：${this.errorText(error)}`;
+      this.log('error', 'session.remote_file.download_failed', `fileName=${file.fileName}; message=${this.errorText(error)}`);
+    } finally {
+      this.remoteFileActionBusy = false;
+    }
+  }
+
+  private closeMarkdownReader(source: string): void {
+    const fileName = this.markdownReaderDocument?.fileName ?? '';
+    this.markdownReaderDocument = null;
+    this.log('info', 'session.remote_file.markdown_closed', `source=${source}; fileName=${fileName}`);
+  }
+
+  private async copyMarkdownReaderText(): Promise<void> {
+    const document = this.markdownReaderDocument;
+    if (document === null) {
+      return;
+    }
+    try {
+      await ContentActionService.copyText(document.content);
+      this.message = 'Markdown 全文已复制';
+      this.log('info', 'session.remote_file.markdown_copied', `fileName=${document.fileName}; length=${document.content.length}`);
+    } catch (error) {
+      this.message = `复制 Markdown 失败：${this.errorText(error)}`;
+      this.log('error', 'session.remote_file.markdown_copy_failed', `message=${this.errorText(error)}`);
+    }
+  }
+
+  private async shareMarkdownReaderFile(): Promise<void> {
+    const document = this.markdownReaderDocument;
+    if (document === null) {
+      return;
+    }
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      await ContentActionService.shareRemoteFile(context, document, document.fileName);
+      this.message = '已打开系统分享';
+      this.log('info', 'session.remote_file.markdown_shared', `fileName=${document.fileName}`);
+    } catch (error) {
+      this.message = `分享 Markdown 失败：${this.errorText(error)}`;
+      this.log('error', 'session.remote_file.markdown_share_failed', `message=${this.errorText(error)}`);
+    }
+  }
+
+  private async openMarkdownReaderInOtherApp(): Promise<void> {
+    const document = this.markdownReaderDocument;
+    if (document === null) {
+      return;
+    }
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      await ContentActionService.openRemoteFile(context, document);
+      this.message = '已交给其他应用打开';
+      this.log('info', 'session.remote_file.markdown_external_opened', `fileName=${document.fileName}`);
+    } catch (error) {
+      this.message = `没有找到可打开此文件的应用：${this.errorText(error)}`;
+      this.log('warn', 'session.remote_file.markdown_external_open_failed', `message=${this.errorText(error)}`);
+    }
+  }
+
+  private handleMarkdownReaderLink(href: string): void {
+    const normalized = String(href ?? '').trim().replace(/^<|>$/g, '');
+    if (normalized.length === 0) {
+      return;
+    }
+    if (this.isDesktopFileLink(normalized)) {
+      void this.openSessionMarkdownLink(normalized);
+      return;
+    }
+    const scheme = this.linkScheme(normalized);
+    if (scheme === 'http' || scheme === 'https') {
+      this.confirmExternalMarkdownLink(normalized);
+      return;
+    }
+    this.message = `为保护设备，未打开 ${scheme} 链接`;
+    this.log('warn', 'session.remote_file.markdown_link_blocked', `scheme=${scheme}`);
+  }
+
+  private confirmExternalMarkdownLink(url: string): void {
+    AlertDialog.show({
+      title: '打开外部链接？',
+      message: `该链接来自电脑端 Markdown 文件：\n${url}\n\n确认后将交给系统浏览器打开。`,
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          this.log('info', 'session.remote_file.markdown_link_cancelled', `scheme=${this.linkScheme(url)}`);
+        }
+      },
+      secondaryButton: {
+        value: '继续打开',
+        action: () => {
+          void this.openConfirmedExternalMarkdownLink(url);
+        }
+      }
+    });
+  }
+
+  private async openConfirmedExternalMarkdownLink(url: string): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      await ContentActionService.openExternalLink(context, url);
+      this.message = '已打开外部链接';
+      this.log('info', 'session.remote_file.markdown_link_opened', `scheme=${this.linkScheme(url)}`);
+    } catch (error) {
+      this.message = `无法打开链接：${this.errorText(error)}`;
+      this.log('error', 'session.remote_file.markdown_link_failed', `message=${this.errorText(error)}`);
+    }
+  }
+
+  private isDesktopFileLink(value: string): boolean {
+    const normalized = String(value ?? '').trim().replace(/^<|>$/g, '');
+    return /^[A-Za-z]:[\\/]/.test(normalized) || /^file:\/\/\/[A-Za-z]:\//i.test(normalized);
+  }
+
+  private linkScheme(value: string): string {
+    const match = String(value ?? '').trim().match(/^([A-Za-z][A-Za-z0-9+.-]*):/);
+    return match ? match[1].toLowerCase() : 'relative';
   }
 
   private errorText(error: Error | Object | string): string {
@@ -6940,7 +9267,43 @@ struct Index {
     if (this.selectedSession === null) {
       return null;
     }
-    return this.taskSessionId(this.currentTask) === this.selectedSession.id ? this.currentTask : null;
+    if (this.taskSessionId(this.currentTask) !== this.selectedSession.id) {
+      return null;
+    }
+    if (this.failedTaskHasCanonicalCompletion(this.currentTask)) {
+      return null;
+    }
+    return this.currentTask;
+  }
+
+  private failedTaskHasCanonicalCompletion(task: BridgeTask): boolean {
+    if (task.status !== 'failed' || this.selectedSession === null || this.taskSessionId(task) !== this.selectedSession.id) {
+      return false;
+    }
+    const expected = this.normalizedFailedMessageText(task.prompt);
+    if (expected.length === 0) {
+      return false;
+    }
+    const entries = this.selectedSession.entries;
+    let promptIndex = -1;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (entry.role !== 'user') {
+        continue;
+      }
+      if (this.normalizedFailedMessageText(entry.text) === expected) {
+        promptIndex = index;
+        break;
+      }
+    }
+    if (promptIndex < 0) {
+      return false;
+    }
+    return entries.some((entry: CodexSessionEntry, index: number) => {
+      return index > promptIndex
+        && entry.role === 'assistant'
+        && this.normalizedFailedMessageText(entry.text).length > 0;
+    });
   }
 
   private shouldShowSessionFloatingStatus(): boolean {
@@ -6951,7 +9314,6 @@ struct Index {
       || this.desktopLiveState === 'mismatch'
       || this.desktopLiveState === 'unverified'
       || this.desktopLiveState === 'unavailable'
-      || this.isSendingSessionMessage
       || this.isInterruptingTask;
   }
 
@@ -6974,11 +9336,13 @@ struct Index {
     return status === 'running'
       || status === 'queued'
       || status === 'waiting_approval'
+      || status === 'waiting_input'
+      || status === 'recovering'
       || status === 'failed';
   }
 
   private sessionFloatingStatusIsRunning(): boolean {
-    if (this.isSendingSessionMessage || this.isInterruptingTask) {
+    if (this.isInterruptingTask) {
       return true;
     }
     const task = this.selectedVisibleTask();
@@ -6988,9 +9352,6 @@ struct Index {
   }
 
   private sessionFloatingStatusTitle(): string {
-    if (this.isSendingSessionMessage) {
-      return '正在发送到桌面 Codex';
-    }
     if (this.isInterruptingTask) {
       return '正在中断当前会话';
     }
@@ -7022,17 +9383,17 @@ struct Index {
 
   private sessionFloatingStatusColor(): string {
     if (this.pendingApprovalId().length > 0 || this.isInterruptingTask) {
-      return '#B42318';
+      return this.themeColor('#B42318');
     }
     const task = this.selectedVisibleTask();
     if (task !== null && task.status === 'failed') {
-      return '#B42318';
+      return this.themeColor('#B42318');
     }
     if (task !== null && task.status === 'interrupted') {
-      return '#68717D';
+      return this.themeColor('#68717D');
     }
     if (this.sessionFloatingStatusIsRunning()) {
-      return '#1F6FEB';
+      return this.themeColor('#1F6FEB');
     }
     return this.desktopLiveStatusColor();
   }
@@ -7123,17 +9484,17 @@ struct Index {
 
   private slashItemPrimaryColor(item: SlashIndexItem): string {
     if (this.isActiveSlashItem(item)) {
-      return '#1F6FEB';
+      return this.themeColor('#1F6FEB');
     }
-    return item.type === 'skill' ? '#7A4D00' : '#17202A';
+    return item.type === 'skill' ? this.themeColor('#7A4D00') : this.themeColor('#17202A');
   }
 
   private slashItemTitleColor(item: SlashIndexItem): string {
-    return this.isActiveSlashItem(item) ? '#1F6FEB' : '#17202A';
+    return this.isActiveSlashItem(item) ? this.themeColor('#1F6FEB') : this.themeColor('#17202A');
   }
 
   private slashItemDescriptionColor(item: SlashIndexItem): string {
-    return this.isActiveSlashItem(item) ? '#2F6FBE' : '#68717D';
+    return this.isActiveSlashItem(item) ? this.themeColor('#2F6FBE') : this.themeColor('#68717D');
   }
 
   private slashPanelTitle(): string {
@@ -7287,6 +9648,7 @@ struct Index {
     if (command === '/clear') {
       this.sessionMessage = '';
       this.pendingSessionImages = [];
+      this.pendingSessionFiles = [];
       this.message = '已清空输入区';
       return;
     }
@@ -7339,6 +9701,9 @@ struct Index {
     if (this.desktopLiveState === 'ready') {
       return '桌面实时连接：已连接';
     }
+    if (this.desktopLiveState === 'not_required') {
+      return 'App Server 主链路：已连接（无需桌面 CDP）';
+    }
     if (this.desktopLiveState === 'unavailable') {
       if (this.desktopLiveRequiresDesktopCdp || !this.desktopLiveMobileRecoverable) {
         const hint = this.desktopLiveRecoveryHint.length > 0
@@ -7353,16 +9718,16 @@ struct Index {
   }
 
   private desktopLiveStatusColor(): string {
-    if (this.desktopLiveState === 'verified' || this.desktopLiveSessionVerified) {
-      return '#137333';
+    if (this.desktopLiveState === 'verified' || this.desktopLiveState === 'not_required' || this.desktopLiveSessionVerified) {
+      return this.themeColor('#137333');
     }
     if (this.desktopLiveState === 'mismatch' || this.desktopLiveState === 'unverified') {
-      return '#9A6700';
+      return this.themeColor('#9A6700');
     }
     if (this.desktopLiveState === 'unavailable') {
-      return '#B42318';
+      return this.themeColor('#B42318');
     }
-    return '#68717D';
+    return this.themeColor('#68717D');
   }
 
   private desktopLiveBlockedText(): string {
@@ -7432,15 +9797,15 @@ struct Index {
   private sessionPrimaryActionColor(): string {
     const mode = this.sessionPrimaryActionMode();
     if (mode === 'interrupt') {
-      return '#B42318';
+      return this.themeColor('#B42318');
     }
     if (mode === 'guidance_send') {
-      return '#14853D';
+      return this.themeColor('#14853D');
     }
     if (mode === 'sending' || mode === 'interrupting' || mode === 'disabled') {
-      return '#8A95A3';
+      return this.themeColor('#8A95A3');
     }
-    return '#1F6FEB';
+    return this.themeColor('#1F6FEB');
   }
 
   private canUseSessionPrimaryAction(): boolean {
@@ -7492,6 +9857,8 @@ struct Index {
     return this.currentTask.status === 'running'
       || this.currentTask.status === 'queued'
       || this.currentTask.status === 'waiting_approval'
+      || this.currentTask.status === 'waiting_input'
+      || this.currentTask.status === 'recovering'
       || this.currentTask.status === 'failed';
   }
 
@@ -7551,6 +9918,14 @@ struct Index {
     }
     this.pruneResolvedFailedSessionMessages();
     return this.failedSessionMessages.filter((message: FailedSessionMessage) => message.sessionId === sessionId);
+  }
+
+  private visibleOptimisticSessionMessages(): OptimisticSessionMessage[] {
+    const sessionId = this.isNewSessionDraft ? '__new_session__' : (this.selectedSession?.id ?? '');
+    if (sessionId.length === 0) {
+      return [];
+    }
+    return optimisticSessionMessagesForTarget(this.optimisticSessionMessages, sessionId);
   }
 
   private currentTaskLiveEntries(): CodexSessionEntry[] {
@@ -7635,6 +10010,14 @@ struct Index {
     return this.visibleSessionText(text).replace(/\s+/g, ' ').trim();
   }
 
+  private visibleSessionText(text: string): string {
+    let visible = this.stripInternalInstructionBlocks(String(text ?? ''));
+    visible = this.stripCodexDirectiveBlocks(visible);
+    visible = this.stripLeadingSkillToken(visible);
+    visible = this.stripMobileImagePromptText(visible);
+    return this.markdownPlainDisplayText(visible.replace(/\n{3,}/g, '\n\n').trim());
+  }
+
   private failedSessionMessageHasCanonicalEntry(message: FailedSessionMessage): boolean {
     const expected = this.normalizedFailedMessageText(message.text);
     if (expected.length === 0) {
@@ -7669,10 +10052,11 @@ struct Index {
         visibleEntries.push(entry);
       }
     });
+    const compactedEntries = compactAdjacentSessionToolEntries(visibleEntries);
     if (liveActivity !== null && !this.shouldHideSessionEntry(liveActivity)) {
-      visibleEntries.push(liveActivity);
+      compactedEntries.push(liveActivity);
     }
-    return visibleEntries;
+    return compactedEntries;
   }
 
   private streamingAgentText(): string {
@@ -7776,7 +10160,7 @@ struct Index {
   private sessionProjectLabels(): string[] {
     const labels: string[] = [];
     this.sessions.forEach((session: CodexSessionSummary) => {
-      if (session.pinned === true) {
+      if (session.pinned === true || session.sidebarSection === 'recent') {
         return;
       }
       const label = session.projectLabel && session.projectLabel.length > 0 ? session.projectLabel : '未归类';
@@ -7785,6 +10169,41 @@ struct Index {
       }
     });
     return labels;
+  }
+
+  private recentSessions(): CodexSessionSummary[] {
+    return this.sessions.filter((session: CodexSessionSummary) => {
+      return session.pinned !== true && session.sidebarSection === 'recent';
+    });
+  }
+
+  private async answerPendingUserInput(): Promise<void> {
+    const request = this.pendingUserInput();
+    if (request === null || !this.canAnswerPendingUserInput()) {
+      return;
+    }
+    const answers: Record<string, string[]> = {};
+    request.questions.forEach((question: BridgeUserInputQuestion) => {
+      answers[question.id] = [this.userInputAnswer(question.id).trim()];
+    });
+    await this.guard('answerUserInput', async () => {
+      await BridgeClient.answerUserInput(
+        this.normalizedBridgeUrl(),
+        request.id,
+        answers,
+        this.bridgeToken
+      );
+      this.userInputAnswers = {};
+      this.message = '回答已提交，Codex 正在继续处理';
+      this.log('info', 'user_input.answered.client', `requestId=${request.id}; questionCount=${request.questions.length}`);
+      if (this.currentTask !== null) {
+        this.currentTask = await BridgeClient.getCodexRun(
+          this.normalizedBridgeUrl(),
+          this.currentTask.id,
+          this.bridgeToken
+        );
+      }
+    });
   }
 
   private sessionMonitorSummaryText(): string {
@@ -7830,6 +10249,9 @@ struct Index {
     return this.sessions
       .filter((session: CodexSessionSummary) => {
         if (session.pinned === true) {
+          return false;
+        }
+        if (session.sidebarSection === 'recent') {
           return false;
         }
         const label = session.projectLabel && session.projectLabel.length > 0 ? session.projectLabel : '未归类';
@@ -7921,10 +10343,14 @@ struct Index {
     this.closeSessionSwipe();
     this.applySessionActivitySnapshot(session, 'open');
     this.isNewSessionDraft = false;
+    this.activeSessionId = session.id;
     this.expandedSessionEntries = [];
     this.sessionSidebarCollapsed = true;
+    this.sessionSidebarUserCollapsed = false;
     this.sessionMessage = '';
     this.pendingSessionImages = [];
+    this.pendingSessionFiles = [];
+    this.pendingSessionFiles = [];
     this.composerActionMenuExpanded = false;
     this.slashCommandPanelVisible = false;
     this.reasoningEffortMenuVisible = false;
@@ -7992,19 +10418,24 @@ struct Index {
   }
 
   private canDeleteSession(session: CodexSessionSummary): boolean {
-    return this.deletingSessionId.length === 0;
+    return this.deletingSessionId.length === 0 && !this.isSessionRunning(session.id);
   }
 
   private confirmDeleteSession(session: CodexSessionSummary): void {
+    if (this.isSessionRunning(session.id)) {
+      this.closeSessionSwipe();
+      this.message = '会话正在运行，请先中断或等待完成后再删除';
+      this.log('warn', 'session.delete.blocked', `sessionId=${session.id}; reason=running`);
+      return;
+    }
     if (!this.canDeleteSession(session)) {
       this.message = '正在删除其他会话';
       this.log('warn', 'session.delete.blocked', `sessionId=${session.id}; running=${this.isSessionRunning(session.id)}; deleting=${this.deletingSessionId}`);
       return;
     }
-    const runningPrefix = this.isSessionRunning(session.id) ? '这个会话当前标记为进行中。' : '';
     AlertDialog.show({
       title: '删除会话',
-      message: `${runningPrefix}将物理删除“${session.title}”的 Codex 历史文件，并从桌面会话列表同步移除。此操作不可恢复。`,
+      message: `将“${session.title}”从手机和桌面会话列表隐藏，并保留历史文件以避免桌面端打开中的会话损坏。`,
       primaryButton: {
         value: '取消',
         action: () => {
@@ -8014,7 +10445,7 @@ struct Index {
       },
       secondaryButton: {
         value: '删除',
-        fontColor: '#D92D20',
+        fontColor: this.themeColor('#D92D20'),
         action: () => {
           void this.deleteSession(session);
         }
@@ -8046,6 +10477,9 @@ struct Index {
   }
 
   private removeDeletedSessionLocalState(sessionId: string): void {
+    if (this.activeSessionId === sessionId) {
+      this.activeSessionId = '';
+    }
     this.sessions = this.sessions.filter((session: CodexSessionSummary) => session.id !== sessionId);
     this.runningSessionIds = this.runningSessionIds.filter((id: string) => id !== sessionId);
     this.unreadCompletedSessionIds = this.unreadCompletedSessionIds.filter((id: string) => id !== sessionId);
@@ -8075,8 +10509,10 @@ struct Index {
       this.selectedSession = null;
       this.isNewSessionDraft = false;
       this.sessionSidebarCollapsed = false;
+      this.sessionSidebarUserCollapsed = false;
       this.sessionMessage = '';
       this.pendingSessionImages = [];
+      this.pendingSessionFiles = [];
       this.composerActionMenuExpanded = false;
       this.slashCommandPanelVisible = false;
       this.reasoningEffortMenuVisible = false;
@@ -8088,27 +10524,90 @@ struct Index {
     this.bumpSessionMonitorRevision();
   }
 
+  private sessionWindowWidthVp(): number {
+    return this.sessionWindowWidth > 0 ? px2vp(this.sessionWindowWidth) : 0;
+  }
+
+  private sessionWindowHeightVp(): number {
+    return this.sessionWindowHeight > 0 ? px2vp(this.sessionWindowHeight) : 0;
+  }
+
+  private isLandscapeSessionLayout(): boolean {
+    const width = this.sessionWindowWidthVp();
+    const height = this.sessionWindowHeightVp();
+    return width >= 720 && width > height;
+  }
+
+  private sessionLandscapeSidebarWidth(): number {
+    return Math.max(
+      this.sessionLandscapeSidebarMinWidth(),
+      Math.min(this.sessionLandscapeSidebarMaxWidth(), this.sessionSidebarWidth)
+    );
+  }
+
+  private sessionLandscapeSidebarMinWidth(): number {
+    return 280;
+  }
+
+  private sessionLandscapeSidebarMaxWidth(): number {
+    const availableWidth = this.sessionWindowWidthVp() - 420;
+    return Math.max(this.sessionLandscapeSidebarMinWidth(), Math.min(440, availableWidth));
+  }
+
+  private resizeSessionLandscapeSidebar(offsetX: number): void {
+    const nextWidth = this.sessionSidebarResizeStartWidth + offsetX;
+    this.sessionSidebarWidth = Math.max(this.sessionLandscapeSidebarMinWidth(), Math.min(this.sessionLandscapeSidebarMaxWidth(), nextWidth));
+  }
+
+  private isSessionSidebarVisible(): boolean {
+    return this.isLandscapeSessionLayout() ? !this.sessionSidebarUserCollapsed : !this.sessionSidebarCollapsed;
+  }
+
+  private shouldShowSessionHeaderSidebarToggle(): boolean {
+    return this.sessionSidebarCollapsed;
+  }
+
+  private toggleSessionSidebarFromHeader(): void {
+    if (this.isLandscapeSessionLayout()) {
+      const collapsed = !this.sessionSidebarUserCollapsed;
+      this.sessionSidebarUserCollapsed = collapsed;
+      this.sessionSidebarCollapsed = collapsed;
+      this.homeActionMenuVisible = false;
+      this.homeActionMenuSource = '';
+      this.log('info', 'ui.session_sidebar.toggle', `collapsed=${collapsed}; source=conversation_header; layout=landscape`);
+      return;
+    }
+    this.sessionSidebarCollapsed = false;
+    this.sessionSidebarUserCollapsed = false;
+    this.log('info', 'ui.session_sidebar.toggle', 'collapsed=false; source=conversation_header; layout=portrait');
+  }
+
   private closeSessionSidebar(source: string): void {
-    if (this.selectedSession === null && !this.isNewSessionDraft) {
+    if (!this.isLandscapeSessionLayout() && this.selectedSession === null && !this.isNewSessionDraft) {
       this.sessionSidebarCollapsed = false;
+      this.sessionSidebarUserCollapsed = false;
       this.message = '请选择一个会话';
       this.log('info', 'ui.session_sidebar.keep_open', `source=${source}; reason=no_session_selected`);
       return;
     }
     this.sessionSidebarCollapsed = true;
+    this.sessionSidebarUserCollapsed = this.isLandscapeSessionLayout();
     this.message = this.selectedSession === null && !this.isNewSessionDraft ? '已返回会话主界面' : this.message;
-    this.log('info', 'ui.session_sidebar.toggle', `collapsed=true; source=${source}`);
+    this.log('info', 'ui.session_sidebar.toggle', `collapsed=true; source=${source}; layout=${this.isLandscapeSessionLayout() ? 'landscape' : 'portrait'}`);
   }
 
   private returnToSessionHome(source: string): void {
     this.sessionDetailRequestSeq += 1;
     this.selectedSession = null;
+    this.activeSessionId = '';
     this.isNewSessionDraft = false;
     this.newSessionTaskId = '';
     this.sessionSidebarCollapsed = false;
+    this.sessionSidebarUserCollapsed = false;
     this.expandedSessionEntries = [];
     this.sessionMessage = '';
     this.pendingSessionImages = [];
+    this.pendingSessionFiles = [];
     this.composerActionMenuExpanded = false;
     this.slashCommandPanelVisible = false;
     this.reasoningEffortMenuVisible = false;
@@ -8133,12 +10632,15 @@ struct Index {
       return;
     }
     this.selectedSession = null;
+    this.activeSessionId = '';
     this.isNewSessionDraft = true;
     this.newSessionTaskId = '';
     this.sessionSidebarCollapsed = true;
+    this.sessionSidebarUserCollapsed = false;
     this.expandedSessionEntries = [];
     this.sessionMessage = '';
     this.pendingSessionImages = [];
+    this.pendingSessionFiles = [];
     this.composerActionMenuExpanded = false;
     this.slashCommandPanelVisible = false;
     this.reasoningEffortMenuVisible = false;
@@ -8199,10 +10701,18 @@ struct Index {
   }
 
   private sessionTimeLabel(session: CodexSessionSummary): string {
+    const runtimeState = session.runtimeState ?? session.activityStatus ?? '';
+    if (SessionRuntimeStore.isActiveState(runtimeState)) {
+      return this.statusLabel(runtimeState);
+    }
     if (session.relativeTime && session.relativeTime.length > 0) {
       return session.relativeTime;
     }
     return session.updatedAt;
+  }
+
+  private sessionSidebarTimeWidth(): number {
+    return Math.ceil(84 * fontScalePercent(this.fontScaleMode) / 100);
   }
 
   private sessionDetailTimeLabel(): string {
@@ -8210,10 +10720,12 @@ struct Index {
       return '';
     }
     const prefix = this.selectedSession.activitySource === 'session-file' ? '本地历史' : '官方会话';
+    const runtimeState = this.selectedSession.runtimeState ?? this.selectedSession.activityStatus ?? '';
+    const runtimePrefix = runtimeState.length > 0 ? `${this.statusLabel(runtimeState)} · ` : '';
     if (this.selectedSession.relativeTime && this.selectedSession.relativeTime.length > 0) {
-      return `${prefix} · ${this.selectedSession.relativeTime}`;
+      return `${runtimePrefix}${prefix} · ${this.selectedSession.relativeTime}`;
     }
-    return `${prefix} · ${this.selectedSession.updatedAt}`;
+    return `${runtimePrefix}${prefix} · ${this.selectedSession.updatedAt}`;
   }
 
   private sessionEntryKey(entry: CodexSessionEntry): string {
@@ -8334,18 +10846,18 @@ struct Index {
 
   private sessionMetaEntryColor(entry: CodexSessionEntry): string {
     if (entry.type === 'live_agent_failed') {
-      return '#B42318';
+      return this.themeColor('#B42318');
     }
     if (this.isActiveSessionMetaEntry(entry)) {
-      return '#667085';
+      return this.themeColor('#667085');
     }
     if (entry.type === 'live_agent_status') {
-      return '#667085';
+      return this.themeColor('#667085');
     }
     if (entry.role === 'tool') {
-      return '#8A949F';
+      return this.themeColor('#8A949F');
     }
-    return '#A0A8B2';
+    return this.themeColor('#A0A8B2');
   }
 
   private sessionMetaEntryMark(entry: CodexSessionEntry): string {
@@ -8419,6 +10931,140 @@ struct Index {
       this.expandedSessionEntries = this.expandedSessionEntries.concat([key]);
     }
     this.log('info', 'ui.session_entry.toggle', `key=${key}; expanded=${this.isSessionEntryExpanded(entry)}`);
+  }
+
+  private sessionToolItemKey(entry: CodexSessionEntry, item: SessionToolPresentationItem): string {
+    return `${this.sessionEntryKey(entry)}::tool::${item.id}`;
+  }
+
+  private hasExpandableSessionToolItem(item: SessionToolPresentationItem): boolean {
+    return item.detail.length > 0 || item.target.length > 56;
+  }
+
+  private isSessionToolItemExpanded(entry: CodexSessionEntry, item: SessionToolPresentationItem): boolean {
+    return this.expandedSessionEntries.indexOf(this.sessionToolItemKey(entry, item)) >= 0;
+  }
+
+  private toggleSessionToolItem(entry: CodexSessionEntry, item: SessionToolPresentationItem): void {
+    const key = this.sessionToolItemKey(entry, item);
+    const index = this.expandedSessionEntries.indexOf(key);
+    if (index >= 0) {
+      this.expandedSessionEntries = this.expandedSessionEntries.filter((entryKey: string) => entryKey !== key);
+    } else {
+      this.expandedSessionEntries = this.expandedSessionEntries.concat([key]);
+    }
+    this.log('info', 'ui.session_tool_item.toggle', `key=${key}; expanded=${index < 0}`);
+  }
+
+  private isSessionToolGroup(entry: CodexSessionEntry): boolean {
+    return sessionToolPresentationItems(entry).length > 1;
+  }
+
+  private sessionToolGroupKey(entry: CodexSessionEntry): string {
+    const items = sessionToolPresentationItems(entry);
+    const firstId = items.length > 0 ? items[0].id : 'tool';
+    const lastId = items.length > 0 ? items[items.length - 1].id : 'tool';
+    return `${entry.threadId ?? this.selectedSession?.id ?? 'session'}::tool-group::${firstId}::${lastId}::${items.length}`;
+  }
+
+  private sessionToolGroupIsRunning(entry: CodexSessionEntry): boolean {
+    return sessionToolPresentationItems(entry)
+      .some((item: SessionToolPresentationItem) => item.status === 'running');
+  }
+
+  private sessionToolGroupHasFailure(entry: CodexSessionEntry): boolean {
+    return sessionToolPresentationItems(entry)
+      .some((item: SessionToolPresentationItem) => item.status === 'failed');
+  }
+
+  private sessionToolGroupIsCollapsible(entry: CodexSessionEntry): boolean {
+    return this.isSessionToolGroup(entry)
+      && !this.sessionToolGroupIsRunning(entry)
+      && !this.sessionToolGroupHasFailure(entry);
+  }
+
+  private isSessionToolGroupExpanded(entry: CodexSessionEntry): boolean {
+    if (!this.isSessionToolGroup(entry)) {
+      return true;
+    }
+    if (!this.sessionToolGroupIsCollapsible(entry)) {
+      return true;
+    }
+    return this.expandedSessionEntries.indexOf(this.sessionToolGroupKey(entry)) >= 0;
+  }
+
+  private shouldShowSessionToolGroupItems(entry: CodexSessionEntry): boolean {
+    return !this.isSessionToolGroup(entry) || this.isSessionToolGroupExpanded(entry);
+  }
+
+  private toggleSessionToolGroup(entry: CodexSessionEntry): void {
+    const key = this.sessionToolGroupKey(entry);
+    const index = this.expandedSessionEntries.indexOf(key);
+    if (index >= 0) {
+      this.expandedSessionEntries = this.expandedSessionEntries
+        .filter((entryKey: string) => entryKey !== key);
+    } else {
+      this.expandedSessionEntries = this.expandedSessionEntries.concat([key]);
+    }
+    this.log('info', 'ui.session_tool_group.toggle', `key=${key}; expanded=${index < 0}`);
+  }
+
+  private sessionToolGroupTitle(entry: CodexSessionEntry): string {
+    const items = sessionToolPresentationItems(entry);
+    const failed = items.filter((item: SessionToolPresentationItem) => item.status === 'failed').length;
+    if (this.sessionToolGroupIsRunning(entry)) {
+      return `正在执行 ${items.length} 项操作`;
+    }
+    if (failed > 0) {
+      return `${items.length} 项操作中有 ${failed} 项失败`;
+    }
+    return `已完成 ${items.length} 项操作`;
+  }
+
+  private sessionToolGroupColor(entry: CodexSessionEntry): string {
+    if (this.sessionToolGroupHasFailure(entry)) {
+      return this.themeColor('#B42318');
+    }
+    if (this.sessionToolGroupIsRunning(entry)) {
+      return this.themeColor('#1F6FEB');
+    }
+    return this.themeColor('#14853D');
+  }
+
+  private sessionToolItemStatusText(item: SessionToolPresentationItem): string {
+    if ((item.retryCount ?? 0) > 0 && item.status === 'completed') {
+      return `重试 ${item.retryCount} 次后成功`;
+    }
+    if (item.status === 'running') {
+      return '进行中';
+    }
+    if (item.status === 'failed') {
+      return '失败';
+    }
+    if (item.status === 'stopped') {
+      return '已停止';
+    }
+    return '完成';
+  }
+
+  private sessionToolItemMark(item: SessionToolPresentationItem): string {
+    if (item.status === 'failed') {
+      return '!';
+    }
+    if (item.status === 'stopped') {
+      return '×';
+    }
+    return '▹';
+  }
+
+  private sessionToolItemColor(item: SessionToolPresentationItem): string {
+    if (item.status === 'failed') {
+      return this.themeColor('#B42318');
+    }
+    if (item.status === 'running') {
+      return this.themeColor('#1F6FEB');
+    }
+    return this.themeColor('#667085');
   }
 
   private sessionMarkdownBlockKey(entry: CodexSessionEntry, block: SessionMarkdownBlock): string {
@@ -8622,11 +11268,14 @@ struct Index {
     if (latest === null) {
       return '任务已创建，等待 Codex 输出';
     }
-    if (task.status === 'running') {
+    if (task.status === 'running' || task.status === 'recovering') {
       return this.workingStatusTextForTask(task);
     }
     if (task.status === 'waiting_approval') {
       return `等待确认：${this.pendingApprovalSummary()}`;
+    }
+    if (task.status === 'waiting_input') {
+      return '等待你回答问题';
     }
     if (task.status === 'completed') {
       return 'Codex 已完成本次任务';
@@ -9057,6 +11706,24 @@ struct Index {
         continue;
       }
 
+      if (index + 1 < lines.length
+        && parseSessionMarkdownTable(`${line}\n${lines[index + 1]}`).headers.length > 0) {
+        flushParagraph();
+        const tableLines: string[] = [line, lines[index + 1]];
+        let tableIndex = index + 2;
+        while (tableIndex < lines.length) {
+          const tableLine = lines[tableIndex].trim();
+          if (tableLine.length === 0 || tableLine.indexOf('|') < 0) {
+            break;
+          }
+          tableLines.push(lines[tableIndex]);
+          tableIndex += 1;
+        }
+        pushBlock('table', tableLines.join('\n'));
+        index = tableIndex - 1;
+        continue;
+      }
+
       const codexDirectiveName = this.markdownCodexDirectiveName(trimmed);
       if (codexDirectiveName.length > 0) {
         flushParagraph();
@@ -9173,28 +11840,28 @@ struct Index {
 
   private codexDirectiveAccentColor(name: string): string {
     if (name === 'git-stage') {
-      return '#14853D';
+      return this.themeColor('#14853D');
     }
     if (name === 'git-commit') {
-      return '#B54708';
+      return this.themeColor('#B54708');
     }
     if (name === 'git-push') {
-      return '#7A4E00';
+      return this.themeColor('#7A4E00');
     }
-    return '#1F6FEB';
+    return this.themeColor('#1F6FEB');
   }
 
   private codexDirectiveAccentBackground(name: string): string {
     if (name === 'git-stage') {
-      return '#EAF8EF';
+      return this.themeColor('#EAF8EF');
     }
     if (name === 'git-commit') {
-      return '#FFF4E5';
+      return this.themeColor('#FFF4E5');
     }
     if (name === 'git-push') {
-      return '#FFF8D8';
+      return this.themeColor('#FFF8D8');
     }
-    return '#EAF4FF';
+    return this.themeColor('#EAF4FF');
   }
 
   private codexDirectiveSummary(block: SessionMarkdownBlock): string {
@@ -9220,28 +11887,28 @@ struct Index {
 
   private structuredFieldLabelColor(kind: string): string {
     if (kind === 'code') {
-      return '#344054';
+      return this.themeColor('#344054');
     }
     if (kind === 'path') {
-      return '#175CD3';
+      return this.themeColor('#175CD3');
     }
     if (kind === 'source') {
-      return '#1F6FEB';
+      return this.themeColor('#1F6FEB');
     }
-    return '#475467';
+    return this.themeColor('#475467');
   }
 
   private structuredFieldLabelBackground(kind: string): string {
     if (kind === 'code') {
-      return '#F2F4F7';
+      return this.themeColor('#F2F4F7');
     }
     if (kind === 'path') {
-      return '#EAF4FF';
+      return this.themeColor('#EAF4FF');
     }
     if (kind === 'source') {
-      return '#EAF4FF';
+      return this.themeColor('#EAF4FF');
     }
-    return '#F2F4F7';
+    return this.themeColor('#F2F4F7');
   }
 
   private codexDirectiveDetailFields(block: SessionMarkdownBlock): SessionStructuredField[] {
@@ -9613,25 +12280,78 @@ struct Index {
     return this.sessionEntryVisibleText(entry).trim().length > 0;
   }
 
-  private userSessionEntryWidth(entry: CodexSessionEntry): string {
+  private userSessionEntryWidth(entry: CodexSessionEntry): string | number {
     if (this.sessionEntryImages(entry).length > 0 && !this.shouldRenderUserTextBubble(entry)) {
-      return '58%';
+      return this.isLandscapeSessionLayout() ? '72%' : '58%';
     }
-    return '82%';
+    return this.userTextBubbleWidth(this.sessionEntryVisibleText(entry));
+  }
+
+  private userTextBubbleWidth(text: string): number {
+    const lines = text.trim().split('\n');
+    let longestLineLength = 0;
+    lines.forEach((line: string) => {
+      longestLineLength = Math.max(longestLineLength, line.trim().length);
+    });
+    return Math.max(112, Math.min(620, 32 + longestLineLength * 13));
   }
 
   private userImageEntryWidth(entry: CodexSessionEntry): string {
     if (!this.shouldRenderUserTextBubble(entry)) {
       return '100%';
     }
-    return '58%';
+    return this.isLandscapeSessionLayout() ? '72%' : '58%';
+  }
+
+  private pendingUserInput(): BridgeUserInput | null {
+    const task = this.selectedVisibleTask();
+    if (task?.pendingUserInput && task.pendingUserInput.status === 'pending') {
+      return task.pendingUserInput;
+    }
+    if (this.selectedSession === null && !this.isNewSessionDraft
+      && this.currentTask?.pendingUserInput
+      && this.currentTask.pendingUserInput.status === 'pending') {
+      return this.currentTask.pendingUserInput;
+    }
+    return null;
+  }
+
+  private userInputAnswer(questionId: string): string {
+    return this.userInputAnswers[questionId] ?? '';
+  }
+
+  private setUserInputAnswer(questionId: string, value: string): void {
+    const next: Record<string, string> = {};
+    Object.keys(this.userInputAnswers).forEach((key: string) => {
+      next[key] = this.userInputAnswers[key];
+    });
+    next[questionId] = value;
+    this.userInputAnswers = next;
+  }
+
+  private canAnswerPendingUserInput(): boolean {
+    const request = this.pendingUserInput();
+    if (request === null || this.isBusy) {
+      return false;
+    }
+    return request.questions.every((question: BridgeUserInputQuestion) => {
+      return this.userInputAnswer(question.id).trim().length > 0;
+    });
   }
 
   private userImageEntryHeight(entry: CodexSessionEntry): number {
     if (!this.shouldRenderUserTextBubble(entry)) {
-      return 430;
+      return this.isLandscapeSessionLayout() ? 300 : 430;
     }
-    return 300;
+    return this.isLandscapeSessionLayout() ? 240 : 300;
+  }
+
+  private assistantImageEntryWidth(): string {
+    return this.isLandscapeSessionLayout() ? '72%' : '64%';
+  }
+
+  private assistantImageEntryHeight(): number {
+    return this.isLandscapeSessionLayout() ? 300 : 260;
   }
 
   private sessionEntryImagePaths(text: string): string[] {
@@ -9970,11 +12690,17 @@ struct Index {
     if (status === 'waiting_approval') {
       return '待确认';
     }
+    if (status === 'waiting_input') {
+      return '待回答';
+    }
     if (status === 'running') {
       return '运行中';
     }
     if (status === 'queued') {
       return '排队中';
+    }
+    if (status === 'recovering') {
+      return '正在恢复';
     }
     return '空闲';
   }
@@ -10017,28 +12743,31 @@ struct Index {
 
   private statusColor(status: string): string {
     if (status === 'completed') {
-      return '#137333';
+      return this.themeColor('#137333');
     }
     if (status === 'failed') {
-      return '#B42318';
+      return this.themeColor('#B42318');
     }
     if (status === 'interrupted') {
-      return '#68717D';
+      return this.themeColor('#68717D');
     }
     if (status === 'waiting_approval') {
-      return '#A15C00';
+      return this.themeColor('#A15C00');
     }
-    if (status === 'running') {
-      return '#1F6FEB';
+    if (status === 'waiting_input') {
+      return this.themeColor('#7C3AED');
     }
-    return '#68717D';
+    if (status === 'running' || status === 'recovering') {
+      return this.themeColor('#1F6FEB');
+    }
+    return this.themeColor('#68717D');
   }
 }
 
 @Extend(Column)
-function cardStyle() {
+function cardStyle(backgroundColor: ResourceColor) {
   .width('100%')
   .padding(14)
-  .backgroundColor('#FFFFFF')
+  .backgroundColor(backgroundColor)
   .borderRadius(8)
 }

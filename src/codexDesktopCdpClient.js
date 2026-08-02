@@ -70,6 +70,20 @@ export class CodexDesktopCdpClient {
     }, { retries: 1 });
   }
 
+  async openDesktopThread(sessionId) {
+    const normalizedSessionId = String(sessionId ?? '').trim();
+    if (!/^[A-Za-z0-9_-]+$/.test(normalizedSessionId)) {
+      throw new Error('Invalid Codex desktop thread id');
+    }
+    return this.withCdpReconnectRetry(async () => {
+      await this.ensureConnected();
+      return this.evaluate(
+        openDesktopThreadExpression(normalizedSessionId),
+        Math.max(this.timeoutMs, 8000)
+      );
+    }, { retries: 1 });
+  }
+
   async drainNotifications() {
     return this.withCdpReconnectRetry(async () => {
       await this.ensureConnected();
@@ -111,15 +125,15 @@ export class CodexDesktopCdpClient {
       this.closeSocket(this.socket);
       this.socket = null;
     }
-    this.connected = this.connect().then(() => {
-      this.connected = null;
-    }).catch((error) => {
-      this.connected = null;
-      this.closeSocket(this.socket);
-      this.socket = null;
-      throw error;
-    });
-    return this.connected;
+    const connectionAttempt = this.connect();
+    this.connected = connectionAttempt;
+    try {
+      return await connectionAttempt;
+    } finally {
+      if (this.connected === connectionAttempt) {
+        this.connected = null;
+      }
+    }
   }
 
   async connect() {
@@ -129,9 +143,7 @@ export class CodexDesktopCdpClient {
     for (const port of ports) {
       try {
         const targets = await getCdpTargets(port, Math.min(this.timeoutMs, 5000));
-        page = targets.find((target) => target.type === 'page' && target.title === 'Codex' && target.webSocketDebuggerUrl)
-          ?? targets.find((target) => target.type === 'page' && target.webSocketDebuggerUrl && /codex/i.test(`${target.title ?? ''} ${target.url ?? ''}`))
-          ?? targets.find((target) => target.type === 'page' && target.webSocketDebuggerUrl);
+        page = selectCodexDesktopCdpTarget(targets);
         if (page?.webSocketDebuggerUrl) {
           this.port = port;
           break;
@@ -145,27 +157,41 @@ export class CodexDesktopCdpClient {
       throw lastError ?? new Error(`未找到 Codex 桌面窗口 CDP 入口：${ports.map((port) => `127.0.0.1:${port}`).join(', ')}`);
     }
 
-    const socket = new WebSocket(page.webSocketDebuggerUrl);
+    const socket = new WebSocket(
+      page.webSocketDebuggerUrl,
+      [],
+      buildDesktopCdpWebSocketOptions(this.port)
+    );
     this.socket = socket;
     socket.onmessage = (event) => this.handleMessage(event);
     socket.onclose = () => this.markDisconnected(socket, new Error('Codex 桌面 CDP 连接已关闭'));
     socket.onerror = () => this.markDisconnected(socket, new Error('Codex 桌面 CDP 连接错误'));
 
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('连接 Codex 桌面 CDP 超时')), this.timeoutMs);
-      socket.onopen = () => {
-        clearTimeout(timeout);
-        socket.onerror = () => this.markDisconnected(socket, new Error('Codex 桌面 CDP 连接错误'));
-        resolve();
-      };
-      socket.onerror = () => {
-        clearTimeout(timeout);
-        this.markDisconnected(socket, new Error('连接 Codex 桌面 CDP 失败'));
-        reject(new Error('连接 Codex 桌面 CDP 失败'));
-      };
-    });
-    await this.enableRuntimeIfAvailable();
-    await this.installNotificationCollector();
+    try {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const error = new Error('连接 Codex 桌面 CDP 超时');
+          this.markDisconnected(socket, error);
+          reject(error);
+        }, this.timeoutMs);
+        socket.onopen = () => {
+          clearTimeout(timeout);
+          socket.onerror = () => this.markDisconnected(socket, new Error('Codex 桌面 CDP 连接错误'));
+          resolve();
+        };
+        socket.onerror = () => {
+          clearTimeout(timeout);
+          const error = new Error('连接 Codex 桌面 CDP 失败');
+          this.markDisconnected(socket, error);
+          reject(error);
+        };
+      });
+      await this.enableRuntimeIfAvailable();
+      await this.installNotificationCollector();
+    } catch (error) {
+      this.markDisconnected(socket, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
   }
 
   refreshPort() {
@@ -278,7 +304,6 @@ export class CodexDesktopCdpClient {
     const socketToClose = socket ?? this.socket;
     this.rejectAll(error);
     this.socket = null;
-    this.connected = null;
     this.closeSocket(socketToClose);
   }
 
@@ -312,7 +337,9 @@ export class CodexDesktopCdpClient {
         if (attempt >= retries || !isRetryableCdpTransportError(error)) {
           throw error;
         }
-        this.markDisconnected(this.socket, error instanceof Error ? error : new Error(String(error)));
+        // The low-level socket handlers already retire the socket that actually
+        // failed. Do not close `this.socket` here: another concurrent request
+        // may already have replaced it with a healthy connection.
         await sleep(100 * (attempt + 1));
       }
     }
@@ -349,6 +376,32 @@ export function extractConversationIdFromPath(value) {
   const match = withoutQuery.match(/^\/(?:local|remote)\/([^/]+)$/)
     ?? withoutQuery.match(/^\/hotkey-window\/thread\/([^/]+)$/);
   return match ? decodeURIComponent(match[1]) : null;
+}
+
+export function extractConversationIdFromDesktopThreadKey(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return null;
+  }
+  const match = value.match(/^(?:local|remote):([A-Za-z0-9_-]+)$/);
+  return match ? match[1] : null;
+}
+
+export function selectCodexDesktopCdpTarget(targets) {
+  const pages = Array.isArray(targets)
+    ? targets.filter((target) => target?.type === 'page' && target.webSocketDebuggerUrl)
+    : [];
+  return pages.find((target) => (
+    target.title === 'Codex'
+    && /^app:\/\/-\/index\.html$/.test(String(target.url ?? ''))
+  ))
+    ?? pages.find((target) => (
+      target.title === 'Codex'
+      && !/initialRoute=(?:%2F|\/)?avatar-overlay/i.test(String(target.url ?? ''))
+    ))
+    ?? pages.find((target) => target.title === 'Codex')
+    ?? pages.find((target) => /codex/i.test(`${target.title ?? ''} ${target.url ?? ''}`))
+    ?? pages[0]
+    ?? null;
 }
 
 export function resolveDesktopCdpPort(env = process.env) {
@@ -393,6 +446,17 @@ export function resolveDesktopCdpPortCandidates(env = process.env) {
   return candidates;
 }
 
+export function buildDesktopCdpWebSocketOptions(port, env = process.env) {
+  const configured = String(env.CODEX_DESKTOP_CDP_ORIGIN ?? '').trim().replace(/\/+$/, '');
+  const normalizedPort = Number.parseInt(String(port ?? ''), 10);
+  const origin = configured || `http://127.0.0.1:${Number.isInteger(normalizedPort) && normalizedPort > 0 ? normalizedPort : 9229}`;
+  return {
+    headers: {
+      Origin: origin
+    }
+  };
+}
+
 function currentConversationIdExpression() {
   return `
 (() => {
@@ -409,8 +473,85 @@ function currentConversationIdExpression() {
   return extract(window.location.pathname)
     || extract(window.location.hash)
     || extract(new URL(window.location.href).pathname)
+    || (() => {
+      const activeThread = document.querySelector(
+        '[data-app-action-sidebar-thread-active="true"][data-app-action-sidebar-thread-id]'
+      );
+      const desktopThreadKey = activeThread?.getAttribute('data-app-action-sidebar-thread-id') || '';
+      const match = desktopThreadKey.match(/^(?:local|remote):([A-Za-z0-9_-]+)$/);
+      return match ? match[1] : null;
+    })()
     || null;
 })()
+`;
+}
+
+function openDesktopThreadExpression(sessionId) {
+  return `
+(() => new Promise((resolve) => {
+  const sessionId = ${JSON.stringify(sessionId)};
+  const threadKeys = ['local:' + sessionId, 'remote:' + sessionId];
+  const threadIdAttribute = 'data-app-action-sidebar-thread-id';
+  const activeAttribute = 'data-app-action-sidebar-thread-active';
+  const findThread = () => Array.from(
+    document.querySelectorAll('[' + threadIdAttribute + ']')
+  ).find((element) => threadKeys.includes(element.getAttribute(threadIdAttribute) || '')) || null;
+  const activeThreadKey = () => document.querySelector(
+    '[' + activeAttribute + '="true"][' + threadIdAttribute + ']'
+  )?.getAttribute(threadIdAttribute) || '';
+  const thread = findThread();
+  if (!thread) {
+    resolve({
+      ok: false,
+      error: 'Codex 桌面侧边栏未找到目标会话',
+      reason: 'thread_not_found',
+      sessionId,
+      transport: 'cdp'
+    });
+    return;
+  }
+  const desktopThreadKey = thread.getAttribute(threadIdAttribute) || '';
+  if (threadKeys.includes(activeThreadKey())) {
+    resolve({
+      ok: true,
+      sessionId,
+      desktopThreadKey,
+      alreadyActive: true,
+      transport: 'cdp'
+    });
+    return;
+  }
+  thread.scrollIntoView({ block: 'center', inline: 'nearest' });
+  thread.click();
+  let attempts = 0;
+  const confirmActivation = () => {
+    attempts += 1;
+    const activeKey = activeThreadKey();
+    if (threadKeys.includes(activeKey)) {
+      resolve({
+        ok: true,
+        sessionId,
+        desktopThreadKey: activeKey,
+        alreadyActive: false,
+        transport: 'cdp'
+      });
+      return;
+    }
+    if (attempts >= 60) {
+      resolve({
+        ok: false,
+        error: 'Codex 桌面未确认切换到目标会话',
+        reason: 'activation_timeout',
+        sessionId,
+        desktopThreadKey,
+        transport: 'cdp'
+      });
+      return;
+    }
+    setTimeout(confirmActivation, 100);
+  };
+  setTimeout(confirmActivation, 80);
+}))()
 `;
 }
 

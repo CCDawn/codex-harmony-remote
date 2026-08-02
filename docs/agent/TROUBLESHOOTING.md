@@ -90,3 +90,60 @@ Actions:
 3. Confirm desktop live/CDP status.
 4. If failed message exists in the phone UI, use retry after link recovery.
 5. Do not create a new thread unless the user explicitly asks.
+
+## Desktop-owned App Server Runtime
+
+The default runtime is `app-server-primary`. The phone may operate thread B while the
+desktop displays thread A. A difference between those selected thread ids is
+informational and must not block sending, provided the desktop-owned App Server
+can verify B. A desktop channel outage remains blocking because the Bridge must
+not silently start a second owner.
+
+Inspect the effective contract with:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8787/health?threadId=<thread-id>"
+Invoke-RestMethod "http://127.0.0.1:8787/system/link/status?sessionId=<thread-id>"
+```
+
+Expected fields are `runtime.mode=desktop`,
+`runtime.existingThreadExecution=desktop`,
+`link.executionMode=desktop`, and `link.desktopRequired=true`. If the desktop
+currently displays another thread, `desktop.sessionVerified=false` together
+with `desktop.targetVerified=true` and `desktop.status=target_ready` is healthy.
+
+## Desktop Target Verification Failure
+
+If the phone reports the desktop channel offline or the target cannot be
+verified, inspect:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8787/health
+Invoke-RestMethod "http://127.0.0.1:8787/desktop/live/status?sessionId=<thread-id>"
+```
+
+Do not switch to `app-server-primary` as an automatic fallback. That would
+create a second live owner and can make the phone and desktop event streams
+diverge.
+
+## App Server Primary Failure
+
+If the stack reports an App Server runtime failure, inspect the bridge startup
+logs first and keep the phone connected through the normal bridge/HDC route:
+
+```powershell
+Get-Content .\logs\startup\bridge.stderr.log -Tail 120
+Invoke-RestMethod http://127.0.0.1:8787/health
+```
+
+The explicit compatibility mode contains
+`runtime.mode=app-server-primary` and a `runtime.appServer` object. This mode
+does not guarantee that the desktop frontend renders the same live event
+stream. Do not expose the App Server stdio process or any local App Server port
+directly to the phone or the public relay.
+
+Return to the desktop-owned mode with:
+
+```powershell
+npm.cmd run agent:start -- -RuntimeMode desktop -ForceRestart
+```

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; connect-src 'none'; img-src data:; media-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+  />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { background: #11151a; color: #f7f9fc; font-family: sans-serif; }
+    body.light { background: #ffffff; color: #17202a; }
+    #diagram-root {
+      width: 100%; height: 100%; padding: 14px; overflow: auto;
+      display: flex; align-items: flex-start; justify-content: flex-start;
+    }
+    #diagram-root svg { display: block; min-width: max-content; height: auto; }
+    #diagram-root .empty { color: #8994a3; font: 13px sans-serif; padding: 12px; }
+  </style>
+  <script src="mermaid.min.js"></script>
+</head>
+<body>
+  <div id="diagram-root"><div class="empty">正在渲染图表…</div></div>
+  <script>
+    (function () {
+      'use strict';
+
+      var MAX_SOURCE_CHARS = 24 * 1024;
+      var root = document.getElementById('diagram-root');
+
+      function sourceError(source) {
+        if (!source || !source.trim()) return '图表内容为空';
+        if (source.length > MAX_SOURCE_CHARS) return '图表超过 24KB 安全渲染限制';
+        if (/%%\{|\bclick\b|\bcallback\b|\bhref\b|(?:javascript|data|file|https?):/i.test(source)) {
+          return '图表包含已禁用的外部链接或交互指令';
+        }
+        var first = source.split('\n').find(function (line) {
+          var text = line.trim();
+          return text && !text.startsWith('%%');
+        }) || '';
+        if (!/^(?:flowchart|graph)\s+(?:TB|TD|BT|RL|LR)\b/i.test(first)) {
+          return '当前版本仅支持 flowchart / graph 流程图';
+        }
+        return '';
+      }
+
+      function briefError(error) {
+        var text = String(error && error.message ? error.message : error || '未知错误');
+        return text.replace(/[<>]/g, '').replace(/\s+/g, ' ').slice(0, 160);
+      }
+
+      function sanitizeSvg(svg) {
+        if (/<(?:script|foreignObject)\b/i.test(svg)) {
+          throw new Error('图表输出包含不安全节点');
+        }
+        return svg
+          .replace(/<a\b[^>]*>/gi, '')
+          .replace(/<\/a>/gi, '')
+          .replace(/\s(?:href|xlink:href)\s*=\s*(['\"])(?:javascript:|data:|file:|https?:).*?\1/gi, '')
+          .replace(/\son[a-z]+\s*=\s*(['\"]).*?\1/gi, '');
+      }
+
+      window.renderMermaid = async function (payloadJson) {
+        try {
+          var payload = JSON.parse(payloadJson);
+          var source = String(payload.source || '');
+          var error = sourceError(source);
+          if (error) return 'MERMAID_ERROR:' + error;
+          if (!window.mermaid) return 'MERMAID_ERROR:离线 Mermaid 引擎未加载';
+
+          document.body.className = payload.darkMode ? '' : 'light';
+          window.mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'strict',
+            theme: payload.darkMode ? 'dark' : 'default',
+            flowchart: { htmlLabels: false, useMaxWidth: false }
+          });
+          var renderId = 'codex-mermaid-' + String(payload.revision || Date.now());
+          var rendered = await window.mermaid.render(renderId, source);
+          var svg = sanitizeSvg(rendered.svg);
+          root.innerHTML = svg;
+          return 'MERMAID_RENDERED';
+        } catch (error) {
+          root.innerHTML = '<div class="empty">图表无法渲染</div>';
+          return 'MERMAID_ERROR:' + briefError(error);
+        }
+      };
+    }());
+  </script>
+</body>
+</html>

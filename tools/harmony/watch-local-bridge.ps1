@@ -2,6 +2,8 @@
 param(
   [int]$BridgePort = 8787,
   [string]$BridgeToken = $env:CODEX_BRIDGE_TOKEN,
+  [string]$RuntimeMode = $env:CODEX_BRIDGE_RUNTIME_MODE,
+  [string]$CanaryThreadIds = $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS,
   [int]$IntervalSeconds = 6,
   [int]$FailureThreshold = 2
 )
@@ -9,7 +11,35 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if ([string]::IsNullOrWhiteSpace($RuntimeMode)) {
+  $RuntimeMode = 'app-server-primary'
+}
+$RuntimeMode = $RuntimeMode.Trim().ToLowerInvariant()
+
+function Resolve-CompatiblePowerShellHost {
+  $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentHost -and -not [string]::IsNullOrWhiteSpace([string]$currentHost.Path) -and (Test-Path -LiteralPath ([string]$currentHost.Path))) {
+    return [string]$currentHost.Path
+  }
+
+  $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source) -and (Test-Path -LiteralPath ([string]$pwsh.Source))) {
+    return [string]$pwsh.Source
+  }
+
+  throw '未找到可用的 PowerShell 主机'
+}
+
+$powerShellHostPath = Resolve-CompatiblePowerShellHost
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
+$bridgeConfigPath = Join-Path ([string]$repoRoot) 'HarmonyCodexRemote\entry\src\main\ets\config\BridgeConfig.ets'
+if ([string]::IsNullOrWhiteSpace($BridgeToken) -and (Test-Path -LiteralPath $bridgeConfigPath)) {
+  $bridgeConfigText = Get-Content -Raw -LiteralPath $bridgeConfigPath
+  $bridgeTokenMatch = [regex]::Match($bridgeConfigText, "DEFAULT_BRIDGE_TOKEN:\s*string\s*=\s*'([^']*)'")
+  if ($bridgeTokenMatch.Success) {
+    $BridgeToken = $bridgeTokenMatch.Groups[1].Value
+  }
+}
 $logRoot = Join-Path ([string]$repoRoot) 'logs\startup'
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 $missingCount = 0
@@ -21,10 +51,15 @@ function Write-WatchLog {
 
 function Test-LocalBridge {
   try {
-    Invoke-RestMethod -UseBasicParsing `
+    $health = Invoke-RestMethod -UseBasicParsing `
       -Uri "http://127.0.0.1:${BridgePort}/health" `
       -Headers @{ 'X-Codex-Bridge-Token' = $BridgeToken } `
-      -TimeoutSec 4 | Out-Null
+      -TimeoutSec 4
+    $actualMode = [string]$health.runtime.mode
+    if ($actualMode -ne $RuntimeMode) {
+      Write-WatchLog "local bridge runtime mismatch: expected=$RuntimeMode actual=$actualMode"
+      return $false
+    }
     return $true
   } catch {
     return $false
@@ -78,17 +113,19 @@ function Start-LocalBridge {
 `$env:CODEX_BRIDGE_WORKSPACE='$repoRoot'
 `$env:CODEX_BRIDGE_TOKEN='$BridgeToken'
 `$env:CODEX_BRIDGE_ADAPTER='codex'
+`$env:CODEX_BRIDGE_RUNTIME_MODE='$RuntimeMode'
+`$env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS='$CanaryThreadIds'
 node src/server.js
 "@
   Write-WatchLog "start local bridge on 127.0.0.1:${BridgePort}"
-  Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+  Start-Process -WindowStyle Hidden -FilePath $powerShellHostPath -ArgumentList @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-Command', $command
   ) -WorkingDirectory ([string]$repoRoot) -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
 }
 
-Write-WatchLog "local bridge watchdog started: http://127.0.0.1:${BridgePort}"
+Write-WatchLog "local bridge watchdog started: http://127.0.0.1:${BridgePort}; mode=$RuntimeMode"
 
 while ($true) {
   if (Test-LocalBridge) {

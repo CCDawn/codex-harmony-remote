@@ -1,17 +1,22 @@
 import http from 'node:http';
+import {
+  buildDesktopCdpWebSocketOptions,
+  selectCodexDesktopCdpTarget
+} from '../src/codexDesktopCdpClient.js';
 
-const port = Number.parseInt(process.env.CODEX_DESKTOP_CDP_PORT ?? '9229', 10);
+const cdpPort = Number.parseInt(process.env.CODEX_DESKTOP_CDP_PORT ?? '9229', 10);
 const hostId = process.env.CODEX_DESKTOP_HOST_ID ?? 'local';
 const method = process.argv[2] ?? 'thread/list';
 const params = parseParams(process.argv[3]);
 const requestId = `codex-hramony-${Date.now()}`;
 
 async function main() {
-  const page = (await getJson(`http://127.0.0.1:${port}/json/list`))
-    .find((target) => target.type === 'page' && target.title === 'Codex');
+  const page = selectCodexDesktopCdpTarget(
+    await getJson(`http://127.0.0.1:${cdpPort}/json/list`)
+  );
 
   if (!page?.webSocketDebuggerUrl) {
-    throw new Error(`Codex desktop page not found on CDP port ${port}`);
+    throw new Error(`Codex desktop page not found on CDP port ${cdpPort}`);
   }
 
   const client = await CdpClient.connect(page.webSocketDebuggerUrl);
@@ -101,7 +106,7 @@ class CdpClient {
   }
 
   static async connect(url) {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, [], buildDesktopCdpWebSocketOptions(cdpPort));
     await new Promise((resolve, reject) => {
       socket.onopen = resolve;
       socket.onerror = reject;

@@ -14,6 +14,27 @@ export class HybridCodexAdapter {
     this.lastDesktopUnavailableError = null;
   }
 
+  async openDesktopThread(sessionId) {
+    if (!this.cdpDesktopAdapter || typeof this.cdpDesktopAdapter.openDesktopThread !== 'function') {
+      throw new Error('当前 Codex 桌面实时通道不支持会话切换');
+    }
+    return this.cdpDesktopAdapter.openDesktopThread(sessionId);
+  }
+
+  async archiveThread(sessionId) {
+    if (!this.cdpDesktopAdapter || typeof this.cdpDesktopAdapter.archiveThread !== 'function') {
+      throw new Error('当前 Codex 桌面实时通道不支持原生会话归档');
+    }
+    return this.cdpDesktopAdapter.archiveThread(sessionId);
+  }
+
+  async listThreadRuntimeStates(options = {}) {
+    if (!this.cdpDesktopAdapter || typeof this.cdpDesktopAdapter.listThreadRuntimeStates !== 'function') {
+      return [];
+    }
+    return this.cdpDesktopAdapter.listThreadRuntimeStates(options);
+  }
+
   async run(context) {
     const targetSessionId = context?.task?.codexSessionId ?? '';
     const desktopStatus = this.usableVerifiedDesktopStatus(context?.task?.verifiedDesktopStatus, targetSessionId)
@@ -21,7 +42,7 @@ export class HybridCodexAdapter {
     this.selectDesktopAdapterForStatus(desktopStatus);
     this.emitDesktopProbeResult(context, desktopStatus);
 
-    if (!desktopStatus.desktopLive || (targetSessionId && desktopStatus.status !== 'verified')) {
+    if (!isDesktopTargetReady(desktopStatus, targetSessionId)) {
       context.emit('codex.desktop_sync', {
         status: 'desktop_live_required',
         desktopLive: false,
@@ -34,10 +55,11 @@ export class HybridCodexAdapter {
       throw createDesktopVerificationError(desktopStatus);
     }
 
+    const selectedAdapter = this.desktopAdapter;
     try {
-      return await this.desktopAdapter.run(context);
+      return await selectedAdapter.run(context);
     } catch (error) {
-      if (await this.shouldRetryWithCdp(error, desktopStatus, targetSessionId)) {
+      if (await this.shouldRetryWithCdp(error, desktopStatus, targetSessionId, selectedAdapter)) {
         context.emit('codex.desktop_live.transport_retry', {
           from: desktopStatus.transport ?? 'script',
           to: 'cdp',
@@ -63,16 +85,26 @@ export class HybridCodexAdapter {
     if (status.desktopLive !== true) {
       return null;
     }
-    if (normalizedTargetSessionId && status.sessionVerified !== true) {
+    if (!isDesktopTargetReady(status, normalizedTargetSessionId)) {
       return null;
     }
+    const sessionVerified = status.sessionVerified === true;
+    const targetVerified = normalizedTargetSessionId
+      ? status.targetVerified === true || sessionVerified
+      : status.targetVerified === true;
     return {
       ...status,
-      status: normalizedTargetSessionId ? 'verified' : (status.status ?? 'ready'),
+      status: normalizedTargetSessionId
+        ? (sessionVerified ? 'verified' : 'target_ready')
+        : (status.status ?? 'ready'),
       targetSessionId: normalizedTargetSessionId,
-      sessionVerified: normalizedTargetSessionId ? true : status.sessionVerified === true,
+      sessionVerified,
+      targetVerified,
       transport: normalizeTransport(status.transport),
-      message: status.message ?? '已复用本次发送前的桌面会话校验结果。'
+      message: status.message
+        ?? (sessionVerified
+          ? '已复用本次发送前的桌面会话校验结果。'
+          : '桌面 App Server 已确认目标会话；桌面当前页面无需切换。')
     };
   }
 
@@ -84,7 +116,7 @@ export class HybridCodexAdapter {
     this.selectDesktopAdapterForStatus(desktopStatus);
     this.emitDesktopProbeResult(context, desktopStatus);
 
-    if (!desktopStatus.desktopLive || (targetSessionId && desktopStatus.status !== 'verified')) {
+    if (!isDesktopTargetReady(desktopStatus, targetSessionId)) {
       throw createDesktopVerificationError({
         ...desktopStatus,
         message: desktopStatus.message
@@ -93,14 +125,14 @@ export class HybridCodexAdapter {
       });
     }
 
-    const adapter = this.desktopAdapter ?? this.scriptDesktopAdapter ?? this.cdpDesktopAdapter;
-    if (!adapter || typeof adapter.interrupt !== 'function') {
+    const selectedAdapter = this.desktopAdapter ?? this.scriptDesktopAdapter ?? this.cdpDesktopAdapter;
+    if (!selectedAdapter || typeof selectedAdapter.interrupt !== 'function') {
       throw new Error('当前桌面实时通道不支持中断');
     }
     try {
-      return await adapter.interrupt(context);
+      return await selectedAdapter.interrupt(context);
     } catch (error) {
-      if (await this.shouldRetryWithCdp(error, desktopStatus, targetSessionId)) {
+      if (await this.shouldRetryWithCdp(error, desktopStatus, targetSessionId, selectedAdapter)) {
         context.emit('codex.desktop_live.transport_retry', {
           from: desktopStatus.transport ?? 'script',
           to: 'cdp',
@@ -128,6 +160,14 @@ export class HybridCodexAdapter {
       normalizedTargetSessionId
     );
     if (this.shouldUseScriptStatus(scriptStatus, normalizedTargetSessionId)) {
+      this.desktopAdapter = this.scriptDesktopAdapter;
+      this.lastDesktopUnavailableError = null;
+      return {
+        ...scriptStatus,
+        cdpUnavailableReason: cdpStatus?.reason ?? cdpStatus?.message ?? ''
+      };
+    }
+    if (scriptStatus?.desktopLive === true) {
       this.desktopAdapter = this.scriptDesktopAdapter;
       this.lastDesktopUnavailableError = null;
       return {
@@ -166,8 +206,7 @@ export class HybridCodexAdapter {
       await withTimeout(
         this.cdpDesktopAdapter.probe(),
         timeoutMs,
-        '连接当前 Codex 桌面窗口超时',
-        () => this.cdpDesktopAdapter.close?.()
+        '连接当前 Codex 桌面窗口超时'
       );
       this.desktopAdapter = this.cdpDesktopAdapter;
       const checkedAt = new Date().toISOString();
@@ -178,32 +217,20 @@ export class HybridCodexAdapter {
           timeoutMs
         );
         const currentSessionId = await this.tryGetCurrentDesktopSessionId(timeoutMs);
-        if (targetVerification?.verified) {
-          this.lastDesktopUnavailableError = null;
-          return {
-            ok: true,
-            desktopLive: true,
-            status: 'verified',
-            currentSessionId,
-            targetSessionId: normalizedTargetSessionId,
-            sessionVerified: true,
-            targetVerified: true,
-            transport: 'cdp',
-            message: '已通过 Codex 桌面官方会话通道确认目标会话，可以按会话 ID 直接发送并同步桌面端状态。',
-            checkedAt
-          };
-        }
         if (!currentSessionId) {
           this.lastDesktopUnavailableError = null;
           return {
             ok: true,
             desktopLive: true,
-            status: 'unverified',
+            status: targetVerification?.verified === true ? 'target_ready' : 'unverified',
             currentSessionId: null,
             targetSessionId: normalizedTargetSessionId,
             sessionVerified: false,
+            targetVerified: targetVerification?.verified === true,
             transport: 'cdp',
-            message: '已连接桌面实时通道，但无法确认桌面当前会话，已阻止直接发送。',
+            message: targetVerification?.verified === true
+              ? '桌面 App Server 已确认目标会话；桌面当前页面无需切换。'
+              : '已连接桌面实时通道，但无法确认桌面当前会话，已阻止直接发送。',
             checkedAt
           };
         }
@@ -212,12 +239,15 @@ export class HybridCodexAdapter {
           return {
             ok: true,
             desktopLive: true,
-            status: 'mismatch',
+            status: targetVerification?.verified === true ? 'target_ready' : 'mismatch',
             currentSessionId,
             targetSessionId: normalizedTargetSessionId,
             sessionVerified: false,
+            targetVerified: targetVerification?.verified === true,
             transport: 'cdp',
-            message: '桌面当前会话与手机选择的会话不一致，已阻止发送以避免串线。',
+            message: targetVerification?.verified === true
+              ? '桌面 App Server 已确认手机选择的目标会话；桌面继续停留在当前页面。'
+              : '桌面当前会话与手机选择的会话不一致，且桌面 App Server 找不到目标会话，已阻止发送。',
             checkedAt
           };
         }
@@ -229,8 +259,9 @@ export class HybridCodexAdapter {
           currentSessionId,
           targetSessionId: normalizedTargetSessionId,
           sessionVerified: true,
+          targetVerified: targetVerification?.verified === true,
           transport: 'cdp',
-          message: '已校验：桌面当前会话与手机选择会话一致，可以实时发送。',
+          message: '已严格校验：桌面当前显示的会话与手机选择会话一致，可以实时发送。',
           checkedAt
         };
       }
@@ -269,7 +300,7 @@ export class HybridCodexAdapter {
     if (!targetSessionId) {
       return true;
     }
-    return status.sessionVerified === true;
+    return isDesktopTargetReady(status, targetSessionId);
   }
 
   shouldUseScriptStatus(status, targetSessionId) {
@@ -285,7 +316,7 @@ export class HybridCodexAdapter {
     if (!targetSessionId) {
       return true;
     }
-    if (status.sessionVerified === true) {
+    if (isDesktopTargetReady(status, targetSessionId)) {
       return true;
     }
     if (status.status === 'mismatch' && status.currentSessionId) {
@@ -308,11 +339,14 @@ export class HybridCodexAdapter {
     }
   }
 
-  async shouldRetryWithCdp(error, desktopStatus, targetSessionId) {
+  async shouldRetryWithCdp(error, desktopStatus, targetSessionId, attemptedAdapter = this.desktopAdapter) {
     if (!error?.safeToFallback) {
       return false;
     }
-    if (this.desktopAdapter !== this.scriptDesktopAdapter) {
+    if (normalizeTransport(desktopStatus?.transport) !== 'script') {
+      return false;
+    }
+    if (attemptedAdapter !== this.scriptDesktopAdapter) {
       return false;
     }
     if (!this.cdpDesktopAdapter || this.cdpDesktopAdapter === this.scriptDesktopAdapter) {
@@ -332,8 +366,7 @@ export class HybridCodexAdapter {
     return withTimeout(
       this.desktopAdapter.getCurrentConversationId(),
       timeoutMs,
-      '读取当前 Codex 桌面会话超时',
-      () => this.desktopAdapter.close?.()
+      '读取当前 Codex 桌面会话超时'
     );
   }
 
@@ -368,8 +401,7 @@ export class HybridCodexAdapter {
       return await withTimeout(
         adapter.verifyTargetSession(targetSessionId),
         timeoutMs,
-        '校验 Codex 桌面目标会话超时',
-        () => adapter.close?.()
+        '校验 Codex 桌面目标会话超时'
       );
     } catch {
       return null;
@@ -400,20 +432,50 @@ export class HybridCodexAdapter {
           targetSessionId,
           timeoutMs
         );
-        if (targetVerification?.verified) {
+        if (!currentSessionId) {
           return {
             ok: true,
             desktopLive: true,
-            status: 'verified',
-            currentSessionId,
+            status: targetVerification?.verified === true ? 'target_ready' : 'unverified',
+            currentSessionId: null,
             targetSessionId,
-            sessionVerified: true,
-            targetVerified: true,
+            sessionVerified: false,
+            targetVerified: targetVerification?.verified === true,
             transport: 'script',
-            message: '已通过 Codex 桌面官方会话通道确认目标会话，可以按会话 ID 直接发送并同步桌面端状态。',
+            message: targetVerification?.verified === true
+              ? '桌面 App Server 已确认目标会话；桌面当前页面无需切换。'
+              : '桌面脚本桥已连接，但无法确认桌面当前会话，已阻止直接发送。',
             checkedAt
           };
         }
+        if (currentSessionId !== targetSessionId) {
+          return {
+            ok: true,
+            desktopLive: true,
+            status: targetVerification?.verified === true ? 'target_ready' : 'mismatch',
+            currentSessionId,
+            targetSessionId,
+            sessionVerified: false,
+            targetVerified: targetVerification?.verified === true,
+            transport: 'script',
+            message: targetVerification?.verified === true
+              ? '桌面 App Server 已确认手机选择的目标会话；桌面继续停留在当前页面。'
+              : '桌面当前会话与手机选择的会话不一致，且桌面 App Server 找不到目标会话，已阻止发送。',
+            checkedAt
+          };
+        }
+        return {
+          ok: true,
+          desktopLive: true,
+          status: 'verified',
+          currentSessionId,
+          targetSessionId,
+          sessionVerified: true,
+          targetVerified: targetVerification?.verified === true,
+          transport: 'script',
+          message: '已严格校验：桌面当前显示的会话与手机选择会话一致，可以实时发送。',
+          checkedAt
+        };
       }
       if (!targetSessionId) {
         return {
@@ -428,43 +490,6 @@ export class HybridCodexAdapter {
           checkedAt
         };
       }
-      if (!currentSessionId) {
-        return {
-          ok: true,
-          desktopLive: true,
-          status: 'unverified',
-          currentSessionId: null,
-          targetSessionId,
-          sessionVerified: false,
-          transport: 'script',
-          message: '桌面脚本桥已连接，但无法确认桌面当前会话，已阻止直接发送。',
-          checkedAt
-        };
-      }
-      if (currentSessionId !== targetSessionId) {
-        return {
-          ok: true,
-          desktopLive: true,
-          status: 'mismatch',
-          currentSessionId,
-          targetSessionId,
-          sessionVerified: false,
-          transport: 'script',
-          message: '桌面当前会话与手机选择的会话不一致，已阻止发送以避免串线。',
-          checkedAt
-        };
-      }
-      return {
-        ok: true,
-        desktopLive: true,
-        status: 'verified',
-        currentSessionId,
-        targetSessionId,
-        sessionVerified: true,
-        transport: 'script',
-        message: '已校验：桌面当前会话与手机选择会话一致，可以实时发送。',
-        checkedAt
-      };
     } catch {
       return null;
     }
@@ -476,13 +501,14 @@ export class HybridCodexAdapter {
       timeoutMs: this.desktopProbeTimeoutMs,
       targetSessionId: status.targetSessionId ?? ''
     });
-    if (status.desktopLive && (!status.targetSessionId || status.sessionVerified)) {
+    if (isDesktopTargetReady(status, status.targetSessionId ?? '')) {
       context.emit('codex.desktop_live.available', {
         status: status.status,
         message: status.message,
         currentSessionId: status.currentSessionId ?? null,
         targetSessionId: status.targetSessionId ?? '',
         sessionVerified: status.sessionVerified ?? false,
+        targetVerified: status.targetVerified ?? false,
         transport: status.transport ?? 'unknown'
       });
       return;
@@ -494,6 +520,7 @@ export class HybridCodexAdapter {
       currentSessionId: status.currentSessionId ?? null,
       targetSessionId: status.targetSessionId ?? '',
       sessionVerified: status.sessionVerified ?? false,
+      targetVerified: status.targetVerified ?? false,
       transport: status.transport ?? 'unknown',
       safeToFallback: false
     });
@@ -508,11 +535,23 @@ function normalizeTransport(value) {
   return value === 'cdp' || value === 'script' ? value : '';
 }
 
+function isDesktopTargetReady(status, targetSessionId = '') {
+  if (!status || status.desktopLive !== true) {
+    return false;
+  }
+  const normalizedTargetSessionId = normalizeSessionId(targetSessionId);
+  if (!normalizedTargetSessionId) {
+    return true;
+  }
+  return status.sessionVerified === true || status.targetVerified === true;
+}
+
 function createDesktopVerificationError(status) {
   const error = new Error(status?.message || '桌面实时通道未校验，已阻止发送到现有会话。');
   error.status = status?.status ?? 'unavailable';
   error.currentSessionId = status?.currentSessionId ?? null;
   error.targetSessionId = status?.targetSessionId ?? '';
+  error.targetVerified = status?.targetVerified === true;
   error.reason = status?.reason ?? status?.message ?? '';
   return error;
 }
