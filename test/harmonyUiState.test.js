@@ -195,6 +195,7 @@ test('durable outbox tasks keep polling through the Codex run API and hand pendi
   const refreshBody = methodBody('refreshTask()');
   const routeBody = methodBody('taskUsesCodexRunApi(task: BridgeTask | BridgeTaskSummary): boolean');
   const handoffBody = methodBody('handoffPendingSessionSend(previousTaskId: string, task: BridgeTask): void');
+  const sendBody = methodBody('sendMessageToSelectedSession(retryFailedMessageId: string = \'\'): Promise<boolean>');
 
   assert.match(routeBody, /this\.taskUsesAppServer\(task\)/);
   assert.match(routeBody, /task\.runtime\?\.kind === 'durable_outbox'/);
@@ -204,6 +205,8 @@ test('durable outbox tasks keep polling through the Codex run API and hand pendi
   assert.match(handoffBody, /this\.pendingSessionSendsByTaskId\[previousTaskId\]/);
   assert.match(handoffBody, /next\[task\.id\] = pending/);
   assert.match(handoffBody, /this\.activeSessionTaskId === previousTaskId/);
+  assert.match(sendBody, /this\.currentTask\.runtime\?\.kind === 'durable_outbox'/);
+  assert.match(sendBody, /消息已排队，将在当前回合结束后按顺序自动发送/);
 });
 
 test('mobile negotiates Bridge compatibility and advances a monotonic task event cursor', () => {

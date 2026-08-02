@@ -409,6 +409,11 @@ test('thread service confirms an App Server interrupt as interrupted instead of 
   assert.equal(interrupted.status, 'interrupted');
   assert.equal(client.calls.filter((call) => call.method === 'turn/interrupt').length, 1);
   assert.equal(interrupted.runtime.canInterrupt, false);
+  assert.equal(interrupted.interruptRequested, false);
+  assert.equal(
+    interrupted.events.some((event) => event.type === 'codex.turn.interrupt.confirmed'),
+    true
+  );
 });
 
 test('thread service resolves a primary-session interrupt to its active App Server run', async () => {
@@ -675,9 +680,14 @@ test('thread lifecycle uses the App Server sandbox spelling and identifies the B
 
   const started = client.calls.find((call) => call.method === 'thread/start');
   const resumed = client.calls.find((call) => call.method === 'thread/resume');
-  assert.equal(started.params.sandbox, 'workspace-write');
+  const turn = client.calls.find((call) => call.method === 'turn/start');
+  assert.equal(started.params.sandbox, 'danger-full-access');
+  assert.equal(started.params.approvalPolicy, 'never');
   assert.equal(started.params.serviceName, 'codex_harmony_remote');
-  assert.equal(resumed.params.sandbox, 'workspace-write');
+  assert.equal(resumed.params.sandbox, 'danger-full-access');
+  assert.equal(resumed.params.approvalPolicy, 'never');
+  assert.deepEqual(turn.params.sandboxPolicy, { type: 'dangerFullAccess' });
+  assert.equal(turn.params.approvalPolicy, 'never');
 });
 
 class FakeRuntimeClient extends EventEmitter {

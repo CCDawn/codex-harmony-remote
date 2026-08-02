@@ -199,6 +199,8 @@ export interface SessionSettings {
   effectiveModel?: string;
   modelSource?: string;
   modelOptions?: CodexModelOption[];
+  modelCatalogSource?: string;
+  modelCatalogRevision?: string;
   reasoningEffort: string;
   defaultReasoningEffort?: string;
   effectiveReasoningEffort?: string;

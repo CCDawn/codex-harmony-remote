@@ -4343,9 +4343,11 @@ struct Index {
         });
         this.rememberTaskForSession(targetSessionId, this.currentTask.id, this.currentTask.status);
         this.markSessionRunning(targetSessionId);
-        this.message = guidanceSend
-          ? `引导已提交，正在确认 Codex 接收`
-          : `消息已提交，正在确认 Codex 接收`;
+        this.message = this.currentTask.runtime?.kind === 'durable_outbox'
+          ? '消息已排队，将在当前回合结束后按顺序自动发送'
+          : guidanceSend
+            ? `引导已提交，正在确认 Codex 接收`
+            : `消息已提交，正在确认 Codex 接收`;
         this.sessionMessage = '';
         this.restoreUnsentSessionAttachments(composed.failedImages, composed.failedFiles);
         if (composed.failedImages.length > 0 || composed.failedFiles.length > 0) {
@@ -7258,7 +7260,7 @@ struct Index {
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? this.desktopDefaultReasoningEffort);
       this.reasoningEffortLoadedSessionId = sessionId;
       this.reasoningEffortLoadedAt = Date.now();
-      this.log('info', 'session.model_catalog.loaded', `sessionId=${sessionId}; force=${force}; model=${this.sessionModel || 'auto'}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; effort=${this.sessionReasoningEffort || 'auto'}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
+      this.log('info', 'session.model_catalog.loaded', `sessionId=${sessionId}; force=${force}; source=${settings.modelCatalogSource ?? 'unknown'}; revision=${settings.modelCatalogRevision ?? 'unknown'}; model=${this.sessionModel || 'auto'}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; effort=${this.sessionReasoningEffort || 'auto'}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
     } catch (error) {
       this.sessionModel = '';
       this.sessionReasoningEffort = '';
@@ -7280,7 +7282,7 @@ struct Index {
       this.availableModels = this.normalizeModelOptions(settings.modelOptions ?? []);
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? '');
       this.desktopModelDefaultsLoadedAt = Date.now();
-      this.log('info', 'session.model_catalog.refreshed', `force=${force}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
+      this.log('info', 'session.model_catalog.refreshed', `force=${force}; source=${settings.modelCatalogSource ?? 'unknown'}; revision=${settings.modelCatalogRevision ?? 'unknown'}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
     } catch (error) {
       this.desktopModelDefaultsLoadedAt = 0;
       this.log('warn', 'session.model_catalog.refresh_failed', `force=${force}; message=${this.errorText(error)}`);
@@ -8450,7 +8452,7 @@ struct Index {
     if (task.status === 'interrupted') {
       return '已中断当前会话';
     }
-    return '已发送中断请求';
+    return '已发送中断请求；可以继续输入，新消息会在中断确认后按顺序发送';
   }
 
   private isInterruptFailureTask(task: BridgeTask): boolean {

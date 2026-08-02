@@ -72,7 +72,7 @@ function runtimeSession(session, activeRun, officialState, epoch) {
     : officialState
       ? String(officialState.activeTurnId ?? '').trim()
       : projectedTurnId;
-  const stateUpdatedAt = String(
+  let stateUpdatedAt = String(
     activeRun?.updatedAt
       ?? officialState?.updatedAt
       ?? session?.runtimeUpdatedAt
@@ -89,9 +89,22 @@ function runtimeSession(session, activeRun, officialState, epoch) {
   if (activeRun) {
     const runState = normalizeRuntimeSnapshotState(activeRun.status ?? activeRun.runtime?.state);
     const runTurnId = String(activeRun.turnId ?? activeRun.activeCodexTurnId ?? '').trim();
+    const officialRunState = normalizeRuntimeSnapshotState(officialState?.state ?? officialState?.status);
+    const officialTurnId = String(officialState?.activeTurnId ?? officialState?.turnId ?? '').trim();
+    const officialTerminalForRun = Boolean(
+      officialState
+      && runTurnId
+      && officialTurnId === runTurnId
+      && TERMINAL_STATES.has(officialRunState)
+    );
     runId = String(activeRun.id ?? '');
-    generation = numberOrNull(activeRun.generation);
-    if (
+    if (officialTerminalForRun) {
+      state = officialRunState;
+      reason = 'official_terminal_sticky';
+      generation = numberOrNull(officialState.generation);
+      source = String(officialState.source ?? 'desktop-app-server');
+      stateUpdatedAt = String(officialState.updatedAt ?? stateUpdatedAt);
+    } else if (
       runTurnId
       && projectedTurnId === runTurnId
       && TERMINAL_STATES.has(projectedState)
@@ -101,15 +114,16 @@ function runtimeSession(session, activeRun, officialState, epoch) {
       // claims: terminal is sticky and the stale run must not override it.
       state = projectedState;
       reason = 'official_terminal_sticky';
+      generation = numberOrNull(activeRun.generation);
+      source = String(session?.runtimeSource ?? session?.activitySource ?? session?.source ?? 'unknown');
     } else {
       state = runState;
+      generation = numberOrNull(activeRun.generation);
       reason = runTurnId && projectedTurnId && runTurnId !== projectedTurnId
         ? 'newer_turn_active'
         : 'active_run';
+      source = 'app-server-run';
     }
-    source = reason === 'official_terminal_sticky'
-      ? String(session?.runtimeSource ?? session?.activitySource ?? session?.source ?? 'unknown')
-      : 'app-server-run';
   } else if (officialState) {
     state = normalizeRuntimeSnapshotState(officialState.state ?? officialState.status);
     reason = 'official_state';

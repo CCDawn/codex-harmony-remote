@@ -89,16 +89,29 @@ export function effectiveCodexSettings(settings, defaults = {}) {
   const defaultModel = safeNormalizeModelId(defaults?.model ?? '');
   const defaultReasoningEffort = safeNormalizeReasoningEffort(defaults?.reasoningEffort ?? '');
   const modelOptions = normalizeModelOptions(defaults?.models ?? [], defaultModel);
+  const modelCatalogSource = String(defaults?.source ?? defaults?.modelCatalogSource ?? '');
+  const providedModelCatalogRevision = String(defaults?.modelCatalogRevision ?? '').trim();
+  const modelCatalogRevision = providedModelCatalogRevision
+    || buildModelCatalogRevision(defaultModel, modelOptions);
   return {
     ...normalizedSettings,
     defaultModel,
     effectiveModel: normalizedSettings.model || defaultModel,
     modelSource: normalizedSettings.model ? 'session' : 'desktop',
     modelOptions,
+    modelCatalogSource,
+    modelCatalogRevision,
     defaultReasoningEffort,
     effectiveReasoningEffort: normalizedSettings.reasoningEffort || defaultReasoningEffort,
     reasoningEffortSource: normalizedSettings.reasoningEffort ? 'session' : 'desktop'
   };
+}
+
+function buildModelCatalogRevision(defaultModel, modelOptions) {
+  return [
+    defaultModel,
+    ...modelOptions.map((option) => option.id)
+  ].join('|');
 }
 
 function safeNormalizeReasoningEffort(value) {

@@ -9,17 +9,10 @@ export async function readDesktopCodexSettings(options = {}) {
   });
   const closeClient = options.client ? false : true;
   try {
-    const configResult = await client.request('config/read', {
+    return await readCodexSettingsFromClient(client, fallback, {
       cwd: options.cwd ?? null,
-      includeLayers: false
+      source: 'desktop_cdp'
     });
-    const config = configResult?.config ?? {};
-    const models = await readDesktopModelList(client);
-    return {
-      model: safeNormalizeModelId(config.model ?? fallback.model),
-      reasoningEffort: safeNormalizeReasoningEffort(config.model_reasoning_effort ?? fallback.reasoningEffort),
-      models
-    };
   } catch {
     return fallback;
   } finally {
@@ -27,6 +20,22 @@ export async function readDesktopCodexSettings(options = {}) {
       client.close();
     }
   }
+}
+
+export async function readAppServerCodexSettings(threadService, options = {}) {
+  if (!threadService || typeof threadService.requestAppServer !== 'function') {
+    throw new Error('Managed Codex App Server settings are unavailable');
+  }
+  const fallback = await readConfigFileDefaults(options);
+  const client = {
+    request(method, params) {
+      return threadService.requestAppServer(method, params);
+    }
+  };
+  return await readCodexSettingsFromClient(client, fallback, {
+    cwd: options.cwd ?? null,
+    source: 'app_server'
+  });
 }
 
 async function readConfigFileDefaults(options) {
@@ -37,6 +46,7 @@ async function readConfigFileDefaults(options) {
   return {
     model,
     reasoningEffort,
+    source: 'config_file',
     models: model ? [{
       id: model,
       model,
@@ -47,17 +57,23 @@ async function readConfigFileDefaults(options) {
   };
 }
 
-async function readDesktopModelList(client) {
-  try {
-    const result = await client.request('model/list', {
-      cursor: null,
-      includeHidden: false,
-      limit: 50
-    });
-    return Array.isArray(result?.data) ? result.data : [];
-  } catch {
-    return [];
-  }
+async function readCodexSettingsFromClient(client, fallback, options) {
+  const configResult = await client.request('config/read', {
+    cwd: options.cwd,
+    includeLayers: false
+  });
+  const config = configResult?.config ?? {};
+  const modelResult = await client.request('model/list', {
+    cursor: null,
+    includeHidden: false,
+    limit: 100
+  });
+  return {
+    model: safeNormalizeModelId(config.model ?? fallback.model),
+    reasoningEffort: safeNormalizeReasoningEffort(config.model_reasoning_effort ?? fallback.reasoningEffort),
+    source: options.source,
+    models: Array.isArray(modelResult?.data) ? modelResult.data : []
+  };
 }
 
 function safeNormalizeModelId(value) {

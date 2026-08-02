@@ -2244,6 +2244,50 @@ test('exposes desktop default reasoning effort for automatic session settings', 
   }
 });
 
+test('default settings endpoint reads the managed App Server model catalog before CDP fallback', async () => {
+  const config = createTestConfig();
+  delete config.codexSettingsProvider;
+  const threadService = new FakeThreadService();
+  const calls = [];
+  threadService.requestAppServer = async (method) => {
+    calls.push(method);
+    if (method === 'config/read') {
+      return { config: { model: 'gpt-5.6-terra', model_reasoning_effort: 'high' } };
+    }
+    if (method === 'model/list') {
+      return {
+        data: [
+          { id: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra' },
+          { id: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol' },
+          { id: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna' }
+        ]
+      };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  config.threadService = threadService;
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/settings`);
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.settings.modelCatalogSource, 'app_server');
+    assert.equal(body.settings.defaultModel, 'gpt-5.6-terra');
+    assert.deepEqual(body.settings.modelOptions.map((model) => model.id), [
+      'gpt-5.6-terra',
+      'gpt-5.6-sol',
+      'gpt-5.6-luna'
+    ]);
+    assert.deepEqual(calls, ['config/read', 'model/list']);
+  } finally {
+    server.close();
+  }
+});
+
 test('exposes Codex account usage from the configured usage provider', async () => {
   const config = createTestConfig();
   let called = false;

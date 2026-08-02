@@ -35,11 +35,11 @@ export class CodexThreadService {
     this.sandbox = options.sandbox
       ?? process.env.CODEX_BRIDGE_APP_SERVER_SANDBOX
       ?? process.env.CODEX_BRIDGE_SANDBOX
-      ?? 'workspace-write';
+      ?? 'danger-full-access';
     this.approvalPolicy = options.approvalPolicy
       ?? process.env.CODEX_BRIDGE_APP_SERVER_APPROVAL_POLICY
       ?? process.env.CODEX_BRIDGE_APPROVAL_POLICY
-      ?? 'on-request';
+      ?? 'never';
     this.runs = new Map();
     this.runsBySubmissionId = new Map();
     this.newThreadRunsBySubmissionId = new Map();
@@ -50,6 +50,7 @@ export class CodexThreadService {
     this.runtimeSnapshotTracker = new SessionRuntimeSnapshotTracker({
       epoch: options.runtimeSnapshotEpoch
     });
+    this.lastRuntimeSnapshotLoggedRevision = 0;
     this.converter = new CodexAppServerEventConverter();
     this.runJournal = options.runJournal ?? new CodexAppServerRunJournal({
       filePath: options.runStatePath === undefined
@@ -136,12 +137,28 @@ export class CodexThreadService {
         });
       }
     }
-    return this.runtimeSnapshotTracker.build({
+    const snapshot = this.runtimeSnapshotTracker.build({
       sessions,
       activeRuns: [...this.runs.values()],
       officialStates,
       stale
     });
+    if (snapshot.revision !== this.lastRuntimeSnapshotLoggedRevision) {
+      this.lastRuntimeSnapshotLoggedRevision = snapshot.revision;
+      const decisions = snapshot.decisions.filter((decision) => (
+        decision.reason === 'official_terminal_sticky'
+        || decision.reason === 'newer_turn_active'
+      ));
+      this.addServiceEvent('runtime.snapshot.reconciled', {
+        epoch: snapshot.epoch,
+        revision: snapshot.revision,
+        stale: snapshot.stale,
+        sessionCount: snapshot.sessions.length,
+        conflictCount: decisions.length,
+        decisions: decisions.slice(0, 50)
+      });
+    }
+    return snapshot;
   }
 
   async listAppServerThreads({ limit, query }) {
@@ -493,6 +510,13 @@ export class CodexThreadService {
     }
 
     const start = async () => {
+      this.addServiceEvent('policy.effective', {
+        operation: 'thread/start',
+        sandbox: this.sandbox,
+        approvalPolicy: this.approvalPolicy,
+        projectId: resolvedProjectId,
+        submissionId: normalizedSubmissionId
+      });
       const response = await this.requestAppServer('thread/start', {
         cwd: resolvedCwd,
         approvalPolicy: this.approvalPolicy,
@@ -796,6 +820,17 @@ export class CodexThreadService {
     const run = this.runs.get(approval.runId);
     if (!run || isTerminalActivityStatus(run.status)) {
       return;
+    }
+    if (this.approvalPolicy === 'never') {
+      this.addServiceEvent('policy.mismatch', {
+        operation: 'approval/required',
+        configuredApprovalPolicy: this.approvalPolicy,
+        configuredSandbox: this.sandbox,
+        approvalId: approval.id,
+        runId: approval.runId,
+        threadId: approval.threadId,
+        turnId: approval.turnId
+      });
     }
     run.status = 'waiting_approval';
     run.pendingApprovalId = approval.id;
@@ -1181,6 +1216,7 @@ export class CodexThreadService {
       this.markLiveSessionTerminal(run.threadId, status, run.updatedAt, run.turnId);
       this.removeLiveActivity(run.threadId, run.turnId);
     }
+    this.resolveInterruptRequest(run, status, `recovery:${reason}`);
     const eventType = status === 'failed' ? 'codex.run.recovery_failed' : 'codex.run.recovered_terminal';
     this.addRunEvent(run, eventType, this.recoveryEventPayload(
       run,
@@ -1256,6 +1292,13 @@ export class CodexThreadService {
     this.activeRunsByThreadId.set(run.threadId, run.id);
     this.addRunEvent(run, 'codex.turn.preparing', { threadId: run.threadId });
     this.schedulePersistRuns();
+    this.addRunEvent(run, 'policy.effective', {
+      operation: 'turn/start',
+      sandbox: this.sandbox,
+      approvalPolicy: this.approvalPolicy,
+      threadId: run.threadId,
+      submissionId: run.submissionId
+    });
 
     try {
       await this.requestAppServer('thread/resume', {
@@ -1344,6 +1387,7 @@ export class CodexThreadService {
         } else {
           run.status = 'completed';
         }
+        this.resolveInterruptRequest(run, run.status, `notification:${item.type}`);
         await this.finishRun(run);
       }
     }
@@ -1437,6 +1481,21 @@ export class CodexThreadService {
     this.eventBus?.publish?.(run.id, event);
     void this.writeLog(type, { runId: run.id, threadId: run.threadId, payload: event.payload });
     return event;
+  }
+
+  resolveInterruptRequest(run, terminalStatus, resolution) {
+    if (run.interruptRequested !== true || !isTerminalActivityStatus(terminalStatus)) {
+      return;
+    }
+    run.interruptRequested = false;
+    this.addRunEvent(run, 'codex.turn.interrupt.confirmed', {
+      threadId: run.threadId,
+      turnId: run.turnId,
+      terminalStatus,
+      resolution,
+      generation: Number(run.generation ?? this.clientGeneration()) || 0,
+      epoch: this.runtimeSnapshotTracker.epoch
+    });
   }
 
   openDesktopThread(run, stage) {

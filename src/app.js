@@ -18,7 +18,7 @@ import { DesktopLiveRecovery } from './desktopLiveRecovery.js';
 import { DesktopLiveDiagnostics } from './desktopLiveDiagnostics.js';
 import { SessionSettingsStore, normalizeModelId, normalizeReasoningEffort } from './sessionSettingsStore.js';
 import { effectiveCodexSettings, readCodexDefaultReasoningEffort } from './codexUserConfig.js';
-import { readDesktopCodexSettings } from './codexDesktopSettings.js';
+import { readAppServerCodexSettings, readDesktopCodexSettings } from './codexDesktopSettings.js';
 import { readDesktopVisibleReasoningEffort } from './desktopReasoningEffort.js';
 import { readCodexAccountUsage } from './codexAccountUsage.js';
 import { collectLinkHealth, recoverHdcLink } from './linkHealth.js';
@@ -40,7 +40,6 @@ export function createApp({ config, adapter }) {
     repoRoot: config.repoRoot ?? process.cwd()
   });
   const defaultReasoningEffortProvider = config.defaultReasoningEffortProvider ?? readEffectiveDesktopReasoningEffort;
-  const codexSettingsProvider = config.codexSettingsProvider ?? readDesktopCodexSettings;
   const accountUsageProvider = config.accountUsageProvider ?? readCodexAccountUsage;
   const desktopOpener = config.desktopOpener
     ?? (typeof adapter?.openDesktopThread === 'function'
@@ -60,8 +59,13 @@ export function createApp({ config, adapter }) {
     archiveThreadProvider: typeof adapter?.archiveThread === 'function'
       ? adapter.archiveThread.bind(adapter)
       : null,
+    model: config.model,
+    sandbox: config.appServerSandbox ?? config.sandbox,
+    approvalPolicy: config.appServerApprovalPolicy ?? config.approvalPolicy,
     allowIndependentAppServer: appServerRuntimeMode(config) !== 'desktop'
   });
+  const codexSettingsProvider = config.codexSettingsProvider
+    ?? (() => readPrimaryCodexSettings({ threadService }));
   const desktopLiveRecovery = config.desktopLiveRecovery ?? new DesktopLiveRecovery({
     repoRoot: config.repoRoot ?? process.cwd(),
     bridgeUrl: config.localBridgeUrl ?? `http://127.0.0.1:${config.port ?? 8787}`
@@ -675,8 +679,18 @@ async function route({ request, response, config, store, outbox, eventBus, logge
   }
 
   if (method === 'GET' && url.pathname === '/api/codex/settings') {
+    const settings = effectiveCodexSettings(
+      {},
+      await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider })
+    );
+    await logger.write('bridge', 'info', 'model.catalog.loaded', {
+      source: settings.modelCatalogSource,
+      revision: settings.modelCatalogRevision,
+      modelCount: settings.modelOptions.length,
+      defaultModel: settings.defaultModel
+    }).catch(() => {});
     sendJson(response, 200, {
-      settings: effectiveCodexSettings({}, await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider }))
+      settings
     });
     return;
   }
@@ -1165,6 +1179,7 @@ async function getDefaultCodexSettings({ codexSettingsProvider, defaultReasoning
     return {
       model: '',
       reasoningEffort: fallbackReasoningEffort,
+      source: '',
       models: []
     };
   }
@@ -1174,14 +1189,25 @@ async function getDefaultCodexSettings({ codexSettingsProvider, defaultReasoning
     return {
       model: normalizeModelId(settings?.model ?? ''),
       reasoningEffort: providerReasoningEffort || fallbackReasoningEffort,
+      source: String(settings?.source ?? settings?.modelCatalogSource ?? ''),
+      modelCatalogRevision: String(settings?.modelCatalogRevision ?? ''),
       models: Array.isArray(settings?.models) ? settings.models : []
     };
   } catch {
     return {
       model: '',
       reasoningEffort: fallbackReasoningEffort,
+      source: '',
       models: []
     };
+  }
+}
+
+async function readPrimaryCodexSettings({ threadService }) {
+  try {
+    return await readAppServerCodexSettings(threadService);
+  } catch {
+    return await readDesktopCodexSettings();
   }
 }
 
