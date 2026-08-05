@@ -293,3 +293,59 @@ test('outbox never steers a message into a turn whose interrupt is still pending
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test('outbox reconciles a restored run before deciding whether the lane is busy', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-recovering-'));
+  const outboxPath = path.join(root, 'outbox.json');
+  const runs = [{
+    id: 'run-recovering',
+    threadId: 'thread-a',
+    codexSessionId: 'thread-a',
+    status: 'recovering',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    events: []
+  }];
+  const dispatched = [];
+  let reconciliations = 0;
+  const fixture = await createFixture({
+    outboxPath,
+    runs,
+    onSend: async (input) => {
+      dispatched.push(input.submissionId);
+      return {
+        id: `run-${input.submissionId}`,
+        projectId: input.projectId,
+        threadId: input.threadId,
+        codexSessionId: input.threadId,
+        submissionId: input.submissionId,
+        status: 'running',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        events: []
+      };
+    },
+    threadServiceOverrides: {
+      async reconcilePersistedRun(run) {
+        reconciliations += 1;
+        run.status = 'interrupted';
+        return run;
+      },
+      canSteerThread() {
+        return false;
+      }
+    }
+  });
+
+  try {
+    const response = await send(fixture.baseUrl, 'recovering-release-1', '继续');
+    const body = await response.json();
+    assert.equal(response.status, 202);
+    assert.equal(body.outbox.status, 'submitted');
+    assert.equal(reconciliations, 1);
+    assert.deepEqual(dispatched, ['recovering-release-1']);
+  } finally {
+    fixture.server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

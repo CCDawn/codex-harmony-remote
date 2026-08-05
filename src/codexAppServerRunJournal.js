@@ -58,10 +58,19 @@ export class CodexAppServerRunJournal {
       if (!Array.isArray(entries)) {
         return [];
       }
-      return entries
+      const recoverable = entries
         .filter((entry) => entry && typeof entry === 'object' && ACTIVE_STATUSES.has(String(entry.status ?? '')))
         .filter((entry) => isRecoverableRunIdentifier(entry))
-        .map((entry) => restoreRun(entry));
+        .filter((entry) => Number.isFinite(recoveryTimestamp(entry)));
+      const newestByThreadId = new Map();
+      for (const entry of recoverable) {
+        const threadId = String(entry.threadId ?? entry.codexSessionId ?? '').trim();
+        const current = newestByThreadId.get(threadId);
+        if (!current || compareRecoveryRecency(entry, current) > 0) {
+          newestByThreadId.set(threadId, entry);
+        }
+      }
+      return [...newestByThreadId.values()].map((entry) => restoreRun(entry));
     } catch {
       return [];
     }
@@ -74,6 +83,7 @@ export class CodexAppServerRunJournal {
     const recoverable = runs
       .filter((run) => run && ACTIVE_STATUSES.has(String(run.status ?? '')))
       .filter((run) => isRecoverableRunIdentifier(run))
+      .filter((run) => hasValidOrMissingRecoveryTimestamp(run))
       .map((run) => snapshotRun(run));
     const directory = path.dirname(this.filePath);
     try {
@@ -132,6 +142,32 @@ function restoreRun(entry) {
     deliveryMode: normalizeDeliveryMode(entry.deliveryMode),
     generation: Number(entry.generation ?? 0) || 0
   };
+}
+
+function recoveryTimestamp(entry) {
+  const updatedAt = Date.parse(String(entry?.updatedAt ?? ''));
+  if (Number.isFinite(updatedAt)) {
+    return updatedAt;
+  }
+  return Date.parse(String(entry?.createdAt ?? ''));
+}
+
+function compareRecoveryRecency(left, right) {
+  const updatedDifference = recoveryTimestamp(left) - recoveryTimestamp(right);
+  if (updatedDifference !== 0) {
+    return updatedDifference;
+  }
+  const createdDifference = Date.parse(String(left?.createdAt ?? ''))
+    - Date.parse(String(right?.createdAt ?? ''));
+  return Number.isFinite(createdDifference) && createdDifference !== 0
+    ? createdDifference
+    : 0;
+}
+
+function hasValidOrMissingRecoveryTimestamp(entry) {
+  const updatedAt = String(entry?.updatedAt ?? '').trim();
+  const createdAt = String(entry?.createdAt ?? '').trim();
+  return (!updatedAt && !createdAt) || Number.isFinite(recoveryTimestamp(entry));
 }
 
 function nullableString(value) {

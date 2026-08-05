@@ -2216,13 +2216,28 @@ async function canDispatchOutboxItem({ item, store, threadService }) {
       return typeof store.canSteerSessionTask === 'function'
         && store.canSteerSessionTask(item.threadId);
     }
-    const activeRun = typeof threadService?.listRuns === 'function'
+    let activeRun = typeof threadService?.listRuns === 'function'
       ? threadService.listRuns().find((run) => (
           (run.threadId === item.threadId || run.codexSessionId === item.threadId)
           && activeStatuses.has(String(run.status ?? '').toLowerCase())
         ))
       : null;
     if (activeRun) {
+      if (
+        String(activeRun.status ?? '').toLowerCase() === 'recovering'
+        && typeof threadService?.reconcilePersistedRun === 'function'
+      ) {
+        try {
+          activeRun = await threadService.reconcilePersistedRun(activeRun);
+        } catch {
+          // Dispatch remains the authoritative target check. A recovery probe
+          // must not leave the lane permanently queued when its owner vanished.
+          return true;
+        }
+        if (!activeStatuses.has(String(activeRun?.status ?? '').toLowerCase())) {
+          return true;
+        }
+      }
       if (activeRun.interruptRequested === true) {
         return {
           allowed: false,

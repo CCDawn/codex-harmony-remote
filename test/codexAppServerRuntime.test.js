@@ -11,6 +11,8 @@ import { CodexThreadService } from '../src/codexThreadService.js';
 const THREAD_1 = '019e0000-0000-7000-8000-000000000001';
 const TURN_1 = '019e0000-0000-7000-8000-000000000002';
 const TURN_2 = '019e0000-0000-7000-8000-000000000003';
+const THREAD_2 = '019e0000-0000-7000-8000-000000000004';
+const TURN_3 = '019e0000-0000-7000-8000-000000000005';
 
 test('run journal persists only recoverable run metadata and never the prompt or command bodies', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-runs-'));
@@ -95,6 +97,13 @@ test('run journal never persists synthetic probe identifiers and requires Codex-
     turnId: 'also-not-a-uuid',
     status: 'running'
   }, {
+    id: 'run-invalid-time',
+    threadId: THREAD_2,
+    turnId: TURN_3,
+    status: 'running',
+    createdAt: 'not-a-time',
+    updatedAt: 'not-a-time'
+  }, {
     id: 'run-valid',
     threadId: THREAD_1,
     turnId: TURN_1,
@@ -116,6 +125,44 @@ test('run journal never persists synthetic probe identifiers and requires Codex-
     }]
   }));
   assert.deepEqual(journal.load(), []);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('run journal restores only the newest active run for each thread', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-app-server-runs-'));
+  const filePath = path.join(directory, 'runs.json');
+  const journal = new CodexAppServerRunJournal({ filePath });
+
+  fs.writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    runs: [{
+      id: 'run-newest',
+      threadId: THREAD_1,
+      turnId: TURN_2,
+      status: 'running',
+      createdAt: '2026-07-28T00:00:02.000Z',
+      updatedAt: '2026-07-28T00:00:03.000Z'
+    }, {
+      id: 'run-old',
+      threadId: THREAD_1,
+      turnId: TURN_1,
+      status: 'running',
+      createdAt: '2026-07-28T00:00:00.000Z',
+      updatedAt: '2026-07-28T00:00:01.000Z'
+    }, {
+      id: 'run-other-thread',
+      threadId: THREAD_2,
+      turnId: TURN_3,
+      status: 'waiting_approval',
+      createdAt: '2026-07-28T00:00:04.000Z',
+      updatedAt: '2026-07-28T00:00:05.000Z'
+    }]
+  }));
+
+  assert.deepEqual(
+    journal.load().map((entry) => entry.id),
+    ['run-newest', 'run-other-thread']
+  );
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
