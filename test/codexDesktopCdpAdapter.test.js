@@ -182,6 +182,54 @@ test('CodexDesktopCdpAdapter does not resume an already verified current desktop
   assert.equal(skipped.payload.threadId, '019e-existing-thread');
 });
 
+test('CodexDesktopCdpAdapter does not treat current-session notification noise as a resume failure', async () => {
+  const client = new ResumeReloadDesktopClient();
+  const adapter = new CodexDesktopCdpAdapter({
+    client,
+    postResumeCdpRecoveryTimeoutMs: 5,
+    postResumeCdpRecoveryIntervalMs: 1,
+    postResumeCdpStablePasses: 20
+  });
+  const events = [];
+
+  const resultPromise = adapter.run({
+    task: {
+      id: 'task-current-session-noise',
+      prompt: '首发不要误报失败',
+      codexSessionId: '019e-existing-thread',
+      verifiedDesktopStatus: {
+        desktopLive: true,
+        currentSessionId: '019e-existing-thread',
+        targetSessionId: '019e-existing-thread',
+        sessionVerified: true,
+        targetVerified: true
+      }
+    },
+    project: { root: 'C:\\work' },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  await client.waitForRequest('turn/start');
+  client.notifications.push({
+    method: 'turn/completed',
+    params: {
+      threadId: '019e-existing-thread',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [{ type: 'agentMessage', id: 'msg-current-noise', text: '首发已成功。' }]
+      }
+    }
+  });
+
+  const result = await resultPromise;
+  assert.equal(result.exitCode, 0);
+  assert.equal(client.requests.filter((request) => request.method === 'turn/start').length, 1);
+  assert.equal(client.requests.some((request) => request.method === 'thread/resume'), false);
+  assert.equal(events.some((event) => event.type === 'codex.desktop_live.post_resume_recovery_started'), false);
+  assert.ok(events.some((event) => event.type === 'codex.desktop_live.noise_clear_failed'));
+});
+
 test('CodexDesktopCdpAdapter steers the active desktop turn with text and local image input', async () => {
   const requests = [];
   const client = {

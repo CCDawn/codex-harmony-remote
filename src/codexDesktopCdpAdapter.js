@@ -189,15 +189,24 @@ export class CodexDesktopCdpAdapter {
     let turnSubmitted = false;
 
     try {
-      const thread = task.codexSessionId
+      const prepared = task.codexSessionId
         ? await this.prepareExistingThread(task, project, emit)
-        : await this.startThread(task, project, emit);
+        : {
+            thread: await this.startThread(task, project, emit),
+            resumed: true
+          };
+      const thread = prepared.thread;
       const sessionFileCursor = task.codexSessionId
         ? await this.captureSessionFileCursor(task, emit)
         : null;
       const noiseClear = await this.clearDesktopNotificationNoise(thread.id, emit);
-      if (!noiseClear.ok && noiseClear.transportError) {
+      if (!noiseClear.ok && noiseClear.transportError && prepared.resumed) {
         await this.waitForPostResumeCdpRecovery(thread.id, emit);
+      } else if (!noiseClear.ok && noiseClear.transportError) {
+        emit('codex.desktop_live.noise_clear_ignored_current', {
+          threadId: thread.id,
+          message: '当前桌面会话未执行恢复或重载；忽略通知清理的瞬时 CDP 错误，继续通过 app-server 提交消息。'
+        });
       }
       notificationPolling = this.startNotificationPolling(thread.id, notifications, emit);
 
@@ -1409,9 +1418,15 @@ export class CodexDesktopCdpAdapter {
         source: verified.source,
         message: '目标会话已在桌面端打开且通过实时 thread/read 校验，已跳过会触发渲染进程重载的 thread/resume。'
       });
-      return verified.thread;
+      return {
+        thread: verified.thread,
+        resumed: false
+      };
     }
-    return this.resumeThread(task, project, emit, verified);
+    return {
+      thread: await this.resumeThread(task, project, emit, verified),
+      resumed: true
+    };
   }
 
   async startTurn(thread, task) {
