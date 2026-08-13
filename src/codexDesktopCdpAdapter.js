@@ -58,6 +58,12 @@ export class CodexDesktopCdpAdapter {
         ?? '2',
       10
     );
+    this.resumeAckTimeoutMs = Number.parseInt(
+      options.resumeAckTimeoutMs
+        ?? process.env.CODEX_BRIDGE_DESKTOP_RESUME_ACK_TIMEOUT_MS
+        ?? '5000',
+      10
+    );
     this.interruptTurnLookupTimeoutMs = Number.parseInt(
       options.interruptTurnLookupTimeoutMs ?? process.env.CODEX_BRIDGE_INTERRUPT_TURN_LOOKUP_TIMEOUT_MS ?? '5000',
       10
@@ -1451,7 +1457,7 @@ export class CodexDesktopCdpAdapter {
 
   async resumeThread(task, project, emit, verified = {}) {
     try {
-      const response = await this.client.request('thread/resume', {
+      const response = await withThreadResumeAckTimeout(this.client.request('thread/resume', {
         threadId: task.codexSessionId,
         cwd: null,
         approvalPolicy: this.approvalPolicy,
@@ -1460,7 +1466,7 @@ export class CodexDesktopCdpAdapter {
         modelProvider: null,
         config: null,
         serviceTier: null
-      });
+      }), this.resumeAckTimeoutMs);
       emit('codex.app_server.thread.resumed', summarizeThreadForEvent(response));
       return response.thread;
     } catch (error) {
@@ -1567,7 +1573,11 @@ function isDesktopScriptTimeout(error) {
   if (!error || typeof error !== 'object') {
     return false;
   }
-  if (error.code === 'DESKTOP_SCRIPT_APP_SERVER_TIMEOUT' || error.code === 'DESKTOP_SCRIPT_HOST_TIMEOUT') {
+  if (
+    error.code === 'DESKTOP_SCRIPT_APP_SERVER_TIMEOUT'
+    || error.code === 'DESKTOP_SCRIPT_HOST_TIMEOUT'
+    || error.code === 'DESKTOP_THREAD_RESUME_ACK_TIMEOUT'
+  ) {
     return true;
   }
   return /等待桌面脚本桥.*响应超时/.test(String(error.message ?? ''));
@@ -1587,6 +1597,26 @@ function isRecoverablePostSubmitAckError(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withThreadResumeAckTimeout(request, timeoutMs) {
+  const boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5000;
+  let timeoutId;
+  try {
+    return await Promise.race([
+      request,
+      new Promise((resolve, reject) => {
+        timeoutId = setTimeout(() => {
+          const error = new Error(`等待 Codex 桌面 thread/resume 确认超时（${boundedTimeoutMs}ms）`);
+          error.code = 'DESKTOP_THREAD_RESUME_ACK_TIMEOUT';
+          error.method = 'thread/resume';
+          reject(error);
+        }, boundedTimeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 function buildSessionFileCompletedTurn({ threadId, turnId, filePath = '', userText, assistantText, status = 'completed' }) {

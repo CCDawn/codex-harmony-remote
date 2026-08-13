@@ -402,6 +402,42 @@ test('CodexDesktopCdpAdapter recovers from a desktop script resume timeout with 
   assert.ok(events.some((event) => event.type === 'codex.app_server.thread.resume_recovered'));
 });
 
+test('CodexDesktopCdpAdapter does not wait for a hanging thread/resume acknowledgement before starting a turn', async () => {
+  const client = new HangingResumeAckDesktopClient();
+  const adapter = new CodexDesktopCdpAdapter({ client, resumeAckTimeoutMs: 5 });
+  const events = [];
+
+  const resultPromise = adapter.run({
+    task: {
+      id: 'task-resume-ack-hang',
+      prompt: '这是手机消息，你看一下是否正确',
+      codexSessionId: '019e-existing-thread'
+    },
+    project: { root: 'C:\\work' },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  await client.waitForRequest('turn/start');
+  client.notifications.push({
+    method: 'turn/completed',
+    params: {
+      threadId: '019e-existing-thread',
+      turn: {
+        id: 'turn-after-resume-ack-timeout',
+        status: 'completed',
+        items: [{ type: 'agentMessage', id: 'msg-1', text: '手机消息已进入目标会话。' }]
+      }
+    }
+  });
+
+  const result = await resultPromise;
+  assert.equal(result.summary, '手机消息已进入目标会话。');
+  assert.equal(client.turnStartedBeforeResumeSettled, true);
+  assert.equal(client.requests.filter((request) => request.method === 'turn/start').length, 1);
+  assert.ok(events.some((event) => event.type === 'codex.app_server.thread.resume_timeout'));
+  assert.ok(events.some((event) => event.type === 'codex.app_server.thread.resume_recovered'));
+});
+
 test('CodexDesktopCdpAdapter submits to a verified session when resume and fallback read both time out', async () => {
   const client = new ResumeAndFallbackReadTimeoutDesktopClient();
   const adapter = new CodexDesktopCdpAdapter({ client });
@@ -1716,6 +1752,59 @@ class ResumeTimeoutDesktopClient extends FakeDesktopClient {
               type: 'agentMessage',
               id: 'msg-1',
               text: '已恢复并继续。'
+            }]
+          }]
+        }
+      };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  }
+}
+
+class HangingResumeAckDesktopClient extends FakeDesktopClient {
+  constructor() {
+    super();
+    this.resumeSettled = false;
+    this.turnStartedBeforeResumeSettled = false;
+  }
+
+  async request(method, params) {
+    this.requests.push({ method, params });
+    if (method === 'thread/read' && params.includeTurns === false) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          status: { type: 'ready' }
+        }
+      };
+    }
+    if (method === 'thread/resume') {
+      return new Promise(() => {});
+    }
+    if (method === 'turn/start') {
+      this.turnStartedBeforeResumeSettled = !this.resumeSettled;
+      this.resolveWaiters(method);
+      return {
+        turn: {
+          id: 'turn-after-resume-ack-timeout',
+          status: 'inProgress',
+          items: []
+        }
+      };
+    }
+    if (method === 'thread/read' && params.includeTurns === true) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          turns: [{
+            id: 'turn-after-resume-ack-timeout',
+            status: 'completed',
+            items: [{
+              type: 'agentMessage',
+              id: 'msg-1',
+              text: '手机消息已进入目标会话。'
             }]
           }]
         }
