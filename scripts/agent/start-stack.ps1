@@ -1,8 +1,10 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [int]$BridgePort = 8787,
   [string]$BridgeToken = $env:CODEX_BRIDGE_TOKEN,
   [string]$BridgeUrl = $env:CODEX_BRIDGE_URL,
+  [string]$RuntimeMode = $env:CODEX_BRIDGE_RUNTIME_MODE,
+  [string]$CanaryThreadIds = $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS,
   [string]$ConfigPath = '',
   [string]$SessionId = '',
   [switch]$SkipHdcRelay,
@@ -33,6 +35,14 @@ if ([string]::IsNullOrWhiteSpace($BridgeToken) -and (Test-Path -LiteralPath $bri
 $args = @{
   BridgePort = $BridgePort
   BridgeToken = $BridgeToken
+}
+
+if ([string]::IsNullOrWhiteSpace($RuntimeMode)) {
+  $RuntimeMode = 'desktop'
+}
+$args.RuntimeMode = $RuntimeMode
+if (-not [string]::IsNullOrWhiteSpace($CanaryThreadIds)) {
+  $args.CanaryThreadIds = $CanaryThreadIds
 }
 
 if (-not [string]::IsNullOrWhiteSpace($BridgeUrl)) {

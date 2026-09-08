@@ -78,7 +78,7 @@ function Fill-RoundRect {
 }
 
 function Draw-Text {
-  param($G, [string]$Text, [float]$X, [float]$Y, [float]$Size, [string]$Color = '#111827', [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular)
+  param($G, [string]$Text, [float]$X, [float]$Y, [float]$Size, [string]$Color = '#EDF2F8', [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular)
   $font = New-Font $Size $Style
   $brush = New-Brush $Color
   $G.DrawString($Text, $font, $brush, [System.Drawing.PointF]::new($X, $Y))
@@ -88,8 +88,8 @@ function Draw-Text {
 
 function Draw-Pill {
   param($G, [float]$X, [float]$Y, [float]$W, [string]$Text)
-  Fill-RoundRect $G $X $Y $W 54 27 '#FFFFFF' '#DDE3EA'
-  Draw-Text $G $Text ($X + 34) ($Y + 13) 20 '#1F2937' ([System.Drawing.FontStyle]::Bold)
+  Fill-RoundRect $G $X $Y $W 54 27 '#11161D' '#29323F'
+  Draw-Text $G $Text ($X + 34) ($Y + 13) 20 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
 }
 
 function Draw-PhoneBase {
@@ -99,31 +99,31 @@ function Draw-PhoneBase {
     [string]$Subtitle,
     [bool]$ShowTopPlus = $true
   )
-  $G.Clear((New-Color '#F7F8FB'))
-  $white = New-Brush '#FFFFFF'
+  $G.Clear((New-Color '#090C10'))
+  $white = New-Brush '#11161D'
   $G.FillRectangle($white, 0, 0, $width, 88)
   $white.Dispose()
-  Draw-Text $G '09:41' 32 30 26 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $G '5G  82%' 575 32 18 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $G $Title 28 116 38 '#111827' ([System.Drawing.FontStyle]::Bold)
+  Draw-Text $G '09:41' 32 30 26 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+  Draw-Text $G '5G  82%' 575 32 18 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+  Draw-Text $G $Title 28 116 38 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
   if (-not [string]::IsNullOrWhiteSpace($Subtitle)) {
-    Draw-Text $G $Subtitle 30 174 20 '#7B8494'
+    Draw-Text $G $Subtitle 30 174 20 '#98A5B5'
   }
   if ($ShowTopPlus) {
-    Fill-RoundRect $G 650 126 46 46 23 '#FFFFFF' '#DDE3EA'
-    Draw-Text $G '+' 662 127 34 '#111827'
+    Fill-RoundRect $G 650 126 46 46 23 '#11161D' '#29323F'
+    Draw-Text $G '+' 662 127 34 '#EDF2F8'
   }
 }
 
 function Draw-Composer {
   param($G, [bool]$Running = $false)
-  Fill-RoundRect $G 34 1374 576 116 20 '#FFFFFF' ''
-  Fill-RoundRect $G 624 1376 58 58 29 '#FFFFFF' '#DDE3EA'
-  Draw-Text $G '+' 640 1376 36 '#111827'
-  $sendColor = if ($Running) { '#BC1B12' } else { '#CDD4DF' }
+  Fill-RoundRect $G 34 1374 576 116 20 '#11161D' ''
+  Fill-RoundRect $G 624 1376 58 58 29 '#11161D' '#29323F'
+  Draw-Text $G '+' 640 1376 36 '#EDF2F8'
+  $sendColor = if ($Running) { '#EA6969' } else { '#24476D' }
   $sendText = if ($Running) { '×' } else { '↑' }
   Fill-RoundRect $G 624 1450 58 58 29 $sendColor ''
-  Draw-Text $G $sendText 640 1449 34 '#FFFFFF'
+  Draw-Text $G $sendText 640 1449 34 '#11161D'
 }
 
 function New-Screenshot {
@@ -138,98 +138,115 @@ function New-Screenshot {
   $bitmap.Dispose()
 }
 
-New-Screenshot -Path (Join-Path $OutputDir 'app-session-list-redacted.png') -Draw {
+# These are code-rendered UI illustrations, never captures of a real account.
+function Draw-DemoList {
   param($g)
-  Draw-PhoneBase $g '会话' '共 12 个会话 · 1 个进行中 · 2 个未读'
-  Draw-Text $g '下拉刷新会话，左滑会话可删除' 30 230 20 '#9AA3AF'
-  Fill-RoundRect $g 28 278 664 64 14 '#FFF7DE' ''
-  Draw-Text $g '置顶' 46 294 24 '#A87000' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $g '1 进行中' 602 298 18 '#A87000'
+  Draw-PhoneBase $g '会话' '共 6 个会话 · 2 个进行中'
+  Draw-Text $g '下拉刷新会话，左滑会话可删除' 30 244 20 '#98A5B5'
+  Draw-Text $g '项目' 30 330 20 '#98A5B5'
+  Draw-Text $g '⌄   示例项目' 30 388 26 '#98A5B5'
   $rows = @(
-    @{ dot = '#2B80EA'; title = 'Codex 远程部署'; meta = '刚刚'; sub = '主项目' },
-    @{ dot = '#E5E7EB'; title = '示例项目管理'; meta = '1 天前'; sub = '项目' },
-    @{ dot = '#2B80EA'; title = '前端开发会话'; meta = '2 分钟前'; sub = '4 未读' },
-    @{ dot = '#2B80EA'; title = '链路恢复测试'; meta = '13 分钟前'; sub = '' },
-    @{ dot = '#E5E7EB'; title = '文档整理'; meta = '26 分钟前'; sub = '' },
-    @{ dot = '#2B80EA'; title = 'Agent 任务中心'; meta = '44 分钟前'; sub = '' },
-    @{ dot = '#E5E7EB'; title = '调试记录'; meta = '9 小时前'; sub = '' }
+    @{ title = '完善产品主页'; meta = '运行中'; active = $true },
+    @{ title = '整理组件样式'; meta = '5 分钟前'; active = $false },
+    @{ title = '更新使用文档'; meta = '1 小时前'; active = $false }
   )
-  $y = 380
+  $y = 475
   foreach ($row in $rows) {
-    $brush = New-Brush $row.dot
-    $g.FillEllipse($brush, 42, $y + 24, 22, 22)
-    $brush.Dispose()
-    Draw-Text $g $row.title 92 $y 28 '#111827' ([System.Drawing.FontStyle]::Bold)
-    if ($row.sub) { Draw-Text $g $row.sub 92 ($y + 44) 18 '#9AA3AF' }
-    Draw-Text $g $row.meta 594 ($y + 10) 20 '#8B95A1'
+    $color = if ($row.active) { '#67A8FF' } else { '#556476' }
+    Draw-Text $g '○' 32 ($y + 3) 24 $color
+    Draw-Text $g $row.title 82 $y 27 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+    Draw-Text $g $row.meta 572 ($y + 6) 18 '#98A5B5'
     $y += 112
   }
-  Draw-Text $g '脱敏示例 · 内容为占位数据' 224 1490 16 '#B0B7C3'
+  Draw-Text $g '最近' 30 868 20 '#98A5B5'
+  $recent = @('检查接口返回', '优化页面布局', '阅读项目结构')
+  $y = 942
+  foreach ($title in $recent) {
+    Draw-Text $g '○' 32 $y 24 '#67A8FF'
+    Draw-Text $g $title 82 $y 27 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+    Draw-Text $g '刚刚' 598 ($y + 6) 18 '#98A5B5'
+    $y += 112
+  }
+  Draw-Text $g '演示数据 · 非真实账号截图' 210 1500 18 '#718095'
 }
-
-New-Screenshot -Path (Join-Path $OutputDir 'app-chat-thread-redacted.png') -Draw {
+function Draw-DemoChat {
   param($g)
-  Draw-PhoneBase $g '示例项目 / 远程会话' 'Codex' $false
-  Draw-Pill $g 470 126 210 '思考 · 自动'
-  Draw-Text $g 'Codex  09:41' 30 244 18 '#8B95A1'
-  Draw-Text $g '已连接桌面实时通道，正在同步当前会话。' 30 288 24 '#111827'
-  Draw-Text $g '工具调用会以结构化组件展示，最终回答保留在对话中。' 30 330 24 '#111827'
-  Fill-RoundRect $g 142 444 544 128 18 '#EAF5FF' '#CFE5FF'
-  Draw-Text $g '请检查链路状态，并继续当前任务。' 176 474 24 '#111827'
-  Draw-Text $g '09:42  你' 576 408 18 '#8B95A1'
-  Draw-Text $g 'Codex  09:42' 30 626 18 '#8B95A1'
-  Fill-RoundRect $g 30 670 626 98 16 '#FFFFFF' '#E3E8EF'
-  Draw-Text $g '正在准备 Codex 运行环境' 66 692 22 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $g '正在执行命令' 66 728 18 '#2B80EA'
-  Fill-RoundRect $g 30 810 626 126 16 '#FFFFFF' '#E3E8EF'
-  Draw-Text $g 'Git 变动' 66 834 22 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $g '已整理为可展开组件，敏感路径已隐藏。' 66 876 18 '#6B7280'
-  Fill-RoundRect $g 30 980 626 110 16 '#FFFFFF' '#E3E8EF'
-  Draw-Text $g '桌面截图附件' 66 1006 22 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $g '点击可预览，发送前可删除。' 66 1048 18 '#6B7280'
-  Fill-RoundRect $g 30 1228 626 66 33 '#FFFFFF' ''
-  Draw-Text $g '桌面实时连接 · 正常' 64 1246 20 '#1F8F5F' ([System.Drawing.FontStyle]::Bold)
-  Draw-Composer $g $true
-  Draw-Text $g '脱敏示例 · 内容为占位数据' 224 1508 16 '#B0B7C3'
-}
-
-New-Screenshot -Path (Join-Path $OutputDir 'app-structured-actions-redacted.png') -Draw {
-  param($g)
-  Draw-PhoneBase $g '示例会话' 'Example Project' $false
-  Draw-Pill $g 470 126 210 '模型 · 自动'
-  Draw-Text $g 'Codex  09:46' 30 242 18 '#8B95A1'
-  Draw-Text $g '操作结果会折叠成组件，便于手机端快速浏览。' 30 284 24 '#111827'
-
-  Fill-RoundRect $g 30 380 660 250 18 '#FFFFFF' '#DEE5EE'
-  Fill-RoundRect $g 52 410 60 60 14 '#EEF7FF' ''
-  Draw-Text $g '□' 70 418 34 '#2B80EA'
-  Draw-Text $g '创建 Git 分支' 132 406 24 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $g '操作 · 创建分支' 132 452 18 '#6B7280'
-  Draw-Text $g '分支  feature/example-task' 132 500 18 '#111827'
-  Draw-Text $g '工作区  <project-worktree>' 132 542 18 '#2B80EA'
-  Draw-Text $g '指令  ::git-create-branch{...}' 132 584 18 '#6B7280'
-
-  Fill-RoundRect $g 30 658 660 190 18 '#FFFFFF' '#DEE5EE'
-  Fill-RoundRect $g 52 688 60 60 14 '#EFFFF7' ''
-  Draw-Text $g '+' 72 690 36 '#11A36A'
-  Draw-Text $g '暂存 Git 改动' 132 684 24 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $g '工作区  <project-worktree>' 132 734 18 '#2B80EA'
-  Draw-Text $g '指令  ::git-stage{...}' 132 778 18 '#6B7280'
-
-  Fill-RoundRect $g 30 880 660 150 18 '#FFFFFF' '#DEE5EE'
-  Fill-RoundRect $g 52 910 60 60 14 '#F2F7FF' ''
-  Draw-Text $g '<>' 62 928 22 '#2B80EA'
-  Draw-Text $g '记忆引用' 132 906 24 '#111827' ([System.Drawing.FontStyle]::Bold)
-  Draw-Text $g 'MEMORY.md · 已脱敏摘要' 132 956 18 '#6B7280'
-
-  Fill-RoundRect $g 472 1260 58 58 29 '#FFFFFF' '#DDE3EA'
-  Draw-Text $g '▣' 490 1274 22 '#111827'
-  Fill-RoundRect $g 548 1260 58 58 29 '#FFFFFF' '#DDE3EA'
-  Draw-Text $g '/' 570 1267 30 '#111827'
-  Fill-RoundRect $g 624 1260 58 58 29 '#FFFFFF' '#DDE3EA'
-  Draw-Text $g '+' 640 1260 36 '#111827'
+  Draw-PhoneBase $g '完善产品主页' 'Codex' $false
+  Draw-Pill $g 455 128 232 'GPT-6-Astra · 中'
+  Draw-Text $g '09:41  你' 588 260 18 '#98A5B5'
+  Fill-RoundRect $g 152 305 535 116 18 '#152B46' '#294A70'
+  Draw-Text $g '请整理主页布局，并检查构建。' 178 345 25 '#EDF2F8'
+  Draw-Text $g '●  Codex  09:42' 32 480 20 '#67A8FF'
+  Draw-Text $g '我会检查现有组件，复用项目里的样式。' 32 534 25 '#EDF2F8'
+  Fill-RoundRect $g 32 638 656 140 16 '#11161D' '#29323F'
+  Draw-Text $g '>_   执行命令' 60 664 24 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+  Draw-Text $g 'npm run build' 60 712 22 '#98A5B5'
+  Draw-Text $g '完成' 602 671 18 '#81C6A3'
+  Fill-RoundRect $g 32 812 656 145 16 '#11161D' '#29323F'
+  Draw-Text $g '<>   文件变更' 60 839 24 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+  Draw-Text $g 'src/pages/Home.tsx     +24  -8' 60 889 22 '#98A5B5'
+  Draw-Text $g '●  Codex  09:43' 32 1022 20 '#67A8FF'
+  Draw-Text $g '主页布局已调整，构建通过。' 32 1080 26 '#EDF2F8'
+  Draw-Text $g '保留了现有导航，统一了内容间距。' 32 1126 25 '#EDF2F8'
+  Draw-Text $g '复制     分享' 32 1202 20 '#98A5B5'
   Draw-Composer $g $false
-  Draw-Text $g '脱敏示例 · 内容为占位数据' 224 1508 16 '#B0B7C3'
+  Draw-Text $g '演示数据 · 非真实账号截图' 210 1520 17 '#718095'
 }
-
-Write-Host "Generated README screenshots in $OutputDir" -ForegroundColor Green
+New-Screenshot -Path (Join-Path $OutputDir 'app-session-list-redacted.png') -Draw { param($g) Draw-DemoList $g }
+New-Screenshot -Path (Join-Path $OutputDir 'app-chat-thread-redacted.png') -Draw { param($g) Draw-DemoChat $g }
+New-Screenshot -Path (Join-Path $OutputDir 'app-account-usage-demo.png') -Draw {
+  param($g)
+  Draw-PhoneBase $g '账号用量' '额度窗口与重置时间 · 演示数据' $false
+  $rows = @(
+    @{ label='套餐'; value='Pro' },
+    @{ label='每周限制'; value='剩余 75% · 已用 25%'; reset='重置 09-15 09:00' },
+    @{ label='GPT-5.3-Codex-Spark · 5小时限制'; value='剩余 90% · 已用 10%'; reset='重置 09-08 14:00' },
+    @{ label='GPT-5.3-Codex-Spark · 每周限制'; value='剩余 85% · 已用 15%'; reset='重置 09-15 09:00' }
+  )
+  $y=280
+  foreach($row in $rows) {
+    Fill-RoundRect $g 30 $y 660 226 18 '#11161D' '#29323F'
+    Draw-Text $g $row.label 58 ($y+25) 22 '#98A5B5'
+    Draw-Text $g $row.value 58 ($y+77) 29 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+    if($row.ContainsKey('reset')) { Draw-Text $g $row.reset 58 ($y+151) 21 '#98A5B5' }
+    $y+=260
+  }
+  Draw-Text $g '额度由桌面同实例 App Server 提供' 58 1375 22 '#67A8FF'
+  Draw-Text $g '演示数据 · 非真实账号截图' 210 1500 18 '#718095'
+}
+$width=1640
+$height=1060
+New-Screenshot -Path (Join-Path $OutputDir 'app-tablet-demo.png') -Draw {
+  param($g)
+  $g.Clear((New-Color '#090C10'))
+  Fill-RoundRect $g 0 0 460 1060 1 '#11161D' ''
+  Draw-Text $g '会话' 32 38 34 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+  Draw-Text $g '共 6 个会话 · 2 个进行中' 32 92 20 '#98A5B5'
+  Draw-Text $g '项目 / 示例项目' 32 177 22 '#98A5B5'
+  Fill-RoundRect $g 18 232 424 80 14 '#202D40' ''
+  Draw-Text $g '○   完善产品主页' 38 255 26 '#EDF2F8'
+  Draw-Text $g '整理组件样式' 76 358 26 '#EDF2F8'
+  Draw-Text $g '更新使用文档' 76 456 26 '#EDF2F8'
+  Draw-Text $g '最近' 32 582 22 '#98A5B5'
+  Draw-Text $g '○   检查接口返回' 38 659 26 '#EDF2F8'
+  Draw-Text $g '优化页面布局' 76 757 26 '#EDF2F8'
+  Draw-Text $g '阅读项目结构' 76 855 26 '#EDF2F8'
+  Draw-Text $g '完善产品主页' 502 42 31 '#EDF2F8' ([System.Drawing.FontStyle]::Bold)
+  Draw-Pill $g 1210 40 235 'GPT-6-Astra · 中'
+  Draw-Pill $g 1468 40 130 '桌面'
+  Fill-RoundRect $g 954 170 640 104 18 '#152B46' '#294A70'
+  Draw-Text $g '请整理主页布局，并检查构建。' 985 204 26 '#EDF2F8'
+  Draw-Text $g '●  Codex  09:42' 510 325 21 '#67A8FF'
+  Draw-Text $g '我会检查现有组件，复用项目里的样式。' 510 377 26 '#EDF2F8'
+  Fill-RoundRect $g 510 458 1060 112 16 '#11161D' '#29323F'
+  Draw-Text $g '>_   npm run build' 542 494 26 '#EDF2F8'
+  Draw-Text $g '完成' 1480 501 20 '#81C6A3'
+  Fill-RoundRect $g 510 604 1060 112 16 '#11161D' '#29323F'
+  Draw-Text $g '<>   src/pages/Home.tsx' 542 639 26 '#EDF2F8'
+  Draw-Text $g '+24  -8' 1445 646 20 '#81C6A3'
+  Draw-Text $g '主页布局已调整，构建通过。' 510 776 27 '#EDF2F8'
+  Fill-RoundRect $g 510 879 984 110 18 '#11161D' '#29323F'
+  Draw-Pill $g 1520 898 80 '+'
+  Draw-Text $g '演示布局与数据 · 非真实账号截图' 622 1020 18 '#718095'
+}
+Write-Host "Generated public demo images in $OutputDir" -ForegroundColor Green

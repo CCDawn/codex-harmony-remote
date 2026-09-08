@@ -2,6 +2,87 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CodexDesktopCdpAdapter } from '../src/codexDesktopCdpAdapter.js';
 
+test('CodexDesktopCdpAdapter exposes authoritative desktop thread runtime states', async () => {
+  const requests = [];
+  const adapter = new CodexDesktopCdpAdapter({
+    client: {
+      async request(method, params) {
+        requests.push({ method, params });
+        return {
+          data: [{
+            id: 'thread-running',
+            status: { type: 'active', activeFlags: [] },
+            updatedAt: 1785403428
+          }, {
+            id: 'thread-approval',
+            status: { type: 'active', activeFlags: ['waitingForApproval'] },
+            updatedAt: 1785403429
+          }, {
+            id: 'thread-idle',
+            status: { type: 'notLoaded' },
+            updatedAt: 1785403400
+          }]
+        };
+      }
+    }
+  });
+
+  const states = await adapter.listThreadRuntimeStates({ limit: 40 });
+
+  assert.equal(requests[0].method, 'thread/list');
+  assert.equal(requests[0].params.limit, 40);
+  assert.deepEqual(states.map((state) => ({
+    threadId: state.threadId,
+    state: state.state
+  })), [{
+    threadId: 'thread-running',
+    state: 'running'
+  }, {
+    threadId: 'thread-approval',
+    state: 'waiting_approval'
+  }, {
+    threadId: 'thread-idle',
+    state: 'idle'
+  }]);
+  assert.ok(states.every((state) => state.source === 'desktop-app-server'));
+});
+
+test('CodexDesktopCdpAdapter delegates explicit desktop thread opening to its CDP client', async () => {
+  const opened = [];
+  const adapter = new CodexDesktopCdpAdapter({
+    client: {
+      async openDesktopThread(sessionId) {
+        opened.push(sessionId);
+        return { ok: true, sessionId };
+      }
+    }
+  });
+
+  const result = await adapter.openDesktopThread('019e-open-target');
+
+  assert.deepEqual(opened, ['019e-open-target']);
+  assert.equal(result.sessionId, '019e-open-target');
+});
+
+test('CodexDesktopCdpAdapter archives a desktop thread through the native App Server protocol', async () => {
+  const requests = [];
+  const adapter = new CodexDesktopCdpAdapter({
+    client: {
+      async request(method, params) {
+        requests.push({ method, params });
+        return { ok: true };
+      }
+    }
+  });
+
+  await adapter.archiveThread('019e-archive-target');
+
+  assert.deepEqual(requests, [{
+    method: 'thread/archive',
+    params: { threadId: '019e-archive-target' }
+  }]);
+});
+
 test('CodexDesktopCdpAdapter resumes verified existing sessions before starting a turn', async () => {
   const client = new FakeDesktopClient();
   const adapter = new CodexDesktopCdpAdapter({ client });
@@ -53,6 +134,191 @@ test('CodexDesktopCdpAdapter resumes verified existing sessions before starting 
   assert.equal(resumed.payload.thread.turns, undefined);
   assert.equal(read.payload.thread.turns, undefined);
   assert.equal(read.payload.thread.turnCount, 1);
+});
+
+test('CodexDesktopCdpAdapter does not resume an already verified current desktop session', async () => {
+  const client = new FakeDesktopClient();
+  const adapter = new CodexDesktopCdpAdapter({ client });
+  const events = [];
+
+  const resultPromise = adapter.run({
+    task: {
+      id: 'task-current-session',
+      prompt: '不要重载当前会话',
+      codexSessionId: '019e-existing-thread',
+      verifiedDesktopStatus: {
+        desktopLive: true,
+        currentSessionId: '019e-existing-thread',
+        targetSessionId: '019e-existing-thread',
+        sessionVerified: true,
+        targetVerified: true
+      }
+    },
+    project: { root: 'C:\\work' },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  await client.waitForRequest('turn/start');
+  client.notifications.push({
+    method: 'turn/completed',
+    params: {
+      threadId: '019e-existing-thread',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [{ type: 'agentMessage', id: 'msg-current', text: '当前会话未被重载。' }]
+      }
+    }
+  });
+
+  const result = await resultPromise;
+  assert.equal(result.exitCode, 0);
+  assert.equal(client.requests.some((request) => request.method === 'thread/resume'), false);
+  assert.deepEqual(client.requests.slice(0, 2).map((request) => request.method), [
+    'thread/read',
+    'turn/start'
+  ]);
+  const skipped = events.find((event) => event.type === 'codex.app_server.thread.resume_skipped_current');
+  assert.equal(skipped.payload.threadId, '019e-existing-thread');
+});
+
+test('CodexDesktopCdpAdapter does not treat current-session notification noise as a resume failure', async () => {
+  const client = new ResumeReloadDesktopClient();
+  const adapter = new CodexDesktopCdpAdapter({
+    client,
+    postResumeCdpRecoveryTimeoutMs: 5,
+    postResumeCdpRecoveryIntervalMs: 1,
+    postResumeCdpStablePasses: 20
+  });
+  const events = [];
+
+  const resultPromise = adapter.run({
+    task: {
+      id: 'task-current-session-noise',
+      prompt: '首发不要误报失败',
+      codexSessionId: '019e-existing-thread',
+      verifiedDesktopStatus: {
+        desktopLive: true,
+        currentSessionId: '019e-existing-thread',
+        targetSessionId: '019e-existing-thread',
+        sessionVerified: true,
+        targetVerified: true
+      }
+    },
+    project: { root: 'C:\\work' },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  await client.waitForRequest('turn/start');
+  client.notifications.push({
+    method: 'turn/completed',
+    params: {
+      threadId: '019e-existing-thread',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [{ type: 'agentMessage', id: 'msg-current-noise', text: '首发已成功。' }]
+      }
+    }
+  });
+
+  const result = await resultPromise;
+  assert.equal(result.exitCode, 0);
+  assert.equal(client.requests.filter((request) => request.method === 'turn/start').length, 1);
+  assert.equal(client.requests.some((request) => request.method === 'thread/resume'), false);
+  assert.equal(events.some((event) => event.type === 'codex.desktop_live.post_resume_recovery_started'), false);
+  assert.ok(events.some((event) => event.type === 'codex.desktop_live.noise_clear_failed'));
+});
+
+test('CodexDesktopCdpAdapter steers the active desktop turn with text and local image input', async () => {
+  const requests = [];
+  const client = {
+    async request(method, params) {
+      requests.push({ method, params });
+      if (method === 'turn/steer') {
+        return { turnId: params.expectedTurnId };
+      }
+      throw new Error(`Unexpected request ${method}`);
+    }
+  };
+  const adapter = new CodexDesktopCdpAdapter({ client });
+  const events = [];
+  const imagePath = 'C:/work/mobile-images/guidance.png';
+
+  const result = await adapter.steer({
+    task: {
+      id: 'task-running',
+      codexSessionId: '019e-existing-thread',
+      activeCodexTurnId: 'turn-running'
+    },
+    prompt: `先检查这个截图\n\n![手机端图片](${imagePath})`,
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.turnId, 'turn-running');
+  assert.deepEqual(requests, [{
+    method: 'turn/steer',
+    params: {
+      threadId: '019e-existing-thread',
+      input: [{
+        type: 'text',
+        text: `先检查这个截图\n\n![手机端图片](${imagePath})`,
+        text_elements: []
+      }, {
+        type: 'localImage',
+        path: imagePath
+      }],
+      expectedTurnId: 'turn-running'
+    }
+  }]);
+  assert.ok(events.some((event) => event.type === 'codex.app_server.turn.steered'));
+});
+
+test('CodexDesktopCdpAdapter waits for CDP stability after a resume reload before submitting', async () => {
+  const client = new ResumeReloadDesktopClient();
+  const adapter = new CodexDesktopCdpAdapter({
+    client,
+    postResumeCdpRecoveryTimeoutMs: 100,
+    postResumeCdpRecoveryIntervalMs: 1,
+    postResumeCdpStablePasses: 2
+  });
+  const events = [];
+
+  const resultPromise = adapter.run({
+    task: {
+      id: 'task-resume-reload',
+      prompt: '你好',
+      codexSessionId: '019e-existing-thread'
+    },
+    project: { root: 'C:\\work' },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  await client.waitForRequest('turn/start');
+  client.notifications.push({
+    method: 'turn/completed',
+    params: {
+      threadId: '019e-existing-thread',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [{ type: 'agentMessage', id: 'msg-1', text: '你好，我在当前桌面会话里。' }]
+      }
+    }
+  });
+
+  const result = await resultPromise;
+  assert.equal(result.exitCode, 0);
+  assert.equal(client.turnStartDrainCount >= 3, true);
+  assert.ok(events.some((event) => event.type === 'codex.desktop_live.post_resume_recovery_started'));
+  assert.ok(events.some((event) => event.type === 'codex.desktop_live.post_resume_recovered'));
+});
+
+test('CodexDesktopCdpAdapter keeps post-submit ack reconciliation open for delayed desktop persistence', () => {
+  const adapter = new CodexDesktopCdpAdapter({ client: new FakeDesktopClient() });
+
+  assert.equal(adapter.postSubmitAckReconcileMs, 30_000);
 });
 
 test('CodexDesktopCdpAdapter resumes host-manager-only historical sessions before starting a turn', async () => {
@@ -131,6 +397,42 @@ test('CodexDesktopCdpAdapter recovers from a desktop script resume timeout with 
     'turn/start',
     'thread/read'
   ]);
+  assert.equal(client.requests.filter((request) => request.method === 'turn/start').length, 1);
+  assert.ok(events.some((event) => event.type === 'codex.app_server.thread.resume_timeout'));
+  assert.ok(events.some((event) => event.type === 'codex.app_server.thread.resume_recovered'));
+});
+
+test('CodexDesktopCdpAdapter does not wait for a hanging thread/resume acknowledgement before starting a turn', async () => {
+  const client = new HangingResumeAckDesktopClient();
+  const adapter = new CodexDesktopCdpAdapter({ client, resumeAckTimeoutMs: 5 });
+  const events = [];
+
+  const resultPromise = adapter.run({
+    task: {
+      id: 'task-resume-ack-hang',
+      prompt: '这是手机消息，你看一下是否正确',
+      codexSessionId: '019e-existing-thread'
+    },
+    project: { root: 'C:\\work' },
+    emit: (type, payload) => events.push({ type, payload })
+  });
+
+  await client.waitForRequest('turn/start');
+  client.notifications.push({
+    method: 'turn/completed',
+    params: {
+      threadId: '019e-existing-thread',
+      turn: {
+        id: 'turn-after-resume-ack-timeout',
+        status: 'completed',
+        items: [{ type: 'agentMessage', id: 'msg-1', text: '手机消息已进入目标会话。' }]
+      }
+    }
+  });
+
+  const result = await resultPromise;
+  assert.equal(result.summary, '手机消息已进入目标会话。');
+  assert.equal(client.turnStartedBeforeResumeSettled, true);
   assert.equal(client.requests.filter((request) => request.method === 'turn/start').length, 1);
   assert.ok(events.some((event) => event.type === 'codex.app_server.thread.resume_timeout'));
   assert.ok(events.some((event) => event.type === 'codex.app_server.thread.resume_recovered'));
@@ -350,6 +652,45 @@ test('CodexDesktopCdpAdapter reports shared notification poll failures after a t
   assert.equal(failures[0].payload.diagnosticOnly, true);
   assert.equal(failures[0].payload.shared, true);
   assert.equal(failures[0].payload.failures, 2);
+});
+
+test('CodexDesktopCdpAdapter suppresses a transient thread/read poll failure', async () => {
+  const client = new RecoveringThreadReadFailureDesktopClient();
+  const adapter = new CodexDesktopCdpAdapter({
+    client,
+    threadPollFailureReportThreshold: 2,
+    idleTimeoutMs: 1000
+  });
+  const notifications = [];
+  const events = [];
+
+  const waiting = adapter.waitForDesktopTurnCompletion({
+    notifications,
+    threadId: '019e-existing-thread',
+    turnId: 'turn-transient-read-failure',
+    prompt: '手机消息',
+    emit: (type, payload) => events.push({ type, payload }),
+    timeoutMs: 1000
+  });
+
+  setTimeout(() => {
+    notifications.push({
+      method: 'turn/completed',
+      params: {
+        threadId: '019e-existing-thread',
+        turn: {
+          id: 'turn-transient-read-failure',
+          status: 'completed',
+          items: [{ type: 'agentMessage', text: '已完成' }]
+        }
+      }
+    });
+  }, 30);
+
+  const completed = await waiting;
+  assert.equal(completed.turn.status, 'completed');
+  assert.equal(client.threadReadCount, 1);
+  assert.equal(events.some((event) => event.type === 'codex.desktop_live.thread_poll_failed'), false);
 });
 
 test('CodexDesktopCdpAdapter waits briefly for an active turn before interrupting', async () => {
@@ -1083,6 +1424,29 @@ class FakeDesktopClient {
   }
 }
 
+class ResumeReloadDesktopClient extends FakeDesktopClient {
+  constructor() {
+    super();
+    this.drainCount = 0;
+    this.turnStartDrainCount = 0;
+  }
+
+  async request(method, params) {
+    if (method === 'turn/start') {
+      this.turnStartDrainCount = this.drainCount;
+    }
+    return super.request(method, params);
+  }
+
+  async drainNotifications() {
+    this.drainCount += 1;
+    if (this.drainCount === 1) {
+      throw new Error('Codex 桌面 CDP 连接错误');
+    }
+    return super.drainNotifications();
+  }
+}
+
 class DelayedActiveTurnInterruptClient {
   constructor() {
     this.requests = [];
@@ -1397,6 +1761,59 @@ class ResumeTimeoutDesktopClient extends FakeDesktopClient {
   }
 }
 
+class HangingResumeAckDesktopClient extends FakeDesktopClient {
+  constructor() {
+    super();
+    this.resumeSettled = false;
+    this.turnStartedBeforeResumeSettled = false;
+  }
+
+  async request(method, params) {
+    this.requests.push({ method, params });
+    if (method === 'thread/read' && params.includeTurns === false) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          status: { type: 'ready' }
+        }
+      };
+    }
+    if (method === 'thread/resume') {
+      return new Promise(() => {});
+    }
+    if (method === 'turn/start') {
+      this.turnStartedBeforeResumeSettled = !this.resumeSettled;
+      this.resolveWaiters(method);
+      return {
+        turn: {
+          id: 'turn-after-resume-ack-timeout',
+          status: 'inProgress',
+          items: []
+        }
+      };
+    }
+    if (method === 'thread/read' && params.includeTurns === true) {
+      return {
+        thread: {
+          id: params.threadId,
+          sessionId: params.threadId,
+          turns: [{
+            id: 'turn-after-resume-ack-timeout',
+            status: 'completed',
+            items: [{
+              type: 'agentMessage',
+              id: 'msg-1',
+              text: '手机消息已进入目标会话。'
+            }]
+          }]
+        }
+      };
+    }
+    throw new Error(`Unexpected request ${method}`);
+  }
+}
+
 class ResumeAndFallbackReadTimeoutDesktopClient extends FakeDesktopClient {
   constructor() {
     super();
@@ -1573,6 +1990,20 @@ class RecoveringPollFailureDesktopClient {
       throw new Error('Codex 桌面 CDP 连接错误');
     }
     return [];
+  }
+}
+
+class RecoveringThreadReadFailureDesktopClient {
+  constructor() {
+    this.threadReadCount = 0;
+  }
+
+  async request(method) {
+    if (method !== 'thread/read') {
+      throw new Error(`Unexpected request ${method}`);
+    }
+    this.threadReadCount += 1;
+    throw new Error('Codex 桌面 CDP 连接错误');
   }
 }
 

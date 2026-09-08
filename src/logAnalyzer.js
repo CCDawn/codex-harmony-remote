@@ -8,6 +8,7 @@ export async function analyzeLogRun(logDir) {
   const entries = await readJsonl(path.join(logDir, 'all.jsonl'));
   const files = await listLogFiles(logDir);
 
+  const stateSync = summarizeStateSync(entries);
   const summary = {
     generatedAt: new Date().toISOString(),
     logDir,
@@ -19,12 +20,13 @@ export async function analyzeLogRun(logDir) {
       levels: countBy(entries, (entry) => entry.level),
       events: countBy(entries, (entry) => entry.event)
     },
-    health: classifyHealth(entries),
+    health: classifyHealth(entries, stateSync),
     latest: entries.slice(-10),
     important: latestImportant(entries),
     bridge: summarizeBridge(entries),
     app: summarizeSource(entries, 'harmony-app'),
     task: summarizeTasks(entries),
+    stateSync,
     files
   };
 
@@ -33,17 +35,17 @@ export async function analyzeLogRun(logDir) {
   return summary;
 }
 
-function classifyHealth(entries) {
+function classifyHealth(entries, stateSync = null) {
   const errors = entries.filter((entry) => entry.level === 'error' || IMPORTANT_EVENT.test(entry.event));
   const httpFailures = entries.filter((entry) => {
     return entry.event === 'http.request.completed' && Number(entry.data?.statusCode ?? 0) >= 400;
   });
   const appEntries = entries.filter((entry) => entry.source === 'harmony-app');
 
-  if (errors.length > 0 || httpFailures.length > 0) {
+  if (errors.length > 0 || httpFailures.length > 0 || (stateSync?.anomalies?.length ?? 0) > 0) {
     return {
       status: 'needs_attention',
-      reason: `${errors.length} important/error event(s), ${httpFailures.length} HTTP failure(s)`
+      reason: `${errors.length} important/error event(s), ${httpFailures.length} HTTP failure(s), ${stateSync?.anomalies?.length ?? 0} state-sync anomaly(s)`
     };
   }
 
@@ -57,6 +59,132 @@ function classifyHealth(entries) {
   return {
     status: 'ok',
     reason: 'No important errors detected in the current run'
+  };
+}
+
+function summarizeStateSync(entries) {
+  const interruptEvents = entries.filter((entry) => String(entry.event ?? '').startsWith('codex.turn.interrupt.'));
+  const requested = interruptEvents.filter((entry) => entry.event === 'codex.turn.interrupt.requested');
+  const confirmed = interruptEvents.filter((entry) => entry.event === 'codex.turn.interrupt.confirmed');
+  const failed = interruptEvents.filter((entry) => entry.event === 'codex.turn.interrupt.failed');
+  const resolvedInterruptKeys = new Set(
+    [...confirmed, ...failed].map(interruptKey).filter(Boolean)
+  );
+  const unresolved = requested
+    .filter((entry) => !resolvedInterruptKeys.has(interruptKey(entry)))
+    .map(summarizeCorrelationEntry);
+
+  const blockedEntries = entries.filter((entry) => entry.event === 'submission.blocked_by_interrupt');
+  const releasedEntries = entries.filter((entry) => (
+    entry.event === 'submission.dequeued'
+    && entry.data?.previousReason === 'interrupt_pending'
+  ));
+  const submittedEntries = entries.filter((entry) => entry.event === 'outbox.item.submitted');
+  const releasedKeys = new Set(releasedEntries.map(submissionKey).filter(Boolean));
+  const submittedKeys = new Set(submittedEntries.map(submissionKey).filter(Boolean));
+  const stuck = blockedEntries
+    .filter((entry) => {
+      const key = submissionKey(entry);
+      return key && !releasedKeys.has(key) && !submittedKeys.has(key);
+    })
+    .map(summarizeCorrelationEntry);
+
+  const effectivePolicies = entries.filter((entry) => entry.event === 'policy.effective');
+  const policyMismatches = entries.filter((entry) => entry.event === 'policy.mismatch');
+  const modelCatalogEvents = entries.filter((entry) => (
+    entry.event === 'model.catalog.loaded'
+    || entry.event === 'session.model_catalog.loaded'
+    || entry.event === 'session.model_catalog.refreshed'
+  ));
+  const runtimeEvents = entries.filter((entry) => entry.event === 'runtime.snapshot.reconciled');
+  const runtimeProjectionEvents = entries.filter((entry) => (
+    entry.event === 'runtime.snapshot.app_server_projected'
+  ));
+  const runtimeConflicts = runtimeEvents.reduce(
+    (total, entry) => total + Number(entry.data?.conflictCount ?? 0),
+    0
+  );
+
+  const anomalies = [
+    ...unresolved.map((entry) => ({
+      code: 'interrupt_without_terminal',
+      severity: 'warn',
+      ...entry
+    })),
+    ...stuck.map((entry) => ({
+      code: 'submission_blocked_without_release',
+      severity: 'warn',
+      ...entry
+    })),
+    ...policyMismatches.map((entry) => ({
+      code: 'policy_mismatch',
+      severity: 'error',
+      ...summarizeCorrelationEntry(entry)
+    }))
+  ];
+
+  return {
+    interrupts: {
+      requested: requested.length,
+      confirmed: confirmed.length,
+      failed: failed.length,
+      unresolved
+    },
+    submissions: {
+      blockedByInterrupt: blockedEntries.length,
+      released: releasedEntries.length,
+      submitted: submittedEntries.length,
+      stuck
+    },
+    policy: {
+      effective: effectivePolicies.at(-1)?.data ?? null,
+      mismatches: policyMismatches.map(summarizeCorrelationEntry)
+    },
+    modelCatalog: modelCatalogEvents.at(-1)?.data ?? null,
+    runtime: {
+      reconciliations: runtimeEvents.length,
+      conflicts: runtimeConflicts,
+      latest: runtimeEvents.at(-1)?.data ?? null,
+      projections: runtimeProjectionEvents.length,
+      latestProjection: runtimeProjectionEvents.at(-1)?.data ?? null
+    },
+    anomalies
+  };
+}
+
+function interruptKey(entry) {
+  const data = entry?.data ?? {};
+  const payload = data.payload ?? {};
+  const runId = String(data.runId ?? payload.runId ?? '').trim();
+  if (runId) {
+    return `run:${runId}`;
+  }
+  const threadId = String(data.threadId ?? payload.threadId ?? '').trim();
+  const turnId = String(data.turnId ?? payload.turnId ?? '').trim();
+  return threadId || turnId ? `turn:${threadId}:${turnId}` : '';
+}
+
+function submissionKey(entry) {
+  const data = entry?.data ?? {};
+  const id = String(data.id ?? '').trim();
+  if (id) {
+    return `outbox:${id}`;
+  }
+  const submissionId = String(data.submissionId ?? '').trim();
+  return submissionId ? `submission:${submissionId}` : '';
+}
+
+function summarizeCorrelationEntry(entry) {
+  const data = entry?.data ?? {};
+  const payload = data.payload ?? {};
+  return {
+    timestamp: String(entry?.timestamp ?? ''),
+    event: String(entry?.event ?? ''),
+    runId: String(data.runId ?? payload.runId ?? ''),
+    threadId: String(data.threadId ?? payload.threadId ?? ''),
+    turnId: String(data.turnId ?? payload.turnId ?? ''),
+    submissionId: String(data.submissionId ?? ''),
+    outboxId: String(data.id ?? '')
   };
 }
 
@@ -206,6 +334,21 @@ function renderMarkdown(summary) {
   lines.push(`- Entries: ${summary.task.entries}`);
   lines.push(`- Task IDs: ${summary.task.taskIds.join(', ') || 'none'}`);
   lines.push(`- Failures: ${summary.task.failures.length}`);
+
+  lines.push('', '## State Sync', '');
+  lines.push(`- Interrupts: requested=${summary.stateSync.interrupts.requested}, confirmed=${summary.stateSync.interrupts.confirmed}, failed=${summary.stateSync.interrupts.failed}, unresolved=${summary.stateSync.interrupts.unresolved.length}`);
+  lines.push(`- Follow-ups: blocked=${summary.stateSync.submissions.blockedByInterrupt}, released=${summary.stateSync.submissions.released}, submitted=${summary.stateSync.submissions.submitted}, stuck=${summary.stateSync.submissions.stuck.length}`);
+  lines.push(`- Policy mismatches: ${summary.stateSync.policy.mismatches.length}`);
+  lines.push(`- Model catalog: ${summary.stateSync.modelCatalog?.source ?? 'unknown'} (${summary.stateSync.modelCatalog?.modelCount ?? 0} models)`);
+  lines.push(`- Runtime conflicts: ${summary.stateSync.runtime.conflicts}`);
+  lines.push(`- App Server runtime projections: ${summary.stateSync.runtime.projections}`);
+  if (summary.stateSync.anomalies.length === 0) {
+    lines.push('- Anomalies: none');
+  } else {
+    for (const anomaly of summary.stateSync.anomalies) {
+      lines.push(`- ${anomaly.code}: thread=${anomaly.threadId || 'unknown'}, turn=${anomaly.turnId || 'unknown'}, submission=${anomaly.submissionId || 'unknown'}`);
+    }
+  }
 
   lines.push('', '## Files', '');
   for (const file of summary.files) {

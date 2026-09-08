@@ -8,7 +8,7 @@
   "troubleshooting": "docs/agent/TROUBLESHOOTING.md",
   "taskRecipes": "docs/agent/TASKS.md",
   "runtime": {
-    "node": ">=20",
+    "node": ">=24",
     "os": "windows",
     "shell": "powershell"
   },

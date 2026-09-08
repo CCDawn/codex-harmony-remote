@@ -8,9 +8,10 @@ import { MockCodexAdapter } from './mockCodexAdapter.js';
 
 const adapter = createAdapter();
 
-const { server, logger } = createApp({ config, adapter });
+const { server, logger, threadService } = createApp({ config, adapter });
 
 await logger.startRun(process.env.CODEX_BRIDGE_RUN_LABEL ?? 'bridge-start');
+await initializeSelectedRuntime(threadService);
 
 server.listen(config.port, config.host, () => {
   console.log(`Codex bridge probe listening on http://${config.host}:${config.port}`);
@@ -31,4 +32,16 @@ function createAdapter() {
     return new CodexDesktopCdpAdapter();
   }
   return new HybridCodexAdapter();
+}
+
+async function initializeSelectedRuntime(threadService) {
+  const mode = String(config.appServerRuntimeMode ?? 'desktop').trim().toLowerCase();
+  if (mode === 'desktop') {
+    return;
+  }
+  if (typeof threadService?.initialize !== 'function') {
+    throw new Error(`App Server runtime ${mode} requires an initializable thread service`);
+  }
+  const health = await threadService.initialize();
+  console.log(`App Server ready: mode=${mode}; state=${health.state}; generation=${health.generation}`);
 }

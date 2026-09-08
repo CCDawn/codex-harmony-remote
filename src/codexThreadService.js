@@ -1,62 +1,281 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { CodexAppServerClient } from './codexAppServerClient.js';
+import { ManagedCodexAppServerClient } from './managedCodexAppServerClient.js';
 import { buildSessionSnapshot, sanitize, summarizeThreadForEvent } from './codexProtocolUtils.js';
 import { CodexAppServerEventConverter } from './codexAppServerEvents.js';
+import { CodexAppServerApprovalBroker } from './codexAppServerApprovalBroker.js';
+import { CodexAppServerUserInputBroker } from './codexAppServerUserInputBroker.js';
+import { CodexAppServerRunJournal, isRecoverableRunIdentifier } from './codexAppServerRunJournal.js';
 import { isLiveActivityEntry } from './codexLiveActivity.js';
 import { classifyCodexClientNotice, createCodexClientNoticeEntry } from './codexClientNotices.js';
+import { CodexProjectCatalog } from './codexProjectCatalog.js';
+import { extractLocalImageInputs } from './codexTurnInput.js';
 import { normalizeModelId } from './sessionSettingsStore.js';
+import { SessionRuntimeSnapshotTracker } from './sessionRuntimeSnapshot.js';
 import { isSameOrChildPath, resolveSafeProjectRoot } from './workspaceGuard.js';
 
 const VALID_THREAD_ID = /^[A-Za-z0-9_-]+$/;
-const MAX_RUNNING_DESKTOP_REFRESHES = 6;
-
 export class CodexThreadService {
   constructor(options = {}) {
-    this.client = options.client ?? new CodexAppServerClient(options);
+    this.client = options.client ?? new ManagedCodexAppServerClient(options);
+    this.allowIndependentAppServer = options.allowIndependentAppServer !== false;
     this.sessions = options.sessions ?? null;
-    this.projects = options.projects ?? [];
+    this.projects = Array.isArray(options.projects) ? options.projects : [];
+    this.projectCatalog = options.projectCatalog ?? new CodexProjectCatalog({
+      projects: this.projects,
+      historyPath: options.projectHistoryPath
+    });
     this.eventBus = options.eventBus ?? null;
     this.logger = options.logger ?? null;
     this.desktopOpener = options.desktopOpener ?? null;
+    this.runtimeStateProvider = options.runtimeStateProvider ?? null;
+    this.desktopThreadListProvider = options.desktopThreadListProvider ?? null;
+    this.archiveThreadProvider = options.archiveThreadProvider ?? null;
     this.autoOpenDesktop = options.autoOpenDesktop ?? process.env.CODEX_BRIDGE_AUTO_OPEN_DESKTOP === '1';
     this.model = options.model ?? process.env.CODEX_BRIDGE_MODEL ?? '';
-    this.sandbox = options.sandbox ?? process.env.CODEX_BRIDGE_SANDBOX ?? 'danger-full-access';
-    this.approvalPolicy = options.approvalPolicy ?? process.env.CODEX_BRIDGE_APPROVAL_POLICY ?? 'never';
+    this.sandbox = options.sandbox
+      ?? process.env.CODEX_BRIDGE_APP_SERVER_SANDBOX
+      ?? process.env.CODEX_BRIDGE_SANDBOX
+      ?? 'danger-full-access';
+    this.approvalPolicy = options.approvalPolicy
+      ?? process.env.CODEX_BRIDGE_APP_SERVER_APPROVAL_POLICY
+      ?? process.env.CODEX_BRIDGE_APPROVAL_POLICY
+      ?? 'never';
     this.runs = new Map();
+    this.runsBySubmissionId = new Map();
+    this.newThreadRunsBySubmissionId = new Map();
+    this.newThreadSubmissionPromises = new Map();
     this.liveSessions = new Map();
     this.activeRunsByTurnId = new Map();
     this.activeRunsByThreadId = new Map();
+    this.runtimeSnapshotTracker = new SessionRuntimeSnapshotTracker({
+      epoch: options.runtimeSnapshotEpoch
+    });
+    this.lastRuntimeSnapshotLoggedRevision = 0;
+    this.lastAppServerProjectionLogFingerprint = '';
     this.converter = new CodexAppServerEventConverter();
-    this.client.on('notification', (message) => this.handleNotification(message));
-    this.client.on('stderr', (text) => this.writeLog('codex_app_server.stderr', { text }));
+    this.runJournal = options.runJournal ?? new CodexAppServerRunJournal({
+      filePath: options.runStatePath === undefined
+        ? defaultRunStatePath()
+        : options.runStatePath,
+      epoch: this.runtimeSnapshotTracker.epoch
+    });
+    this.persistQueued = false;
+    this.recoveryPromise = null;
+    this.approvalBroker = options.approvalBroker ?? new CodexAppServerApprovalBroker({
+      client: this.client,
+      resolveRun: ({ threadId, turnId }) => this.resolveRunForNotification(threadId, turnId)
+    });
+    this.userInputBroker = options.userInputBroker ?? new CodexAppServerUserInputBroker({
+      client: this.client,
+      resolveRun: ({ threadId, turnId }) => this.resolveRunForNotification(threadId, turnId)
+    });
+    if (this.allowIndependentAppServer) {
+      this.approvalBroker.on('required', (approval) => this.handleApprovalRequired(approval));
+      this.approvalBroker.on('decided', (approval) => this.handleApprovalDecided(approval));
+      this.approvalBroker.on('expired', (approval) => this.handleApprovalExpired(approval));
+      this.approvalBroker.on('unsupported', (request) => this.addServiceEvent('codex.app_server.request.rejected', request));
+      this.approvalBroker.start();
+      this.userInputBroker.on('required', (request) => this.handleUserInputRequired(request));
+      this.userInputBroker.on('answered', (request) => this.handleUserInputAnswered(request));
+      this.userInputBroker.on('expired', (request) => this.handleUserInputExpired(request));
+      this.userInputBroker.start();
+      this.client.on('notification', (message) => this.handleNotification(message));
+      this.client.on('stderr', (text) => this.writeLog('codex_app_server.stderr', { text }));
+      this.client.on('connected', () => {
+        void this.reconcilePersistedRuns();
+      });
+      this.client.on('reconnected', () => {
+        void this.reconcilePersistedRuns();
+      });
+      this.restorePersistedRuns();
+    }
   }
 
   async listThreads({ limit = 50, query = '' } = {}) {
+    await this.projectCatalog.initialize();
     const max = clampLimit(limit);
-    const liveSummaries = [...this.liveSessions.values()].map((session) => sessionToSummary(session));
-    const desktopThreads = await this.listDesktopThreads({ limit: max, query });
-    if (desktopThreads.length > 0) {
-      const refreshedLiveSummaries = await this.refreshTerminalStatesForRunningDesktopThreads(liveSummaries, desktopThreads);
-      return filterSessions(mergeDesktopAlignedSessions(refreshedLiveSummaries, desktopThreads), query).slice(0, max);
+    if (!this.allowIndependentAppServer) {
+      const threads = await this.listDesktopThreads({ limit: max, query });
+      await this.projectCatalog.observeSessions(threads);
+      return threads;
     }
+    const liveSummaries = [...this.liveSessions.values()].map((session) => sessionToSummary(session));
+    let appServerThreads = [];
+    let appServerError = null;
+    if (this.allowIndependentAppServer) {
+      try {
+        appServerThreads = await this.listAppServerThreads({ limit: max, query });
+      } catch (error) {
+        appServerError = error;
+        this.addServiceEvent('codex.app_server_threads.list_failed', {
+          message: error.message ?? String(error)
+        });
+      }
+    }
+    const desktopThreads = await this.listDesktopThreads({ limit: max, query });
+    const remoteSummaries = mergeSessions(liveSummaries, appServerThreads);
+    const merged = mergeRemoteAndDesktopSessions(remoteSummaries, desktopThreads);
+    if (appServerError && merged.length === 0) {
+      throw appServerError;
+    }
+    const filtered = filterSessions(merged, query).slice(0, max);
+    await this.projectCatalog.observeSessions(filtered);
+    return filtered;
+  }
 
-    const response = await this.client.request('thread/list', {
-      archived: false,
-      limit: max,
-      searchTerm: query || null,
-      sortKey: 'updated_at',
-      sortDirection: 'desc'
+  async getRuntimeSnapshot({ limit = 500 } = {}) {
+    const sessions = await this.listThreads({ limit: clampLimit(limit, 500) });
+    let officialStates = [];
+    let stale = false;
+    if (typeof this.runtimeStateProvider === 'function') {
+      try {
+        officialStates = await this.runtimeStateProvider({ limit: clampLimit(limit, 500) });
+        if (!Array.isArray(officialStates)) {
+          officialStates = [];
+          stale = true;
+        } else if (officialStates.length === 0 && sessions.length > 0) {
+          stale = true;
+        }
+      } catch (error) {
+        stale = true;
+        this.addServiceEvent('codex.desktop_runtime_states.list_failed', {
+          message: error.message ?? String(error)
+        });
+      }
+    }
+    if (this.allowIndependentAppServer) {
+      const projectedStates = sessions
+        .filter((session) => isRunningActivityStatus(
+          normalizeActivityStatus(session?.appServerRuntimeState)
+        ))
+        .map(runtimeStateFromAppServerProjection);
+      officialStates = mergeRuntimeStateLists(officialStates, projectedStates);
+      const officialThreadIds = new Set(officialStates.map((state) => state.threadId));
+      const unresolvedActiveThreadIds = sessions
+        .filter((session) => {
+          const state = normalizeActivityStatus(session?.runtimeState ?? session?.activityStatus);
+          return isRunningActivityStatus(state)
+            && !officialThreadIds.has(String(session?.id ?? session?.threadId ?? '').trim());
+        })
+        .map((session) => String(session?.id ?? session?.threadId ?? '').trim())
+        .filter(Boolean);
+      stale = unresolvedActiveThreadIds.length > 0;
+      const projectionData = {
+        source: 'thread/list',
+        resolvedThreadIds: projectedStates.map((state) => state.threadId),
+        activeThreadIds: projectedStates
+          .filter((state) => isRunningActivityStatus(state.state))
+          .map((state) => state.threadId),
+        unresolvedActiveThreadIds
+      };
+      const projectionFingerprint = JSON.stringify(projectionData);
+      if (projectionFingerprint !== this.lastAppServerProjectionLogFingerprint) {
+        this.lastAppServerProjectionLogFingerprint = projectionFingerprint;
+        this.addServiceEvent('runtime.snapshot.app_server_projected', projectionData);
+      }
+    }
+    const snapshot = this.runtimeSnapshotTracker.build({
+      sessions,
+      activeRuns: [...this.runs.values()],
+      officialStates,
+      stale
     });
-    const threads = Array.isArray(response) ? response : (response?.data ?? response?.threads ?? []);
-    const appServerThreads = threads
-      .map((thread) => this.threadToSummary(thread))
-      .filter((thread) => thread.id.length > 0);
-    const merged = mergeSessions(liveSummaries, appServerThreads);
-    return filterSessions(merged, query).slice(0, max);
+    if (snapshot.revision !== this.lastRuntimeSnapshotLoggedRevision) {
+      this.lastRuntimeSnapshotLoggedRevision = snapshot.revision;
+      const decisions = snapshot.decisions.filter((decision) => (
+        decision.reason === 'official_terminal_sticky'
+        || decision.reason === 'newer_turn_active'
+      ));
+      this.addServiceEvent('runtime.snapshot.reconciled', {
+        epoch: snapshot.epoch,
+        revision: snapshot.revision,
+        stale: snapshot.stale,
+        sessionCount: snapshot.sessions.length,
+        conflictCount: decisions.length,
+        decisions: decisions.slice(0, 50)
+      });
+    }
+    return snapshot;
+  }
+
+  async listAppServerThreads({ limit, query }) {
+    this.assertIndependentAppServerEnabled('读取独立 App Server 会话列表');
+    return this.listProtocolThreads({ limit, query }, (params) => this.requestAppServer('thread/list', params));
+  }
+
+  async listProtocolThreads({ limit, query }, request) {
+    const target = clampLimit(limit, 500);
+    const pageSize = Math.min(target, 100);
+    const byId = new Map();
+    const seenCursors = new Set();
+    let cursor = null;
+    do {
+      const params = {
+        archived: false,
+        limit: pageSize,
+        searchTerm: query || null,
+        sortKey: 'updated_at',
+        sortDirection: 'desc'
+      };
+      if (cursor) {
+        params.cursor = cursor;
+      }
+      const response = await request(params);
+      const threads = Array.isArray(response) ? response : (response?.data ?? response?.threads ?? []);
+      for (const thread of threads) {
+        const summary = this.threadToSummary(thread);
+        if (summary.id.length > 0 && !byId.has(summary.id)) {
+          byId.set(summary.id, summary);
+        }
+      }
+      const nextCursor = Array.isArray(response)
+        ? null
+        : String(response?.nextCursor ?? response?.next_cursor ?? '').trim() || null;
+      if (!nextCursor || seenCursors.has(nextCursor)) {
+        cursor = null;
+      } else {
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      }
+    } while (cursor && byId.size < target);
+    return [...byId.values()].slice(0, target);
+  }
+
+  async listProjects({ limit = 500 } = {}) {
+    await this.projectCatalog.initialize();
+    let appServerThreads = [];
+    if (this.allowIndependentAppServer) {
+      try {
+        appServerThreads = await this.listAppServerThreads({ limit, query: '' });
+      } catch (error) {
+        this.addServiceEvent('codex.app_server_projects.list_failed', {
+          message: error.message ?? String(error)
+        });
+      }
+    }
+    const desktopThreads = await this.listDesktopThreads({
+      limit: Math.min(clampLimit(limit, 500), 100),
+      query: ''
+    });
+    await this.projectCatalog.observeSessions(
+      mergeRemoteAndDesktopSessions(appServerThreads, desktopThreads)
+    );
+    return this.projectCatalog.listProjects();
   }
 
   async listDesktopThreads({ limit, query }) {
+    if (!this.allowIndependentAppServer) {
+      if (typeof this.desktopThreadListProvider !== 'function') {
+        throw new Error('桌面 App Server 列表接口未连接');
+      }
+      const threads = await this.listProtocolThreads({ limit, query }, (params) => (
+        this.desktopThreadListProvider({ ...params, useStateDbOnly: true })
+      ));
+      return typeof this.sessions?.decorateDesktopThreads === 'function'
+        ? this.sessions.decorateDesktopThreads(threads)
+        : threads;
+    }
     if (!this.sessions || typeof this.sessions.listSessions !== 'function') {
       return [];
     }
@@ -68,29 +287,6 @@ export class CodexThreadService {
       });
       return [];
     }
-  }
-
-  async refreshTerminalStatesForRunningDesktopThreads(liveSummaries, desktopThreads) {
-    const liveById = new Map(liveSummaries.map((session) => [session.id, session]));
-    const candidates = desktopThreads
-      .filter((session) => {
-        const desktopStatus = normalizeActivityStatus(session.runtimeState ?? session.activityStatus);
-        if (!isRunningActivityStatus(desktopStatus)) {
-          return false;
-        }
-        const liveStatus = normalizeActivityStatus(liveById.get(session.id)?.runtimeState ?? liveById.get(session.id)?.activityStatus);
-        return !isTerminalActivityStatus(liveStatus);
-      })
-      .slice(0, MAX_RUNNING_DESKTOP_REFRESHES);
-
-    for (const session of candidates) {
-      const refreshed = await this.readLiveTerminalSnapshot(session.id);
-      if (refreshed) {
-        liveById.set(session.id, sessionToSummary(refreshed));
-      }
-    }
-
-    return [...liveById.values()];
   }
 
   async getThread(threadId, { tail = 120 } = {}) {
@@ -110,7 +306,7 @@ export class CodexThreadService {
       return limitSessionEntries(live, tail);
     }
 
-    const response = await this.client.request('thread/read', {
+    const response = await this.requestAppServer('thread/read', {
       threadId,
       includeTurns: true
     });
@@ -160,16 +356,85 @@ export class CodexThreadService {
       }
     }
 
+    if (this.sessions && typeof this.sessions.getSession === 'function') {
+      try {
+        const localSession = await this.sessions.getSession(threadId, { tail: 1 });
+        const localState = normalizeActivityStatus(
+          localSession?.runtimeState ?? localSession?.activityStatus ?? ''
+        );
+        if (isRunningActivityStatus(localState)) {
+          const error = new Error('会话正在进行中，请先中断或等待完成后再删除。');
+          error.statusCode = 409;
+          throw error;
+        }
+      } catch (error) {
+        if (Number(error?.statusCode ?? 0) === 409) {
+          throw error;
+        }
+      }
+    }
+
+    if (typeof this.runtimeStateProvider === 'function') {
+      try {
+        const states = await this.runtimeStateProvider({ limit: 500 });
+        const targetState = Array.isArray(states)
+          ? states.find((state) => String(state?.threadId ?? state?.id ?? '') === threadId)
+          : null;
+        const runtimeState = normalizeActivityStatus(
+          targetState?.runtimeState ?? targetState?.activityStatus ?? targetState?.status ?? ''
+        );
+        if (isRunningActivityStatus(runtimeState)) {
+          const error = new Error('会话正在进行中，请先中断或等待完成后再删除。');
+          error.statusCode = 409;
+          throw error;
+        }
+      } catch (error) {
+        if (Number(error?.statusCode ?? 0) === 409) {
+          throw error;
+        }
+        this.addServiceEvent('codex.thread.delete_runtime_probe_failed', {
+          threadId,
+          message: error.message ?? String(error)
+        });
+      }
+    }
+
+    let officialArchived = false;
+    if (typeof this.archiveThreadProvider === 'function') {
+      await this.archiveThreadProvider(threadId);
+      officialArchived = true;
+    } else if (this.allowIndependentAppServer) {
+      const response = await this.requestAppServer('thread/read', {
+        threadId,
+        includeTurns: true
+      });
+      const officialState = runtimeStateFromDesktopThread(response.thread ?? response);
+      if (isRunningActivityStatus(officialState)) {
+        const error = new Error('会话正在进行中，请先中断或等待完成后再删除。');
+        error.statusCode = 409;
+        throw error;
+      }
+      await this.requestAppServer('thread/archive', { threadId });
+      officialArchived = true;
+    }
+
     let deletion = {
       id: threadId,
       deletedFiles: [],
+      preservedFiles: [],
       archivedThreadCount: 0,
       removedIndexRecords: 0,
       removedGlobalStateEntries: 0,
       deletedAt: new Date().toISOString()
     };
     if (this.sessions && typeof this.sessions.deleteSession === 'function') {
-      deletion = await this.sessions.deleteSession(threadId);
+      try {
+        deletion = await this.sessions.deleteSession(threadId);
+      } catch (error) {
+        if (!officialArchived || Number(error?.statusCode ?? 0) !== 404) {
+          throw error;
+        }
+      }
     }
 
     this.liveSessions.delete(threadId);
@@ -182,16 +447,24 @@ export class CodexThreadService {
     }
     this.addServiceEvent('codex.thread.deleted', {
       threadId,
+      officialArchived,
       deletedFiles: deletion.deletedFiles?.length ?? 0,
+      preservedFiles: deletion.preservedFiles?.length ?? 0,
       archivedThreadCount: deletion.archivedThreadCount ?? 0,
       removedIndexRecords: deletion.removedIndexRecords ?? 0
     });
-    return deletion;
+    return {
+      ...deletion,
+      officialArchived
+    };
   }
 
   async readLiveTerminalSnapshot(threadId) {
+    if (!this.allowIndependentAppServer) {
+      return null;
+    }
     try {
-      const response = await this.client.request('thread/read', {
+      const response = await this.requestAppServer('thread/read', {
         threadId,
         includeTurns: true
       });
@@ -265,37 +538,92 @@ export class CodexThreadService {
     }
   }
 
-  async startThread({ projectId = '', cwd = '', prompt = '', model = '', reasoningEffort = '' } = {}) {
+  async startThread({ projectId = '', cwd = '', prompt = '', model = '', reasoningEffort = '', submissionId = '' } = {}) {
+    this.assertIndependentAppServerEnabled('通过独立 App Server 新建会话');
+    await this.projectCatalog.initialize();
     const project = this.resolveProject(projectId, cwd);
     const resolvedCwd = resolveSafeProjectRoot(project, { action: '手机端新建 Codex 会话' });
-    const response = await this.client.request('thread/start', {
-      cwd: resolvedCwd,
-      approvalPolicy: this.approvalPolicy,
-      sandbox: this.sandbox,
-      model: this.optionalModel(model),
-      threadSource: 'user'
-    });
-    const thread = response.thread;
-    if (!thread?.id) {
-      throw new Error('Codex app-server did not return thread.id');
+    const normalizedSubmissionId = String(submissionId ?? '').trim();
+    const resolvedProjectId = project?.id ?? projectId;
+    const newThreadSubmissionKey = this.newThreadSubmissionKey(resolvedProjectId, normalizedSubmissionId);
+    const existingRunId = newThreadSubmissionKey ? this.newThreadRunsBySubmissionId.get(newThreadSubmissionKey) : '';
+    const existingRun = existingRunId ? this.runs.get(existingRunId) : null;
+    if (existingRun) {
+      this.addRunEvent(existingRun, 'codex.thread.duplicate_submission_ignored', {
+        projectId: resolvedProjectId,
+        submissionId: normalizedSubmissionId,
+        threadId: existingRun.threadId
+      });
+      const existingThread = this.liveSessions.get(existingRun.threadId)
+        ?? buildSessionSnapshot({ id: existingRun.threadId, cwd: resolvedCwd, turns: [] }, { threadId: existingRun.threadId });
+      return { thread: existingThread, run: this.serializeRun(existingRun) };
     }
-    const session = buildSessionSnapshot(thread, { threadId: thread.id });
-    this.liveSessions.set(thread.id, session);
-    if (prompt.trim().length === 0) {
-      return { thread: session, run: null };
+    if (newThreadSubmissionKey && this.newThreadSubmissionPromises.has(newThreadSubmissionKey)) {
+      return await this.newThreadSubmissionPromises.get(newThreadSubmissionKey);
     }
-    const run = await this.sendMessage({
-      threadId: thread.id,
-      text: prompt,
-      projectId: project?.id ?? projectId,
-      createdThreadId: thread.id,
-      model,
-      reasoningEffort
-    });
-    return { thread: this.liveSessions.get(thread.id) ?? session, run };
+
+    const start = async () => {
+      this.addServiceEvent('policy.effective', {
+        operation: 'thread/start',
+        sandbox: this.sandbox,
+        approvalPolicy: this.approvalPolicy,
+        projectId: resolvedProjectId,
+        submissionId: normalizedSubmissionId
+      });
+      const response = await this.requestAppServer('thread/start', {
+        cwd: resolvedCwd,
+        approvalPolicy: this.approvalPolicy,
+        sandbox: appServerSandboxFromMode(this.sandbox),
+        model: this.optionalModel(model),
+        serviceName: 'codex_harmony_remote',
+        threadSource: 'user'
+      });
+      const thread = response.thread;
+      if (!thread?.id) {
+        throw new Error('Codex app-server did not return thread.id');
+      }
+      const session = buildSessionSnapshot(thread, { threadId: thread.id });
+      this.liveSessions.set(thread.id, session);
+      if (prompt.trim().length === 0) {
+        return { thread: session, run: null };
+      }
+      const run = await this.sendMessage({
+        threadId: thread.id,
+        text: prompt,
+        projectId: resolvedProjectId,
+        createdThreadId: thread.id,
+        model,
+        reasoningEffort,
+        submissionId: normalizedSubmissionId
+      });
+      if (newThreadSubmissionKey) {
+        this.newThreadRunsBySubmissionId.set(newThreadSubmissionKey, run.id);
+      }
+      return { thread: this.liveSessions.get(thread.id) ?? session, run };
+    };
+    const startPromise = start();
+    if (!newThreadSubmissionKey) {
+      return await startPromise;
+    }
+    this.newThreadSubmissionPromises.set(newThreadSubmissionKey, startPromise);
+    try {
+      return await startPromise;
+    } finally {
+      this.newThreadSubmissionPromises.delete(newThreadSubmissionKey);
+    }
   }
 
-  async sendMessage({ threadId, text, projectId = '', createdThreadId = null, model = '', reasoningEffort = '' }) {
+  async sendMessage({
+    threadId,
+    text,
+    projectId = '',
+    createdThreadId = null,
+    model = '',
+    reasoningEffort = '',
+    submissionId = '',
+    deliveryMode = 'app_server'
+  }) {
+    this.assertIndependentAppServerEnabled('通过独立 App Server 发送消息');
     assertThreadId(threadId);
     const prompt = String(text ?? '').trim();
     if (prompt.length === 0) {
@@ -304,7 +632,45 @@ export class CodexThreadService {
       throw error;
     }
 
-    const run = this.createRun({ threadId, prompt, projectId, createdThreadId, model, reasoningEffort });
+    const normalizedSubmissionId = String(submissionId ?? '').trim();
+    const submissionKey = this.submissionKey(threadId, normalizedSubmissionId);
+    if (submissionKey && this.runsBySubmissionId.has(submissionKey)) {
+      const existing = this.runs.get(this.runsBySubmissionId.get(submissionKey));
+      if (existing) {
+        if (canRetryFailedSubmission(existing)) {
+          this.runsBySubmissionId.delete(submissionKey);
+          this.addRunEvent(existing, 'codex.turn.failed_submission_retried', {
+            threadId,
+            submissionId: normalizedSubmissionId,
+            previousRunId: existing.id
+          });
+        } else {
+          this.addRunEvent(existing, 'codex.turn.duplicate_submission_ignored', {
+            threadId,
+            submissionId: normalizedSubmissionId
+          });
+          return this.serializeRun(existing);
+        }
+      }
+      this.runsBySubmissionId.delete(submissionKey);
+    }
+
+    const run = this.createRun({
+      threadId,
+      prompt,
+      projectId,
+      createdThreadId,
+      model,
+      reasoningEffort,
+      submissionId: normalizedSubmissionId,
+      deliveryMode
+    });
+    if (submissionKey) {
+      this.runsBySubmissionId.set(submissionKey, run.id);
+    }
+    if (run.deliveryMode === 'desktop_fallback') {
+      this.addRunEvent(run, 'codex.desktop_sync', desktopSyncForRun(run));
+    }
     this.addEntry(threadId, {
       timestamp: new Date().toISOString(),
       type: 'userMessage',
@@ -312,8 +678,79 @@ export class CodexThreadService {
       text: prompt
     });
     this.addRunEvent(run, 'codex.user.message', { threadId, text: prompt });
+    this.persistRuns();
     this.openDesktopThread(run, 'submitted');
     void this.runTurn(run).catch((error) => this.failRun(run, error));
+    return this.serializeRun(run);
+  }
+
+  canSteerThread(threadId) {
+    const runId = this.activeRunsByThreadId.get(String(threadId ?? ''));
+    const run = runId ? this.runs.get(runId) : null;
+    return Boolean(run && !isTerminalActivityStatus(run.status));
+  }
+
+  async steerMessage({ threadId, text, submissionId = '' }) {
+    this.assertIndependentAppServerEnabled('通过独立 App Server 追加引导');
+    assertThreadId(threadId);
+    const prompt = String(text ?? '').trim();
+    if (!prompt) {
+      const error = new Error('引导消息不能为空');
+      error.statusCode = 400;
+      throw error;
+    }
+    const normalizedSubmissionId = String(submissionId ?? '').trim();
+    const submissionKey = this.submissionKey(threadId, normalizedSubmissionId);
+    if (submissionKey && this.runsBySubmissionId.has(submissionKey)) {
+      const existing = this.runs.get(this.runsBySubmissionId.get(submissionKey));
+      if (existing) {
+        return this.serializeRun(existing);
+      }
+      this.runsBySubmissionId.delete(submissionKey);
+    }
+    const runId = this.activeRunsByThreadId.get(threadId);
+    const run = runId ? this.runs.get(runId) : null;
+    if (!run || isTerminalActivityStatus(run.status)) {
+      const error = new Error('当前回合已经结束，无法追加引导消息。');
+      error.statusCode = 409;
+      error.code = 'CODEX_STEER_NO_ACTIVE_TURN';
+      error.safeToFallback = true;
+      throw error;
+    }
+    const turnId = await this.waitForTurnId(run);
+    if (!turnId) {
+      const error = new Error('当前回合尚未进入可引导阶段，请稍后重试。');
+      error.statusCode = 409;
+      error.code = 'CODEX_STEER_NO_ACTIVE_TURN';
+      error.safeToFallback = true;
+      throw error;
+    }
+    const input = [{
+      type: 'text',
+      text: prompt
+    }, ...extractLocalImageInputs(prompt)];
+    const response = await this.requestAppServer('turn/steer', {
+      threadId,
+      input,
+      expectedTurnId: turnId
+    });
+    this.addEntry(threadId, {
+      timestamp: new Date().toISOString(),
+      type: 'userMessage',
+      role: 'user',
+      text: prompt
+    });
+    this.addRunEvent(run, 'codex.turn.steered', {
+      threadId,
+      turnId: response?.turnId ?? turnId,
+      submissionId: normalizedSubmissionId,
+      inputCount: input.length
+    });
+    if (submissionKey) {
+      this.runsBySubmissionId.set(submissionKey, run.id);
+    }
+    run.updatedAt = new Date().toISOString();
+    this.persistRuns();
     return this.serializeRun(run);
   }
 
@@ -327,30 +764,326 @@ export class CodexThreadService {
     return this.serializeRun(run);
   }
 
+  async initialize() {
+    if (!this.allowIndependentAppServer) {
+      return this.runtimeHealth();
+    }
+    if (typeof this.client.initialize === 'function') {
+      await this.client.initialize();
+    } else if (typeof this.client.ensureStarted === 'function') {
+      await this.client.ensureStarted();
+    }
+    await this.reconcilePersistedRuns();
+    return this.runtimeHealth();
+  }
+
+  listRuns() {
+    return [...this.runs.values()]
+      .sort((left, right) => String(right.updatedAt ?? '').localeCompare(String(left.updatedAt ?? '')));
+  }
+
+  findRunBySubmission({ kind = 'existing_thread', threadId = '', projectId = '', submissionId = '' } = {}) {
+    const normalizedSubmissionId = String(submissionId ?? '').trim();
+    if (!normalizedSubmissionId) {
+      return null;
+    }
+    const key = kind === 'new_thread'
+      ? this.newThreadSubmissionKey(projectId, normalizedSubmissionId)
+      : this.submissionKey(threadId, normalizedSubmissionId);
+    const runId = kind === 'new_thread'
+      ? this.newThreadRunsBySubmissionId.get(key)
+      : this.runsBySubmissionId.get(key);
+    const run = runId ? this.runs.get(runId) : null;
+    return run ? this.serializeRun(run) : null;
+  }
+
+  listApprovals() {
+    return this.approvalBroker.list();
+  }
+
+  getApproval(approvalId) {
+    return this.approvalBroker.get(approvalId);
+  }
+
+  decideApproval(approvalId, decision) {
+    return this.approvalBroker.decide(approvalId, decision);
+  }
+
+  listUserInputs() {
+    return this.userInputBroker.list();
+  }
+
+  getUserInput(requestId) {
+    return this.userInputBroker.get(requestId);
+  }
+
+  answerUserInput(requestId, answers) {
+    return this.userInputBroker.answer(requestId, answers);
+  }
+
+  runtimeHealth() {
+    if (!this.allowIndependentAppServer) {
+      return {
+        kind: 'app_server',
+        enabled: false,
+        state: 'disabled',
+        reason: 'strict_desktop_mode',
+        generation: 0,
+        pendingRequests: 0,
+        reconnectAttempts: 0,
+        reconnectScheduled: false,
+        recoveredRuns: 0,
+        pendingApprovals: 0,
+        pendingUserInputs: 0
+      };
+    }
+    const health = typeof this.client.health === 'function' ? this.client.health() : {};
+    return {
+      kind: 'app_server',
+      enabled: true,
+      state: health.state ?? 'unknown',
+      generation: Number(health.generation ?? this.clientGeneration()),
+      pendingRequests: Number(health.pendingRequests ?? 0),
+      reconnectAttempts: Number(health.reconnectAttempts ?? 0),
+      reconnectScheduled: health.reconnectScheduled === true,
+      recoveredRuns: [...this.runs.values()].filter((run) => run.status === 'recovering').length,
+      pendingApprovals: this.listApprovals().filter((approval) => approval.status === 'pending').length,
+      pendingUserInputs: this.listUserInputs().filter((request) => request.status === 'pending').length
+    };
+  }
+
+  assertIndependentAppServerEnabled(action = '调用独立 App Server') {
+    if (this.allowIndependentAppServer) {
+      return;
+    }
+    const error = new Error(
+      `严格桌面模式已禁用独立 App Server：${action}必须由桌面 Codex 当前可见会话完成。`
+    );
+    error.statusCode = 409;
+    error.code = 'independent_app_server_disabled';
+    throw error;
+  }
+
+  requestAppServer(method, params) {
+    this.assertIndependentAppServerEnabled(`调用 ${method}；`);
+    return this.client.request(method, params);
+  }
+
+  handleApprovalRequired(approval) {
+    const run = this.runs.get(approval.runId);
+    if (!run || isTerminalActivityStatus(run.status)) {
+      return;
+    }
+    if (this.approvalPolicy === 'never') {
+      this.addServiceEvent('policy.mismatch', {
+        operation: 'approval/required',
+        configuredApprovalPolicy: this.approvalPolicy,
+        configuredSandbox: this.sandbox,
+        approvalId: approval.id,
+        runId: approval.runId,
+        threadId: approval.threadId,
+        turnId: approval.turnId
+      });
+    }
+    run.status = 'waiting_approval';
+    run.pendingApprovalId = approval.id;
+    run.updatedAt = new Date().toISOString();
+    this.addRunEvent(run, 'approval.required', {
+      approvalId: approval.id,
+      command: approval.command,
+      reason: approval.reason,
+      risk: approval.risk,
+      generation: approval.generation,
+      threadId: approval.threadId,
+      turnId: approval.turnId
+    });
+    this.schedulePersistRuns();
+  }
+
+  handleApprovalDecided(approval) {
+    const run = this.runs.get(approval.runId);
+    if (!run) {
+      return;
+    }
+    if (run.status === 'waiting_approval') {
+      run.status = 'running';
+    }
+    run.pendingApprovalId = '';
+    run.updatedAt = new Date().toISOString();
+    this.addRunEvent(run, 'approval.decided', {
+      approvalId: approval.id,
+      decision: approval.decision,
+      threadId: approval.threadId,
+      turnId: approval.turnId
+    });
+    this.schedulePersistRuns();
+  }
+
+  handleApprovalExpired(approval) {
+    const run = this.runs.get(approval.runId);
+    if (!run) {
+      return;
+    }
+    if (run.status === 'waiting_approval') {
+      run.status = 'recovering';
+    }
+    run.pendingApprovalId = '';
+    run.updatedAt = new Date().toISOString();
+    this.addRunEvent(run, 'approval.expired', {
+      approvalId: approval.id,
+      reason: approval.expireReason ?? 'app_server_reconnected',
+      threadId: approval.threadId,
+      turnId: approval.turnId
+    });
+    this.schedulePersistRuns();
+    void this.reconcilePersistedRuns();
+  }
+
+  handleUserInputRequired(request) {
+    const run = this.runs.get(request.runId);
+    if (!run || isTerminalActivityStatus(run.status)) {
+      return;
+    }
+    run.status = 'waiting_input';
+    run.pendingUserInputId = request.id;
+    run.updatedAt = new Date().toISOString();
+    this.addRunEvent(run, 'user_input.required', {
+      requestId: request.id,
+      itemId: request.itemId,
+      questions: request.questions,
+      autoResolutionMs: request.autoResolutionMs,
+      generation: request.generation,
+      threadId: request.threadId,
+      turnId: request.turnId
+    });
+    this.schedulePersistRuns();
+  }
+
+  handleUserInputAnswered(request) {
+    const run = this.runs.get(request.runId);
+    if (!run) {
+      return;
+    }
+    if (run.status === 'waiting_input') {
+      run.status = 'running';
+    }
+    run.pendingUserInputId = '';
+    run.updatedAt = new Date().toISOString();
+    this.addRunEvent(run, 'user_input.answered', {
+      requestId: request.id,
+      itemId: request.itemId,
+      threadId: request.threadId,
+      turnId: request.turnId
+    });
+    this.schedulePersistRuns();
+  }
+
+  handleUserInputExpired(request) {
+    const run = this.runs.get(request.runId);
+    if (!run) {
+      return;
+    }
+    if (run.status === 'waiting_input') {
+      run.status = 'recovering';
+    }
+    run.pendingUserInputId = '';
+    run.updatedAt = new Date().toISOString();
+    this.addRunEvent(run, 'user_input.expired', {
+      requestId: request.id,
+      itemId: request.itemId,
+      reason: request.expireReason ?? 'app_server_reconnected',
+      threadId: request.threadId,
+      turnId: request.turnId
+    });
+    this.schedulePersistRuns();
+    void this.reconcilePersistedRuns();
+  }
+
   async interruptRun(runId) {
+    this.assertIndependentAppServerEnabled('中断独立 App Server 回合');
     const run = this.runs.get(runId);
     if (!run) {
       const error = new Error('Unknown Codex run');
       error.statusCode = 404;
       throw error;
     }
-    if (!run.turnId) {
+    if (isTerminalActivityStatus(run.status) || run.status === 'recovering') {
       return this.serializeRun(run);
     }
-    await this.client.request('turn/interrupt', {
-      threadId: run.threadId,
-      turnId: run.turnId
-    });
-    this.addRunEvent(run, 'codex.turn.interrupted', { threadId: run.threadId, turnId: run.turnId });
-    this.removeLiveActivity(run.threadId, run.turnId);
-    run.status = 'failed';
-    run.error = '已中断当前回复';
+    const turnId = await this.waitForTurnId(run);
+    if (!turnId) {
+      return this.serializeRun(run);
+    }
+    if (run.interruptRequested) {
+      return this.serializeRun(run);
+    }
+
+    run.interruptRequested = true;
     run.updatedAt = new Date().toISOString();
-    this.markLiveSessionTerminal(run.threadId, 'interrupted', run.updatedAt, run.turnId);
+    this.addRunEvent(run, 'codex.turn.interrupt.requested', { threadId: run.threadId, turnId });
+    this.schedulePersistRuns();
+    try {
+      await this.requestAppServer('turn/interrupt', {
+        threadId: run.threadId,
+        turnId
+      });
+    } catch (error) {
+      if (!isUncertainTurnStartError(error)) {
+        run.interruptRequested = false;
+        this.addRunEvent(run, 'codex.turn.interrupt.failed', {
+          threadId: run.threadId,
+          turnId,
+          message: error?.message ?? String(error)
+        });
+        this.schedulePersistRuns();
+        throw error;
+      }
+    }
+
+    const terminal = await this.waitForTerminalState(run);
+    if (!terminal) {
+      await this.reconcilePersistedRun(run);
+    }
+    if (!isTerminalActivityStatus(run.status)) {
+      this.addRunEvent(run, 'codex.turn.interrupt.pending', { threadId: run.threadId, turnId });
+      this.schedulePersistRuns();
+    }
     return this.serializeRun(run);
   }
 
-  createRun({ threadId, prompt, projectId, createdThreadId, model, reasoningEffort }) {
+  async interruptThread(threadId) {
+    this.assertIndependentAppServerEnabled('中断独立 App Server 会话');
+    assertThreadId(threadId);
+    const runId = this.activeRunsByThreadId.get(threadId);
+    if (!runId) {
+      const error = new Error('当前会话没有可中断的 App Server 运行');
+      error.statusCode = 404;
+      throw error;
+    }
+    return await this.interruptRun(runId);
+  }
+
+  async waitForTurnId(run) {
+    const deadline = Date.now() + Number(process.env.CODEX_APP_SERVER_INTERRUPT_WAIT_MS ?? 3_000);
+    while (!run.turnId && Date.now() < deadline) {
+      await delay(25);
+    }
+    if (run.turnId) {
+      return run.turnId;
+    }
+    await this.reconcileUncertainTurnStart(run, new Error('等待 App Server 回合标识超时'));
+    return run.turnId;
+  }
+
+  async waitForTerminalState(run) {
+    const deadline = Date.now() + Number(process.env.CODEX_APP_SERVER_INTERRUPT_CONFIRM_MS ?? 5_000);
+    while (!isTerminalActivityStatus(run.status) && Date.now() < deadline) {
+      await delay(25);
+    }
+    return isTerminalActivityStatus(run.status);
+  }
+
+  createRun({ threadId, prompt, projectId, createdThreadId, model, reasoningEffort, submissionId = '', deliveryMode = 'app_server' }) {
     const now = new Date().toISOString();
     const run = {
       id: randomUUID(),
@@ -359,6 +1092,7 @@ export class CodexThreadService {
       threadId,
       createdThreadId,
       turnId: null,
+      activeCodexTurnId: null,
       status: 'queued',
       createdAt: now,
       updatedAt: now,
@@ -366,47 +1100,299 @@ export class CodexThreadService {
       session: this.liveSessions.get(threadId) ?? null,
       model: normalizeModelId(model),
       reasoningEffort: normalizeReasoningEffort(reasoningEffort),
+      submissionId: String(submissionId ?? '').trim(),
+      deliveryMode: normalizeDeliveryMode(deliveryMode),
+      promptLength: String(prompt ?? '').length,
+      generation: this.clientGeneration(),
+      interruptRequested: false,
+      pendingApprovalId: '',
+      pendingUserInputId: '',
       error: ''
     };
     this.runs.set(run.id, run);
     return run;
   }
 
+  restorePersistedRuns() {
+    if (!this.allowIndependentAppServer) {
+      return;
+    }
+    const recovered = this.runJournal.load();
+    for (const snapshot of recovered) {
+      if (!isRecoverableRunIdentifier(snapshot) || !snapshot.id || this.runs.has(snapshot.id)) {
+        continue;
+      }
+      const run = {
+        ...snapshot,
+        activeCodexTurnId: snapshot.turnId,
+        events: [],
+        session: null,
+        error: '',
+        interruptRequested: false,
+        pendingApprovalId: '',
+        pendingUserInputId: ''
+      };
+      this.runs.set(run.id, run);
+      this.activeRunsByThreadId.set(run.threadId, run.id);
+      if (run.turnId) {
+        this.activeRunsByTurnId.set(run.turnId, run.id);
+      }
+      const submissionKey = this.submissionKey(run.threadId, run.submissionId);
+      if (submissionKey) {
+        this.runsBySubmissionId.set(submissionKey, run.id);
+      }
+      const newThreadKey = this.newThreadSubmissionKey(run.projectId, run.submissionId);
+      if (newThreadKey && run.createdThreadId) {
+        this.newThreadRunsBySubmissionId.set(newThreadKey, run.id);
+      }
+    }
+  }
+
+  async reconcilePersistedRuns() {
+    if (!this.allowIndependentAppServer) {
+      return [];
+    }
+    if (this.recoveryPromise) {
+      return await this.recoveryPromise;
+    }
+    const active = [...this.runs.values()].filter((run) => !isTerminalActivityStatus(run.status));
+    this.recoveryPromise = Promise.all(active.map((run) => this.reconcilePersistedRun(run)))
+      .finally(() => {
+        this.recoveryPromise = null;
+      });
+    return await this.recoveryPromise;
+  }
+
+  async reconcilePersistedRun(run) {
+    if (!run || isTerminalActivityStatus(run.status)) {
+      return run;
+    }
+    const recoveringFrom = run.lastKnownStatus ?? run.status;
+    run.status = 'recovering';
+    run.updatedAt = new Date().toISOString();
+    this.addRunEvent(run, 'codex.run.recovering', this.recoveryEventPayload(
+      run,
+      recoveringFrom,
+      'recovering',
+      'recovery_started'
+    ));
+    this.schedulePersistRuns();
+    try {
+      const response = await this.requestAppServer('thread/read', {
+        threadId: run.threadId,
+        includeTurns: true
+      });
+      const thread = response?.thread ?? response;
+      const session = buildSessionSnapshot(thread, { threadId: run.threadId, prompt: run.prompt });
+      this.liveSessions.set(run.threadId, session);
+      run.session = session;
+      const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+      const turnStates = turns.map((turn) => ({
+        id: String(turn?.id ?? '').trim(),
+        status: normalizeDesktopTurnStatus(turn?.status)
+      }));
+      const activeTurnStates = turnStates.filter((turn) => !isTerminalActivityStatus(turn.status));
+
+      if (run.turnId) {
+        const exact = turnStates.find((turn) => turn.id === run.turnId) ?? null;
+        if (exact && isTerminalActivityStatus(exact.status)) {
+          // Official terminal state for the exact same turn is sticky: a
+          // persisted run can never resurrect it as active.
+          this.settleRecoveredRun(run, exact.status, 'official_terminal_sticky', { markSession: true });
+          return run;
+        }
+        if (exact) {
+          this.activateRecoveredRun(run, 'verified_active');
+          return run;
+        }
+        // The exact turn is gone. A genuinely newer active turn must stay
+        // running; otherwise the run is settled as no longer present.
+        const reason = activeTurnStates.length > 0 ? 'superseded_by_newer_turn' : 'turn_not_found';
+        this.settleRecoveredRun(run, 'interrupted', reason, { markSession: activeTurnStates.length === 0 });
+        return run;
+      }
+
+      if (activeTurnStates.length === 1) {
+        // Uncertain start: adopt the thread's single active turn so the run
+        // stays bound to a real Codex-shaped turn id.
+        run.turnId = activeTurnStates[0].id;
+        run.activeCodexTurnId = run.turnId;
+        this.activeRunsByTurnId.set(run.turnId, run.id);
+        this.activateRecoveredRun(run, 'turn_id_recovered');
+      } else if (activeTurnStates.length > 1) {
+        this.activateRecoveredRun(run, 'multi_turn_active');
+      } else {
+        const terminalState = runtimeStateFromDesktopThread(thread);
+        const status = isTerminalActivityStatus(terminalState) ? terminalState : 'interrupted';
+        this.settleRecoveredRun(run, status, 'turn_not_found', { markSession: true });
+      }
+    } catch (error) {
+      // Fail closed: an unverifiable run must not linger as recovering/running,
+      // must not be interruptible, and must not be persisted again as active.
+      run.error = error?.message ?? String(error);
+      this.settleRecoveredRun(run, 'failed', 'thread_read_failed', {
+        markSession: true,
+        message: run.error
+      });
+    }
+    return run;
+  }
+
+  activateRecoveredRun(run, reason) {
+    const fromStatus = run.status;
+    run.status = 'running';
+    run.updatedAt = new Date().toISOString();
+    this.activeRunsByThreadId.set(run.threadId, run.id);
+    if (run.turnId) {
+      this.activeRunsByTurnId.set(run.turnId, run.id);
+    }
+    this.addRunEvent(run, 'codex.run.recovered', this.recoveryEventPayload(
+      run,
+      fromStatus,
+      'running',
+      reason
+    ));
+    this.schedulePersistRuns();
+  }
+
+  settleRecoveredRun(run, status, reason, { markSession = true, message = '' } = {}) {
+    const fromStatus = run.status;
+    run.status = status;
+    run.updatedAt = new Date().toISOString();
+    if (run.turnId) {
+      this.activeRunsByTurnId.delete(run.turnId);
+    }
+    if (this.activeRunsByThreadId.get(run.threadId) === run.id) {
+      this.activeRunsByThreadId.delete(run.threadId);
+    }
+    if (markSession) {
+      this.markLiveSessionTerminal(run.threadId, status, run.updatedAt, run.turnId);
+      this.removeLiveActivity(run.threadId, run.turnId);
+    }
+    this.resolveInterruptRequest(run, status, `recovery:${reason}`);
+    const eventType = status === 'failed' ? 'codex.run.recovery_failed' : 'codex.run.recovered_terminal';
+    this.addRunEvent(run, eventType, this.recoveryEventPayload(
+      run,
+      fromStatus,
+      status,
+      reason,
+      message ? { message } : {}
+    ));
+    this.schedulePersistRuns();
+  }
+
+  recoveryEventPayload(run, fromStatus, toStatus, reason, extra = {}) {
+    return {
+      runId: run.id,
+      threadId: run.threadId,
+      turnId: run.turnId ?? null,
+      fromStatus,
+      toStatus,
+      reason,
+      generation: Number(run.generation ?? this.clientGeneration()) || 0,
+      epoch: this.runtimeSnapshotTracker.epoch,
+      ...extra
+    };
+  }
+
+  async reconcileUncertainTurnStart(run, error) {
+    this.addRunEvent(run, 'codex.turn.start.uncertain', {
+      runId: run.id,
+      threadId: run.threadId,
+      turnId: run.turnId ?? null,
+      reason: 'uncertain_turn_start',
+      generation: Number(run.generation ?? this.clientGeneration()) || 0,
+      epoch: this.runtimeSnapshotTracker.epoch,
+      message: error?.message ?? String(error)
+    });
+    await this.reconcilePersistedRun(run);
+    return run;
+  }
+
+  submissionKey(threadId, submissionId) {
+    const normalized = String(submissionId ?? '').trim();
+    return normalized ? `${String(threadId ?? '').trim()}:${normalized}` : '';
+  }
+
+  newThreadSubmissionKey(projectId, submissionId) {
+    const normalized = String(submissionId ?? '').trim();
+    return normalized ? `${String(projectId ?? 'codex').trim()}:${normalized}` : '';
+  }
+
+  clientGeneration() {
+    const health = typeof this.client.health === 'function' ? this.client.health() : {};
+    return Number(health.generation ?? 0) || 0;
+  }
+
+  persistRuns() {
+    this.runJournal.persist([...this.runs.values()]);
+  }
+
+  schedulePersistRuns() {
+    if (this.persistQueued) {
+      return;
+    }
+    this.persistQueued = true;
+    queueMicrotask(() => {
+      this.persistQueued = false;
+      this.persistRuns();
+    });
+  }
+
   async runTurn(run) {
     run.status = 'running';
     run.updatedAt = new Date().toISOString();
+    this.activeRunsByThreadId.set(run.threadId, run.id);
     this.addRunEvent(run, 'codex.turn.preparing', { threadId: run.threadId });
+    this.schedulePersistRuns();
+    this.addRunEvent(run, 'policy.effective', {
+      operation: 'turn/start',
+      sandbox: this.sandbox,
+      approvalPolicy: this.approvalPolicy,
+      threadId: run.threadId,
+      submissionId: run.submissionId
+    });
 
     try {
-      await this.client.request('thread/resume', {
+      await this.requestAppServer('thread/resume', {
         threadId: run.threadId,
         cwd: null,
         approvalPolicy: this.approvalPolicy,
-        sandbox: this.sandbox,
+        sandbox: appServerSandboxFromMode(this.sandbox),
         model: this.optionalModel(run.model)
       });
     } catch (error) {
       this.addRunEvent(run, 'codex.thread.resume.warning', { threadId: run.threadId, message: error.message });
     }
 
-    const response = await this.client.request('turn/start', {
-      threadId: run.threadId,
-      cwd: null,
-      input: [{
-        type: 'text',
-        text: run.prompt
-      }],
-      approvalPolicy: this.approvalPolicy,
-      sandboxPolicy: sandboxPolicyFromMode(this.sandbox),
-      model: this.optionalModel(run.model),
-      effort: normalizeReasoningEffort(run.reasoningEffort)
-    });
-    run.turnId = response?.turn?.id ?? null;
-    this.activeRunsByThreadId.set(run.threadId, run.id);
-    if (run.turnId) {
-      this.activeRunsByTurnId.set(run.turnId, run.id);
+    try {
+      const response = await this.requestAppServer('turn/start', {
+        threadId: run.threadId,
+        cwd: null,
+        input: [{
+          type: 'text',
+          text: run.prompt
+        }],
+        approvalPolicy: this.approvalPolicy,
+        sandboxPolicy: sandboxPolicyFromMode(this.sandbox),
+        model: this.optionalModel(run.model),
+        effort: normalizeReasoningEffort(run.reasoningEffort)
+      });
+      run.turnId = response?.turn?.id ?? null;
+      run.activeCodexTurnId = run.turnId;
+      run.generation = this.clientGeneration();
+      if (run.turnId) {
+        this.activeRunsByTurnId.set(run.turnId, run.id);
+      }
+      this.addRunEvent(run, 'codex.turn.started', sanitize(response));
+      this.schedulePersistRuns();
+    } catch (error) {
+      if (isUncertainTurnStartError(error)) {
+        await this.reconcileUncertainTurnStart(run, error);
+        return;
+      }
+      throw error;
     }
-    this.addRunEvent(run, 'codex.turn.started', sanitize(response));
   }
 
   async handleNotification(message) {
@@ -425,6 +1411,13 @@ export class CodexThreadService {
       return;
     }
 
+    if (turnId && !run.turnId) {
+      run.turnId = turnId;
+      run.activeCodexTurnId = turnId;
+      this.activeRunsByTurnId.set(turnId, run.id);
+    }
+    run.generation = this.clientGeneration();
+
     const converted = this.converter.convert(message);
     for (const item of converted) {
       if (item.entry) {
@@ -439,12 +1432,19 @@ export class CodexThreadService {
         const terminalStatus = terminalStatusFromConvertedEvent(item);
         this.markLiveSessionTerminal(run.threadId, terminalStatus, new Date().toISOString(), run.turnId);
         this.removeLiveActivity(run.threadId, run.turnId);
-        if (run.status !== 'failed') {
+        if (terminalStatus === 'interrupted') {
+          run.status = 'interrupted';
+          run.error = '已中断当前回复';
+        } else if (terminalStatus === 'failed' || run.status === 'failed') {
+          run.status = 'failed';
+        } else {
           run.status = 'completed';
         }
+        this.resolveInterruptRequest(run, run.status, `notification:${item.type}`);
         await this.finishRun(run);
       }
     }
+    this.schedulePersistRuns();
   }
 
   resolveRunForNotification(threadId, turnId) {
@@ -463,7 +1463,7 @@ export class CodexThreadService {
     }
     this.activeRunsByThreadId.delete(run.threadId);
     try {
-      const response = await this.client.request('thread/read', {
+      const response = await this.requestAppServer('thread/read', {
         threadId: run.threadId,
         includeTurns: true
       });
@@ -471,7 +1471,10 @@ export class CodexThreadService {
         threadId: run.threadId,
         prompt: run.prompt
       });
-      applyTerminalStateToSession(session, run.status === 'failed' ? 'failed' : 'completed', run.updatedAt || new Date().toISOString(), run.turnId);
+      const terminalStatus = ['completed', 'failed', 'interrupted'].includes(run.status)
+        ? run.status
+        : 'completed';
+      applyTerminalStateToSession(session, terminalStatus, run.updatedAt || new Date().toISOString(), run.turnId);
       const merged = preserveClientNoticeEntries(this.liveSessions.get(run.threadId), session);
       this.liveSessions.set(run.threadId, merged);
       run.session = merged;
@@ -481,12 +1484,19 @@ export class CodexThreadService {
     }
     run.updatedAt = new Date().toISOString();
     this.openDesktopThread(run, 'completed');
+    this.persistRuns();
   }
 
   failRun(run, error) {
     run.status = 'failed';
     run.error = error.message ?? String(error);
     run.updatedAt = new Date().toISOString();
+    if (run.turnId) {
+      this.activeRunsByTurnId.delete(run.turnId);
+    }
+    if (this.activeRunsByThreadId.get(run.threadId) === run.id) {
+      this.activeRunsByThreadId.delete(run.threadId);
+    }
     this.removeLiveActivity(run.threadId, run.turnId);
     this.markLiveSessionTerminal(run.threadId, 'failed', run.updatedAt, run.turnId);
     const notice = classifyCodexClientNotice(error, { source: 'codex.run.failed' });
@@ -506,11 +1516,13 @@ export class CodexThreadService {
     this.addRunEvent(run, 'codex.run.failed', notice
       ? { threadId: run.threadId, message: run.error, notice }
       : { threadId: run.threadId, message: run.error });
+    this.persistRuns();
   }
 
   addRunEvent(run, type, payload) {
     const event = {
       id: randomUUID(),
+      seq: run.events.length + 1,
       taskId: run.id,
       type,
       payload: payload ?? {},
@@ -518,9 +1530,25 @@ export class CodexThreadService {
     };
     run.events.push(event);
     run.updatedAt = event.createdAt;
+    this.schedulePersistRuns();
     this.eventBus?.publish?.(run.id, event);
     void this.writeLog(type, { runId: run.id, threadId: run.threadId, payload: event.payload });
     return event;
+  }
+
+  resolveInterruptRequest(run, terminalStatus, resolution) {
+    if (run.interruptRequested !== true || !isTerminalActivityStatus(terminalStatus)) {
+      return;
+    }
+    run.interruptRequested = false;
+    this.addRunEvent(run, 'codex.turn.interrupt.confirmed', {
+      threadId: run.threadId,
+      turnId: run.turnId,
+      terminalStatus,
+      resolution,
+      generation: Number(run.generation ?? this.clientGeneration()) || 0,
+      epoch: this.runtimeSnapshotTracker.epoch
+    });
   }
 
   openDesktopThread(run, stage) {
@@ -624,20 +1652,30 @@ export class CodexThreadService {
       id: run.id,
       projectId: run.projectId,
       prompt: run.prompt,
+      promptLength: run.promptLength ?? String(run.prompt ?? '').length,
       codexSessionId: run.threadId,
       createdCodexSessionId: run.createdThreadId,
+      turnId: run.turnId,
+      activeCodexTurnId: run.activeCodexTurnId ?? run.turnId,
       model: run.model,
       reasoningEffort: run.reasoningEffort,
       status: run.status,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
-      desktopSync: {
-        status: 'app_server_official',
-        desktopLive: false,
-        mode: run.createdThreadId ? 'new' : 'resume',
-        message: '已通过 Codex 官方 app-server 会话协议提交。',
-        reason: '手机端现在以 app-server thread 为准，不再依赖桌面窗口注入。'
+      interruptReady: !isTerminalActivityStatus(run.status) && run.status !== 'recovering' && Boolean(run.turnId || run.status === 'running'),
+      interruptRequested: run.interruptRequested === true,
+      submissionId: run.submissionId || '',
+      runtime: {
+        kind: 'app_server',
+        state: run.status,
+        generation: run.generation ?? this.clientGeneration(),
+        canInterrupt: !isTerminalActivityStatus(run.status) && run.status !== 'recovering' && Boolean(run.turnId || run.status === 'running'),
+        reconnecting: this.runtimeHealth().state === 'reconnecting'
       },
+      pendingUserInput: run.pendingUserInputId
+        ? this.getUserInput(run.pendingUserInputId)
+        : null,
+      desktopSync: desktopSyncForRun(run),
       session: this.liveSessions.get(run.threadId) ?? run.session,
       events: run.events,
       eventCount: run.events.length,
@@ -649,17 +1687,31 @@ export class CodexThreadService {
   threadToSummary(thread) {
     const id = String(thread?.id ?? '');
     const cwd = String(thread?.cwd ?? '');
+    const project = this.resolveProjectByRoot(cwd);
     const updatedAt = timestampToIso(thread?.updatedAt ?? thread?.createdAt) || new Date().toISOString();
+    const runtime = appServerThreadRuntimeState(thread);
     return {
       id,
       title: cleanTitle(thread?.name ?? thread?.preview ?? thread?.firstUserMessage ?? '未命名会话'),
       updatedAt,
       relativeTime: formatRelativeTime(Date.parse(updatedAt)),
       projectRoot: cwd,
-      projectLabel: cwd ? path.basename(cwd.replace(/[\\/]+$/, '')) : '未归类',
+      projectLabel: project?.name ?? (cwd ? path.basename(cwd.replace(/[\\/]+$/, '')) : '未归类'),
+      sidebarSection: 'recent',
       source: 'app-server',
-      activitySource: 'app-server',
-      pinned: false,
+      activitySource: 'app-server-thread-list',
+      activityStatus: runtime.state,
+      activityUpdatedAt: updatedAt,
+      runtimeState: runtime.state,
+      runtimeSource: 'app-server-thread-list',
+      runtimeUpdatedAt: updatedAt,
+      activeTurnId: runtime.activeTurnId,
+      canInterrupt: runtime.canInterrupt,
+      terminalReason: '',
+      appServerRuntimeState: runtime.state,
+      appServerRuntimeUpdatedAt: updatedAt,
+      appServerActiveTurnId: runtime.activeTurnId,
+      pinned: thread?.isPinned === true,
       detailAvailable: true
     };
   }
@@ -735,6 +1787,45 @@ function cleanTitle(value) {
   return `${text.slice(0, 80)}...`;
 }
 
+function appServerThreadRuntimeState(thread) {
+  const rawStatus = typeof thread?.status === 'object'
+    ? String(thread.status?.type ?? '')
+    : String(thread?.status ?? '');
+  const activeFlags = Array.isArray(thread?.status?.activeFlags)
+    ? thread.status.activeFlags.map((flag) => String(flag).toLowerCase())
+    : [];
+  const joinedFlags = activeFlags.join(' ');
+  let state = 'idle';
+  if (rawStatus.trim().toLowerCase() === 'active') {
+    if (joinedFlags.includes('approval')) {
+      state = 'waiting_approval';
+    } else if (joinedFlags.includes('input') || joinedFlags.includes('question')) {
+      state = 'waiting_input';
+    } else if (joinedFlags.includes('recover') || joinedFlags.includes('compact')) {
+      state = 'recovering';
+    } else {
+      state = 'running';
+    }
+  }
+  return {
+    state,
+    activeTurnId: String(thread?.activeTurnId ?? thread?.turnId ?? '').trim(),
+    canInterrupt: isRunningActivityStatus(state)
+  };
+}
+
+function runtimeStateFromAppServerProjection(session) {
+  const state = normalizeActivityStatus(session?.appServerRuntimeState) || 'idle';
+  return {
+    threadId: String(session?.id ?? session?.threadId ?? '').trim(),
+    state,
+    updatedAt: String(session?.appServerRuntimeUpdatedAt ?? session?.updatedAt ?? ''),
+    source: 'app-server-thread-list',
+    activeTurnId: String(session?.appServerActiveTurnId ?? '').trim(),
+    canInterrupt: isRunningActivityStatus(state)
+  };
+}
+
 function sessionToSummary(session) {
   const runtimeState = normalizeActivityStatus(session.runtimeState ?? session.activityStatus) || 'idle';
   return {
@@ -744,6 +1835,7 @@ function sessionToSummary(session) {
     relativeTime: session.relativeTime ?? '',
     projectRoot: session.projectRoot ?? '',
     projectLabel: session.projectLabel ?? '未归类',
+    sidebarSection: session.sidebarSection ?? 'recent',
     source: session.source ?? 'app-server-live',
     activitySource: session.runtimeSource ?? session.activitySource ?? 'app-server-live',
     activityStatus: runtimeState,
@@ -769,39 +1861,46 @@ function mergeSessions(primary, secondary) {
   });
 }
 
-function mergeDesktopAlignedSessions(liveSessions, desktopSessions) {
-  const liveById = new Map(liveSessions.map((session) => [session.id, session]));
-  const desktopIds = new Set(desktopSessions.map((session) => session.id));
-  const liveOnly = liveSessions
-    .filter((session) => !desktopIds.has(session.id))
-    .sort((left, right) => Date.parse(right.updatedAt || '0') - Date.parse(left.updatedAt || '0'));
-  const desktopAligned = desktopSessions.map((desktop) => {
-    const live = liveById.get(desktop.id);
-    if (!live) {
-      return desktop;
+function mergeRemoteAndDesktopSessions(remoteSessions, desktopSessions) {
+  const byId = new Map(remoteSessions.map((session) => [session.id, session]));
+  for (const desktop of desktopSessions) {
+    const remote = byId.get(desktop.id);
+    if (!remote) {
+      byId.set(desktop.id, desktop);
+      continue;
     }
-    const runtime = mergeActivityState(live, desktop);
+    const runtime = mergeActivityState(remote, desktop);
     const runtimeState = runtime.status;
     const runtimeUpdatedAt = runtime.updatedAt;
     const terminal = isTerminalActivityStatus(runtimeState);
-    return {
+    byId.set(desktop.id, {
+      ...remote,
       ...desktop,
-      updatedAt: live.updatedAt || desktop.updatedAt,
-      relativeTime: live.relativeTime || desktop.relativeTime,
-      source: live.source || desktop.source,
+      updatedAt: latestIso(remote.updatedAt, desktop.updatedAt),
+      relativeTime: remote.relativeTime || desktop.relativeTime,
+      projectRoot: desktop.projectRoot || remote.projectRoot,
+      projectLabel: desktop.projectLabel || remote.projectLabel,
+      sidebarSection: desktop.sidebarSection || remote.sidebarSection || '',
+      source: remote.source || desktop.source,
       activitySource: runtime.source,
       activityStatus: runtimeState,
       activityUpdatedAt: runtimeUpdatedAt,
       runtimeState,
       runtimeSource: runtime.source,
       runtimeUpdatedAt,
-      canInterrupt: !terminal && (runtimeState === 'running' || runtimeState === 'waiting_approval' || live.canInterrupt === true || desktop.canInterrupt === true),
+      canInterrupt: !terminal && (runtimeState === 'running' || runtimeState === 'waiting_approval' || runtimeState === 'waiting_input' || remote.canInterrupt === true || desktop.canInterrupt === true),
       terminalReason: terminalReasonForStatus(runtimeState),
-      lastVisibleRole: live.lastVisibleRole || desktop.lastVisibleRole || '',
-      detailAvailable: desktop.detailAvailable !== false
-    };
+      appServerRuntimeState: remote.appServerRuntimeState ?? '',
+      appServerRuntimeUpdatedAt: remote.appServerRuntimeUpdatedAt ?? '',
+      appServerActiveTurnId: remote.appServerActiveTurnId ?? '',
+      lastVisibleRole: remote.lastVisibleRole || desktop.lastVisibleRole || '',
+      pinned: desktop.pinned ?? remote.pinned ?? false,
+      detailAvailable: desktop.detailAvailable !== false || remote.detailAvailable === true
+    });
+  }
+  return [...byId.values()].sort((left, right) => {
+    return Date.parse(right.updatedAt || '0') - Date.parse(left.updatedAt || '0');
   });
-  return [...liveOnly, ...desktopAligned];
 }
 
 function mergeLocalThreadWithLiveState(localSession, liveSession) {
@@ -870,9 +1969,24 @@ function terminalStatusFromConvertedEvent(item) {
   return 'completed';
 }
 
-function runtimeStateFromDesktopThread(thread) {
+function mergeRuntimeStateLists(primary, secondary) {
+  const byThreadId = new Map();
+  for (const state of [...secondary, ...primary]) {
+    const threadId = String(state?.threadId ?? state?.id ?? '').trim();
+    if (threadId) {
+      byThreadId.set(threadId, state);
+    }
+  }
+  return [...byThreadId.values()];
+}
+
+function latestRuntimeTurn(thread) {
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-  const latest = [...turns].reverse().find((turn) => String(turn?.status ?? '').trim().length > 0);
+  return [...turns].reverse().find((turn) => String(turn?.status ?? '').trim().length > 0) ?? null;
+}
+
+function runtimeStateFromDesktopThread(thread) {
+  const latest = latestRuntimeTurn(thread);
   if (!latest) {
     return '';
   }
@@ -953,6 +2067,9 @@ function chooseActivityState(left, right) {
   if ((leftRunning && rightIdle) || (rightRunning && leftIdle)) {
     const running = leftRunning ? left : right;
     const idle = leftIdle ? left : right;
+    if (idle.source === 'app-server-thread-list') {
+      return running;
+    }
     if (!idle.explicitUpdatedAt) {
       return running;
     }
@@ -998,6 +2115,12 @@ function activityStatusPriority(status) {
   if (status === 'waiting_approval') {
     return 30;
   }
+  if (status === 'waiting_input') {
+    return 30;
+  }
+  if (status === 'recovering') {
+    return 25;
+  }
   if (status === 'running') {
     return 20;
   }
@@ -1012,12 +2135,12 @@ function isTerminalActivityStatus(status) {
 }
 
 function isRunningActivityStatus(status) {
-  return status === 'running' || status === 'waiting_approval';
+  return status === 'running' || status === 'waiting_approval' || status === 'waiting_input' || status === 'recovering';
 }
 
 function normalizeActivityStatus(value) {
   const status = String(value ?? '').trim().toLowerCase();
-  if (status === 'running' || status === 'waiting_approval' || status === 'interrupted' || status === 'failed' || status === 'completed' || status === 'idle') {
+  if (status === 'running' || status === 'waiting_approval' || status === 'waiting_input' || status === 'recovering' || status === 'interrupted' || status === 'failed' || status === 'completed' || status === 'idle') {
     return status;
   }
   return '';
@@ -1061,6 +2184,64 @@ function sandboxPolicyFromMode(mode) {
     return { type: 'readOnly' };
   }
   return { type: 'workspaceWrite', networkAccess: true };
+}
+
+function appServerSandboxFromMode(mode) {
+  const normalized = String(mode ?? '').trim().toLowerCase();
+  if (normalized === 'danger-full-access' || normalized === 'dangerfullaccess') {
+    return 'danger-full-access';
+  }
+  if (normalized === 'read-only' || normalized === 'readonly') {
+    return 'read-only';
+  }
+  return 'workspace-write';
+}
+
+function normalizeDeliveryMode(value) {
+  return String(value ?? '').trim() === 'desktop_fallback' ? 'desktop_fallback' : 'app_server';
+}
+
+function desktopSyncForRun(run) {
+  if (normalizeDeliveryMode(run?.deliveryMode) === 'desktop_fallback') {
+    return {
+      status: 'app_server_fallback',
+      desktopLive: false,
+      mode: run?.createdThreadId ? 'new' : 'resume',
+      message: '桌面实时通道暂不可用，已通过 App Server 安全兜底提交到目标会话。',
+      reason: '发送前桌面会话预检未通过；本次不会实时显示到桌面窗口，待桌面远程模式恢复后自动回到桌面主链路。'
+    };
+  }
+  return {
+    status: 'app_server_official',
+    desktopLive: false,
+    mode: run?.createdThreadId ? 'new' : 'resume',
+    message: '已通过 Codex 官方 app-server 会话协议提交。',
+    reason: '手机端现在以 app-server thread 为准，不再依赖桌面窗口注入。'
+  };
+}
+
+function canRetryFailedSubmission(run) {
+  return run?.status === 'failed'
+    && !String(run.turnId ?? '').trim()
+    && !String(run.activeCodexTurnId ?? '').trim();
+}
+
+function defaultRunStatePath() {
+  return path.join(process.cwd(), 'logs', 'app-server-active-runs.json');
+}
+
+function isUncertainTurnStartError(error) {
+  const message = String(error?.message ?? error ?? '').toLowerCase();
+  return message.includes('timed out')
+    || message.includes('timeout')
+    || message.includes('stdin is not writable')
+    || message.includes('closed')
+    || message.includes('disconnect')
+    || message.includes('connection');
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeReasoningEffort(value) {

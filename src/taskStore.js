@@ -22,6 +22,7 @@ export class TaskStore {
     this.interruptReconcileTimeoutMs = Math.max(0, Number(interruptReconcileTimeoutMs) || 0);
     this.interruptReconcilePollMs = Math.max(25, Number(interruptReconcilePollMs) || 500);
     this.tasks = new Map();
+    this.tasksBySubmissionId = new Map();
     this.approvals = new Map();
   }
 
@@ -33,7 +34,7 @@ export class TaskStore {
     }));
   }
 
-  createTask({ projectId, prompt, codexSessionId = null, sessionFingerprint = null, verifiedSessionTarget = null, verifiedDesktopStatus = null, submissionSource = '', reasoningEffort = '', model = '' }) {
+  createTask({ projectId, prompt, codexSessionId = null, sessionFingerprint = null, verifiedSessionTarget = null, verifiedDesktopStatus = null, submissionSource = '', submissionId = '', reasoningEffort = '', model = '' }) {
     const project = this.projects.find((candidate) => candidate.id === projectId);
     if (!project) {
       const error = new Error('Unknown project');
@@ -48,6 +49,19 @@ export class TaskStore {
     }
 
     const normalizedSessionId = normalizeSessionId(codexSessionId);
+    const normalizedSubmissionId = normalizeOptionalString(submissionId);
+    const submissionKey = buildTaskSubmissionKey(projectId, normalizedSessionId, normalizedSubmissionId);
+    if (submissionKey && this.tasksBySubmissionId.has(submissionKey)) {
+      const existing = this.tasks.get(this.tasksBySubmissionId.get(submissionKey));
+      if (existing && !isSafelyRetryableFailedSubmission(existing)) {
+        this.addEvent(existing.id, 'task.duplicate_submission_ignored', {
+          submissionId: normalizedSubmissionId,
+          status: existing.status
+        });
+        return existing;
+      }
+      this.tasksBySubmissionId.delete(submissionKey);
+    }
     const now = new Date().toISOString();
     const task = {
       id: createId('task'),
@@ -66,6 +80,7 @@ export class TaskStore {
       desktopSync: null,
       verifiedDesktopStatus,
       submissionSource: normalizeOptionalString(submissionSource),
+      submissionId: normalizedSubmissionId,
       model: normalizeModelId(model),
       reasoningEffort: normalizeReasoningEffort(reasoningEffort),
       activeCodexTurnId: null,
@@ -81,10 +96,14 @@ export class TaskStore {
     };
 
     this.tasks.set(task.id, task);
+    if (submissionKey) {
+      this.tasksBySubmissionId.set(submissionKey, task.id);
+    }
     this.addEvent(task.id, 'task.created', {
       projectId,
       codexSessionId: normalizedSessionId,
-      sessionFingerprint: task.sessionFingerprint
+      sessionFingerprint: task.sessionFingerprint,
+      submissionId: normalizedSubmissionId
     });
     this.runTask(task.id);
     return task;
@@ -132,6 +151,66 @@ export class TaskStore {
     return runningTasks[0] ?? null;
   }
 
+  canSteerSessionTask(sessionId) {
+    return typeof this.adapter?.steer === 'function'
+      && this.findRunningTaskForSession(sessionId) !== null;
+  }
+
+  async steerSessionTask(sessionId, { prompt, submissionId = '' } = {}) {
+    const task = this.findRunningTaskForSession(sessionId);
+    if (!task || typeof this.adapter?.steer !== 'function') {
+      const error = new Error('当前会话没有可追加引导的运行任务。');
+      error.statusCode = 409;
+      error.code = 'CODEX_STEER_NO_ACTIVE_TURN';
+      error.safeToFallback = true;
+      throw error;
+    }
+    const text = String(prompt ?? '').trim();
+    if (!text) {
+      const error = new Error('引导消息不能为空');
+      error.statusCode = 400;
+      throw error;
+    }
+    const normalizedSubmissionId = normalizeOptionalString(submissionId);
+    const submissionKey = buildTaskSubmissionKey(task.projectId, task.codexSessionId, normalizedSubmissionId);
+    if (submissionKey && this.tasksBySubmissionId.has(submissionKey)) {
+      const existing = this.tasks.get(this.tasksBySubmissionId.get(submissionKey));
+      if (existing) {
+        this.addEvent(existing.id, 'task.guidance.duplicate_submission_ignored', {
+          submissionId: normalizedSubmissionId
+        });
+        return existing;
+      }
+      this.tasksBySubmissionId.delete(submissionKey);
+    }
+    this.addEvent(task.id, 'task.guidance.submitting', {
+      submissionId: normalizedSubmissionId,
+      promptLength: text.length
+    });
+    try {
+      const result = await this.adapter.steer({
+        task,
+        prompt: text,
+        submissionId: normalizedSubmissionId,
+        emit: (type, payload) => this.recordAdapterEvent(task.id, type, payload)
+      });
+      if (submissionKey) {
+        this.tasksBySubmissionId.set(submissionKey, task.id);
+      }
+      this.addEvent(task.id, 'task.guidance.accepted', {
+        submissionId: normalizedSubmissionId,
+        turnId: result?.turnId ?? task.activeCodexTurnId ?? ''
+      });
+      return task;
+    } catch (error) {
+      this.addEvent(task.id, 'task.guidance.failed', {
+        submissionId: normalizedSubmissionId,
+        message: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    }
+  }
+
   interruptSessionTask(sessionId) {
     return this.requestInterruptSessionTask(sessionId);
   }
@@ -165,6 +244,7 @@ export class TaskStore {
       error: null,
       desktopSync: null,
       verifiedDesktopStatus: null,
+      submissionId: '',
       model: '',
       reasoningEffort: '',
       activeCodexTurnId: null,
@@ -519,6 +599,7 @@ export class TaskStore {
 
     const event = {
       id: createId('evt'),
+      seq: task.events.length + 1,
       taskId,
       type,
       payload,
@@ -804,6 +885,20 @@ function isCompletedInterruptStatus(status) {
     && normalized !== 'aborted'
     && normalized !== 'cancelled'
     && normalized !== 'canceled';
+}
+
+function buildTaskSubmissionKey(projectId, sessionId, submissionId) {
+  if (!submissionId) {
+    return '';
+  }
+  return `${String(projectId ?? '')}\u0000${sessionId ?? '__new_thread__'}\u0000${submissionId}`;
+}
+
+function isSafelyRetryableFailedSubmission(task) {
+  if (task?.status !== 'failed') {
+    return false;
+  }
+  return !task.events.some((event) => event.type === 'codex.app_server.turn.started');
 }
 
 function normalizeSessionId(value) {

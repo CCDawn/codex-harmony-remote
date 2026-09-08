@@ -2,6 +2,64 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { HybridCodexAdapter } from '../src/hybridCodexAdapter.js';
 
+test('HybridCodexAdapter reads official runtime states through the CDP desktop adapter', async () => {
+  const cdpDesktopAdapter = {
+    async listThreadRuntimeStates(options) {
+      return [{ threadId: 'thread-1', state: 'idle', limit: options.limit }];
+    }
+  };
+  const adapter = new HybridCodexAdapter({
+    scriptDesktopAdapter: {},
+    cdpDesktopAdapter
+  });
+
+  const states = await adapter.listThreadRuntimeStates({ limit: 32 });
+
+  assert.deepEqual(states, [{ threadId: 'thread-1', state: 'idle', limit: 32 }]);
+});
+
+test('HybridCodexAdapter opens desktop threads through the CDP adapter', async () => {
+  const opened = [];
+  const cdpDesktopAdapter = {
+    async openDesktopThread(sessionId) {
+      opened.push(sessionId);
+      return { ok: true, sessionId, transport: 'cdp' };
+    }
+  };
+  const adapter = new HybridCodexAdapter({
+    scriptDesktopAdapter: {
+      async openDesktopThread() {
+        throw new Error('script adapter must not receive DOM takeover');
+      }
+    },
+    cdpDesktopAdapter
+  });
+
+  const result = await adapter.openDesktopThread('019e-open-target');
+
+  assert.deepEqual(opened, ['019e-open-target']);
+  assert.equal(result.transport, 'cdp');
+});
+
+test('HybridCodexAdapter archives desktop threads through the CDP adapter', async () => {
+  const archived = [];
+  const cdpDesktopAdapter = {
+    async archiveThread(sessionId) {
+      archived.push(sessionId);
+      return { ok: true, sessionId };
+    }
+  };
+  const adapter = new HybridCodexAdapter({
+    scriptDesktopAdapter: {},
+    cdpDesktopAdapter
+  });
+
+  const result = await adapter.archiveThread('019e-archive-target');
+
+  assert.deepEqual(archived, ['019e-archive-target']);
+  assert.equal(result.sessionId, '019e-archive-target');
+});
+
 test('HybridCodexAdapter uses desktop live adapter when probe succeeds', async () => {
   const events = [];
   const desktopAdapter = {
@@ -143,7 +201,7 @@ test('HybridCodexAdapter reprobes desktop live before interrupting', async () =>
       return { verified: sessionId === '019e-existing-session' };
     },
     async getCurrentConversationId() {
-      return null;
+      return '019e-existing-session';
     },
     async interrupt({ task }) {
       this.interrupts += 1;
@@ -197,9 +255,10 @@ test('HybridCodexAdapter blocks interrupt when desktop live is unavailable', asy
   assert.equal(unavailable.payload.reason, 'CDP channel is gone');
 });
 
-test('HybridCodexAdapter accepts existing sessions verified by desktop host manager even when another thread is visible', async () => {
+test('HybridCodexAdapter sends through the desktop app-server when another desktop thread is visible', async () => {
   const events = [];
   const desktopAdapter = {
+    runs: 0,
     async probe() {
       return {};
     },
@@ -210,6 +269,7 @@ test('HybridCodexAdapter accepts existing sessions verified by desktop host mana
       return '019e-other-session';
     },
     async run() {
+      this.runs += 1;
       return { summary: 'desktop-host-verified' };
     }
   };
@@ -228,10 +288,13 @@ test('HybridCodexAdapter accepts existing sessions verified by desktop host mana
   });
 
   assert.equal(result.summary, 'desktop-host-verified');
+  assert.equal(desktopAdapter.runs, 1);
   assert.equal(fallbackAdapter.runs, 0);
   const available = events.find((event) => event.type === 'codex.desktop_live.available');
+  assert.equal(available.payload.status, 'target_ready');
   assert.equal(available.payload.currentSessionId, '019e-other-session');
-  assert.equal(available.payload.sessionVerified, true);
+  assert.equal(available.payload.sessionVerified, false);
+  assert.equal(available.payload.targetVerified, true);
 });
 
 test('HybridCodexAdapter prefers direct CDP over script bridge for verified sends', async () => {
@@ -263,7 +326,7 @@ test('HybridCodexAdapter prefers direct CDP over script bridge for verified send
       return { verified: sessionId === '019e-existing-session' };
     },
     async getCurrentConversationId() {
-      return null;
+      return '019e-existing-session';
     },
     async run() {
       this.runs += 1;
@@ -294,12 +357,12 @@ test('HybridCodexAdapter prefers direct CDP over script bridge for verified send
   assert.equal(cdpDesktopAdapter.runs, 1);
   assert.equal(fallbackAdapter.runs, 0);
   const available = events.find((event) => event.type === 'codex.desktop_live.available');
-  assert.equal(available.payload.currentSessionId, null);
+  assert.equal(available.payload.currentSessionId, '019e-existing-session');
   assert.equal(available.payload.sessionVerified, true);
   assert.equal(available.payload.transport, 'cdp');
 });
 
-test('HybridCodexAdapter uses script bridge only when CDP is unavailable', async () => {
+test('HybridCodexAdapter uses script bridge only when CDP is unavailable and the script route matches', async () => {
   const events = [];
   const scriptDesktopAdapter = {
     runs: 0,
@@ -310,7 +373,7 @@ test('HybridCodexAdapter uses script bridge only when CDP is unavailable', async
       return { verified: sessionId === '019e-existing-session' };
     },
     async getCurrentConversationId() {
-      return '019e-other-session';
+      return '019e-existing-session';
     },
     async run() {
       this.runs += 1;
@@ -338,7 +401,7 @@ test('HybridCodexAdapter uses script bridge only when CDP is unavailable', async
   assert.equal(available.payload.transport, 'script');
 });
 
-test('HybridCodexAdapter accepts script bridge target verification when current route cannot be read', async () => {
+test('HybridCodexAdapter accepts script bridge target verification when the current route cannot be read', async () => {
   const events = [];
   const scriptDesktopAdapter = {
     runs: 0,
@@ -374,11 +437,13 @@ test('HybridCodexAdapter accepts script bridge target verification when current 
   assert.equal(result.summary, 'script-target-verified');
   assert.equal(scriptDesktopAdapter.runs, 1);
   const available = events.find((event) => event.type === 'codex.desktop_live.available');
+  assert.equal(available.payload.status, 'target_ready');
   assert.equal(available.payload.currentSessionId, null);
-  assert.equal(available.payload.sessionVerified, true);
+  assert.equal(available.payload.sessionVerified, false);
+  assert.equal(available.payload.targetVerified, true);
 });
 
-test('HybridCodexAdapter probes CDP when script bridge is online but unverified', async () => {
+test('HybridCodexAdapter uses CDP when it knows the target but cannot read the current desktop route', async () => {
   const events = [];
   const scriptDesktopAdapter = {
     runs: 0,
@@ -430,11 +495,12 @@ test('HybridCodexAdapter probes CDP when script bridge is online but unverified'
   assert.equal(cdpDesktopAdapter.probes, 1);
   assert.equal(cdpDesktopAdapter.runs, 1);
   const available = events.find((event) => event.type === 'codex.desktop_live.available');
-  assert.equal(available.payload.status, 'verified');
-  assert.equal(available.payload.sessionVerified, true);
+  assert.equal(available.payload.status, 'target_ready');
+  assert.equal(available.payload.sessionVerified, false);
+  assert.equal(available.payload.targetVerified, true);
 });
 
-test('HybridCodexAdapter blocks existing sessions when desktop session mismatches', async () => {
+test('HybridCodexAdapter blocks a mismatched visible session when the desktop app-server cannot verify the target', async () => {
   const events = [];
   const desktopAdapter = {
     async probe() {
@@ -469,7 +535,7 @@ test('HybridCodexAdapter blocks existing sessions when desktop session mismatche
   assert.equal(unavailable.payload.sessionVerified, false);
 });
 
-test('HybridCodexAdapter surfaces desktop probe timeouts instead of falling back', async () => {
+test('HybridCodexAdapter surfaces desktop probe timeouts without closing the shared send transport', async () => {
   const events = [];
   let closeCount = 0;
   const desktopAdapter = {
@@ -502,7 +568,7 @@ test('HybridCodexAdapter surfaces desktop probe timeouts instead of falling back
   );
 
   assert.equal(fallbackAdapter.runs, 0);
-  assert.equal(closeCount, 1);
+  assert.equal(closeCount, 0);
   assert.deepEqual(events.map((event) => event.type), [
     'codex.desktop_live.probe_started',
     'codex.desktop_live.unavailable',
@@ -633,7 +699,7 @@ test('HybridCodexAdapter retries direct CDP when script bridge fails before turn
       return { verified: sessionId === '019e-existing-session' };
     },
     async getCurrentConversationId() {
-      return null;
+      return '019e-existing-session';
     },
     async run() {
       this.runs += 1;
@@ -667,4 +733,58 @@ test('HybridCodexAdapter retries direct CDP when script bridge fails before turn
   const retry = events.find((event) => event.type === 'codex.desktop_live.transport_retry');
   assert.equal(retry.payload.from, 'script');
   assert.equal(retry.payload.to, 'cdp');
+});
+
+test('HybridCodexAdapter never retries CDP through CDP after concurrent status mutation', async () => {
+  const events = [];
+  const scriptDesktopAdapter = {
+    async probe() {
+      return {};
+    }
+  };
+  let adapter;
+  const cdpDesktopAdapter = {
+    runs: 0,
+    async probe() {
+      return {};
+    },
+    async verifyTargetSession(sessionId) {
+      return { verified: sessionId === '019e-existing-session' };
+    },
+    async getCurrentConversationId() {
+      return '019e-existing-session';
+    },
+    async run() {
+      this.runs += 1;
+      adapter.desktopAdapter = scriptDesktopAdapter;
+      const error = new Error('Codex 桌面恢复会话后 CDP 未稳定');
+      error.safeToFallback = true;
+      throw error;
+    }
+  };
+  adapter = new HybridCodexAdapter({
+    scriptDesktopAdapter,
+    cdpDesktopAdapter
+  });
+
+  await assert.rejects(
+    adapter.run({
+      task: {
+        codexSessionId: '019e-existing-session',
+        verifiedDesktopStatus: {
+          desktopLive: true,
+          status: 'verified',
+          sessionVerified: true,
+          targetVerified: true,
+          targetSessionId: '019e-existing-session',
+          transport: 'cdp'
+        }
+      },
+      emit: (type, payload) => events.push({ type, payload })
+    }),
+    /CDP 未稳定/
+  );
+
+  assert.equal(cdpDesktopAdapter.runs, 1);
+  assert.equal(events.some((event) => event.type === 'codex.desktop_live.transport_retry'), false);
 });

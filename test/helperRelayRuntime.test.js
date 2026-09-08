@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 const helperTunnelPath = path.resolve('HarmonyHdcRelayHelper/entry/src/main/ets/services/HdcRelayTunnel.ets');
+const appTunnelPath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/HdcRelayTunnel.ets');
 const helperRuntimePath = path.resolve('HarmonyHdcRelayHelper/entry/src/main/ets/services/RelayRuntime.ets');
 const helperPagePath = path.resolve('HarmonyHdcRelayHelper/entry/src/main/ets/pages/Index.ets');
 
@@ -19,6 +20,17 @@ test('helper relay uses bounded reconnect backoff instead of fixed rapid retries
   assert.match(source, /Math\.min\(15000, Math\.max\(1500, this\.reconnectDelayMs \* 2\)\)/);
   assert.match(source, /this\.reconnectDelayMs = 1500/);
   assert.doesNotMatch(source, /await this\.sleep\(1500\)/);
+});
+
+test('relay tunnels wait for EINPROGRESS connections instead of closing them as fatal', () => {
+  for (const tunnelPath of [helperTunnelPath, appTunnelPath]) {
+    const source = text(tunnelPath);
+
+    assert.match(source, /CONNECT_IN_PROGRESS_CODE: number = 2301115/);
+    assert.match(source, /this\.isConnectInProgress\(error\)/);
+    assert.match(source, /await this\.waitForSocketConnected\(hdcd, generation, 5000\)/);
+    assert.match(source, /state\.isConnected/);
+  }
 });
 
 test('helper watchdog treats idle forwarding as healthy and exposes actionable health tier', () => {

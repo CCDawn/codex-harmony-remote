@@ -18,10 +18,19 @@ import { DesktopLiveRecovery } from './desktopLiveRecovery.js';
 import { DesktopLiveDiagnostics } from './desktopLiveDiagnostics.js';
 import { SessionSettingsStore, normalizeModelId, normalizeReasoningEffort } from './sessionSettingsStore.js';
 import { effectiveCodexSettings, readCodexDefaultReasoningEffort } from './codexUserConfig.js';
-import { readDesktopCodexSettings } from './codexDesktopSettings.js';
+import { readAppServerCodexSettings, readDesktopCodexSettings } from './codexDesktopSettings.js';
 import { readDesktopVisibleReasoningEffort } from './desktopReasoningEffort.js';
 import { readCodexAccountUsage } from './codexAccountUsage.js';
 import { collectLinkHealth, recoverHdcLink } from './linkHealth.js';
+import { DurableOutbox } from './durableOutbox.js';
+import { buildBridgeProtocolHandshake } from './bridgeProtocol.js';
+import { paginateTaskEvents } from './taskEventCursor.js';
+import { createOutboxReceiptReconciler } from './outboxReceiptReconciler.js';
+import {
+  prepareRemoteSessionFile,
+  publicRemoteFileMetadata,
+  remoteFileContentDisposition
+} from './remoteFileAccess.js';
 
 export function createApp({ config, adapter }) {
   const eventBus = new EventBus();
@@ -31,16 +40,35 @@ export function createApp({ config, adapter }) {
     repoRoot: config.repoRoot ?? process.cwd()
   });
   const defaultReasoningEffortProvider = config.defaultReasoningEffortProvider ?? readEffectiveDesktopReasoningEffort;
-  const codexSettingsProvider = config.codexSettingsProvider ?? readDesktopCodexSettings;
   const accountUsageProvider = config.accountUsageProvider ?? readCodexAccountUsage;
-  const desktopOpener = config.desktopOpener ?? openCodexThreadDeeplink;
+  const desktopOpener = config.desktopOpener
+    ?? (typeof adapter?.openDesktopThread === 'function'
+      ? adapter.openDesktopThread.bind(adapter)
+      : openCodexThreadDeeplink);
   const threadService = config.threadService ?? new CodexThreadService({
     sessions,
     projects: config.projects,
+    projectHistoryPath: config.projectHistoryPath
+      ?? (config.repoRoot ? path.join(config.repoRoot, 'logs', 'codex-project-history.json') : null),
     eventBus,
     logger,
-    desktopOpener
+    desktopOpener,
+    desktopThreadListProvider: typeof adapter?.listThreads === 'function'
+      ? adapter.listThreads.bind(adapter)
+      : null,
+    runtimeStateProvider: typeof adapter?.listThreadRuntimeStates === 'function'
+      ? adapter.listThreadRuntimeStates.bind(adapter)
+      : null,
+    archiveThreadProvider: typeof adapter?.archiveThread === 'function'
+      ? adapter.archiveThread.bind(adapter)
+      : null,
+    model: config.model,
+    sandbox: config.appServerSandbox ?? config.sandbox,
+    approvalPolicy: config.appServerApprovalPolicy ?? config.approvalPolicy,
+    allowIndependentAppServer: appServerRuntimeMode(config) !== 'desktop'
   });
+  const codexSettingsProvider = config.codexSettingsProvider
+    ?? (() => readPrimaryCodexSettings({ threadService }));
   const desktopLiveRecovery = config.desktopLiveRecovery ?? new DesktopLiveRecovery({
     repoRoot: config.repoRoot ?? process.cwd(),
     bridgeUrl: config.localBridgeUrl ?? `http://127.0.0.1:${config.port ?? 8787}`
@@ -68,6 +96,36 @@ export function createApp({ config, adapter }) {
       desktopOpener
     })
   });
+  const outbox = config.outboxEnabled !== true && !config.outbox
+    ? null
+    : config.outbox ?? new DurableOutbox({
+        filePath: config.outboxPath
+          ?? path.join(config.repoRoot ?? process.cwd(), 'logs', 'state', 'mobile-outbox.json'),
+        blockedDelayMs: config.outboxBlockedDelayMs,
+        logger,
+        reconcile: config.outboxReconciler
+          ?? createOutboxReceiptReconciler({ threadService, sessions }),
+        canDispatch: (item) => canDispatchOutboxItem({ item, store, threadService }),
+        canRequeueSubmitted: (item) => canRequeueSubmittedOutboxItem({
+          item,
+          store,
+          threadService
+        }),
+        dispatch: (item) => dispatchOutboxItem({
+          item,
+          config,
+          store,
+          logger,
+          sessions,
+          sessionSettings,
+          defaultReasoningEffortProvider,
+          codexSettingsProvider,
+          threadService,
+          desktopLiveRecovery,
+          desktopLiveDiagnostics,
+          desktopOpener
+        })
+      });
 
   const server = createServer(async (request, response) => {
     const startedAt = Date.now();
@@ -79,7 +137,7 @@ export function createApp({ config, adapter }) {
           url: sanitizeRequestUrl(request.url)
         });
       }
-      await route({ request, response, config, store, eventBus, logger, sessions, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener });
+      await route({ request, response, config, store, outbox, eventBus, logger, sessions, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener });
       if (shouldLogCompletedRequest(request)) {
         const responseBytes = responseByteCounter.bytes || responseContentLength(response);
         await logger.write('bridge', 'info', 'http.request.completed', {
@@ -116,8 +174,16 @@ export function createApp({ config, adapter }) {
       sendJson(response, error.statusCode ?? 500, payload);
     }
   });
+  server.on('close', () => outbox?.close());
+  if (outbox) {
+    void outbox.initialize()
+      .then(() => outbox.dispatchReady())
+      .catch((error) => logger.write('outbox', 'error', 'outbox.initialize.failed', {
+        message: error?.message ?? String(error)
+      }).catch(() => {}));
+  }
 
-  return { server, store, eventBus, logger, threadService };
+  return { server, store, outbox, eventBus, logger, threadService };
 }
 
 function createThreadInterruptReconciler({ threadService }) {
@@ -290,14 +356,15 @@ function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecove
       targetSessionId: task.codexSessionId,
       message: '正在校验桌面 Codex 会话，防止消息进入错误会话。'
     });
-    if (task.verifiedDesktopStatus?.desktopLive === true && task.verifiedDesktopStatus?.sessionVerified === true) {
+    if (desktopTargetReady(task.verifiedDesktopStatus, task.codexSessionId)) {
       emit('codex.desktop_live.verification.completed', {
         status: task.verifiedDesktopStatus.status,
         desktopLive: true,
         currentSessionId: task.verifiedDesktopStatus.currentSessionId ?? null,
         targetSessionId: task.codexSessionId,
-        sessionVerified: true,
-        message: task.verifiedDesktopStatus.message ?? '发送前已校验当前桌面会话',
+        sessionVerified: task.verifiedDesktopStatus.sessionVerified === true,
+        targetVerified: task.verifiedDesktopStatus.targetVerified === true,
+        message: task.verifiedDesktopStatus.message ?? '发送前已由桌面 App Server 校验目标会话',
         source: 'preflight'
       });
       return;
@@ -325,19 +392,20 @@ function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecove
       currentSessionId: desktop.currentSessionId ?? null,
       targetSessionId: task.codexSessionId,
       sessionVerified: desktop.sessionVerified === true,
+      targetVerified: desktop.targetVerified === true,
       message: desktop.message ?? desktop.reason ?? ''
     });
     assertDesktopThreadReady(desktop, task.codexSessionId);
   };
 }
 
-async function route({ request, response, config, store, eventBus, logger, sessions, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener }) {
+async function route({ request, response, config, store, outbox, eventBus, logger, sessions, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener }) {
   const url = new URL(request.url, 'http://127.0.0.1');
   const method = request.method ?? 'GET';
   if (method === 'OPTIONS') {
     response.writeHead(204, {
       'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+      'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
       'access-control-allow-headers': 'Content-Type,Authorization,X-Codex-Bridge-Token',
       'access-control-max-age': '86400'
     });
@@ -347,7 +415,14 @@ async function route({ request, response, config, store, eventBus, logger, sessi
   requireAuth({ request, url });
 
   if (method === 'GET' && url.pathname === '/health') {
-    sendJson(response, 200, { ok: true, run: await logger.getCurrentRun() });
+    sendJson(response, 200, {
+      ok: true,
+      run: await logger.getCurrentRun(),
+      runtime: runtimeStatus(config, threadService, url.searchParams.get('threadId') ?? '', {
+        clientProtocol: url.searchParams.get('clientProtocol'),
+        clientVersion: url.searchParams.get('clientVersion') ?? ''
+      })
+    });
     return;
   }
 
@@ -570,7 +645,10 @@ async function route({ request, response, config, store, eventBus, logger, sessi
   }
 
   if (method === 'GET' && url.pathname === '/projects') {
-    sendJson(response, 200, { projects: store.listProjects() });
+    const projects = typeof threadService.listProjects === 'function'
+      ? await threadService.listProjects()
+      : store.listProjects();
+    sendJson(response, 200, { projects });
     return;
   }
 
@@ -580,7 +658,19 @@ async function route({ request, response, config, store, eventBus, logger, sessi
   }
 
   if (method === 'GET' && url.pathname === '/tasks') {
-    sendJson(response, 200, { tasks: store.listTasks().map((task) => serializeTaskSummary(task)) });
+    const desktopTasks = store.listTasks();
+    const appServerRuns = appServerRuntimeMode(config) !== 'desktop' && typeof threadService?.listRuns === 'function'
+      ? threadService.listRuns()
+      : [];
+    const taskIds = new Set(desktopTasks.map((task) => task.id));
+    const tasks = [...desktopTasks, ...appServerRuns.filter((run) => !taskIds.has(run.id))]
+      .map((task) => serializeTaskSummary(task));
+    sendJson(response, 200, { tasks });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/api/codex/runtime-snapshot') {
+    sendJson(response, 200, await threadService.getRuntimeSnapshot({ limit: 500 }));
     return;
   }
 
@@ -592,8 +682,18 @@ async function route({ request, response, config, store, eventBus, logger, sessi
   }
 
   if (method === 'GET' && url.pathname === '/api/codex/settings') {
+    const settings = effectiveCodexSettings(
+      {},
+      await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider })
+    );
+    await logger.write('bridge', 'info', 'model.catalog.loaded', {
+      source: settings.modelCatalogSource,
+      revision: settings.modelCatalogRevision,
+      modelCount: settings.modelOptions.length,
+      defaultModel: settings.defaultModel
+    }).catch(() => {});
     sendJson(response, 200, {
-      settings: effectiveCodexSettings({}, await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider }))
+      settings
     });
     return;
   }
@@ -632,6 +732,40 @@ async function route({ request, response, config, store, eventBus, logger, sessi
     return;
   }
 
+  const remoteFileMetadataMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/files\/metadata$/);
+  if (method === 'GET' && remoteFileMetadataMatch) {
+    const file = await prepareRemoteSessionFile({
+      threadService,
+      sessionId: remoteFileMetadataMatch[1],
+      requestedPath: url.searchParams.get('path') ?? '',
+      maxBytes: config.remoteFileMaxBytes
+    });
+    sendJson(response, 200, { file: publicRemoteFileMetadata(file) });
+    return;
+  }
+
+  const remoteFileDownloadMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/files\/download$/);
+  if (method === 'GET' && remoteFileDownloadMatch) {
+    const file = await prepareRemoteSessionFile({
+      threadService,
+      sessionId: remoteFileDownloadMatch[1],
+      requestedPath: url.searchParams.get('path') ?? '',
+      maxBytes: config.remoteFileMaxBytes
+    });
+    const bytes = await fs.readFile(file.filePath);
+    response.writeHead(200, {
+      'content-type': file.mimeType,
+      'content-length': bytes.length,
+      'content-disposition': remoteFileContentDisposition(file.fileName),
+      'cache-control': 'private, no-store',
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+      'access-control-allow-headers': 'Content-Type,Authorization,X-Codex-Bridge-Token'
+    });
+    response.end(bytes);
+    return;
+  }
+
   const apiThreadDeleteMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/delete$/);
   if ((method === 'DELETE' && apiThreadMatch) || (method === 'POST' && apiThreadDeleteMatch)) {
     const threadId = (apiThreadMatch ?? apiThreadDeleteMatch)[1];
@@ -642,25 +776,71 @@ async function route({ request, response, config, store, eventBus, logger, sessi
 
   if (method === 'POST' && url.pathname === '/api/codex/threads') {
     const body = await readJsonObjectBody(request);
-    const defaults = await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider });
-    const requestedModel = normalizeModelId(body.model ?? '');
-    const requestedReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? '');
-    const effectiveModel = requestedModel || defaults.model;
-    const effectiveReasoningEffort = requestedReasoningEffort || defaults.reasoningEffort;
-    const result = await threadService.startThread({
-      projectId: String(body.projectId ?? ''),
-      prompt: String(body.prompt ?? body.text ?? ''),
-      model: effectiveModel,
-      reasoningEffort: effectiveReasoningEffort
-    });
-    const createdThreadId = result.thread?.id ?? result.run?.createdCodexSessionId ?? result.run?.createdThreadId ?? '';
-    if (createdThreadId && (body.reasoningEffort !== undefined || body.model !== undefined)) {
-      await sessionSettings.updateSessionSettings(createdThreadId, {
-        model: body.model,
-        reasoningEffort: body.reasoningEffort
+    const prompt = String(body.prompt ?? body.text ?? '');
+    const projectId = resolveProjectId(config, String(body.projectId ?? ''));
+    const submissionId = String(body.submissionId ?? '');
+    if (outbox && submissionId.trim()) {
+      const accepted = await outbox.enqueue({
+        kind: 'new_thread',
+        projectId,
+        submissionId,
+        text: prompt,
+        payload: body
       });
+      await outbox.dispatchReady();
+      sendOutboxResponse(response, outbox.get(accepted.id), url);
+      return;
     }
-    sendJson(response, result.run ? 202 : 201, result.run ? { ...result, run: serializeTask(result.run, serializationOptions(url)) } : result);
+    const dispatched = await dispatchNewThreadMessage({
+      body,
+      config,
+      store,
+      logger,
+      sessionSettings,
+      defaultReasoningEffortProvider,
+      codexSettingsProvider,
+      threadService,
+      desktopLiveRecovery,
+      desktopLiveDiagnostics
+    });
+    sendJson(response, dispatched.statusCode, serializeDispatchPayload(dispatched.payload, url));
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/api/outbox') {
+    sendJson(response, 200, {
+      items: outbox
+        ? outbox.list({
+            threadId: url.searchParams.get('threadId') ?? '',
+            includeTerminal: url.searchParams.get('active') !== '1'
+          }).map(serializeOutboxItem)
+        : []
+    });
+    return;
+  }
+
+  const apiOutboxMatch = url.pathname.match(/^\/api\/outbox\/([^/]+)$/);
+  if ((method === 'PATCH' || method === 'PUT') && apiOutboxMatch) {
+    requireOutbox(outbox);
+    const item = await outbox.update(apiOutboxMatch[1], await readJsonObjectBody(request));
+    sendJson(response, 200, { item: serializeOutboxItem(item) });
+    return;
+  }
+
+  const apiOutboxActionMatch = url.pathname.match(/^\/api\/outbox\/([^/]+)\/(move|cancel|retry)$/);
+  if (method === 'POST' && apiOutboxActionMatch) {
+    requireOutbox(outbox);
+    const [, itemId, action] = apiOutboxActionMatch;
+    const body = await readJsonObjectBody(request);
+    const item = action === 'move'
+      ? await outbox.move(itemId, String(body.direction ?? ''))
+      : action === 'cancel'
+        ? await outbox.cancel(itemId)
+        : await outbox.retry(itemId);
+    if (action === 'retry') {
+      await outbox.dispatchReady();
+    }
+    sendJson(response, 200, { item: serializeOutboxItem(outbox.get(item.id)) });
     return;
   }
 
@@ -705,72 +885,46 @@ async function route({ request, response, config, store, eventBus, logger, sessi
     const threadId = apiThreadMessageMatch[1];
     const projectId = resolveProjectId(config, String(body.projectId ?? ''));
     const prompt = String(body.text ?? body.prompt ?? '');
-    const storedSettings = await sessionSettings.getSessionSettings(threadId);
-    const defaults = await getThreadCodexDefaults({ codexSettingsProvider, defaultReasoningEffortProvider, sessions, threadId });
-    const requestedModel = normalizeModelId(body.model ?? storedSettings.model ?? '');
-    const requestedReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? storedSettings.reasoningEffort ?? '');
-    const model = requestedModel || defaults.model;
-    const reasoningEffort = requestedReasoningEffort || defaults.reasoningEffort;
-    assertValidCodexSessionId(threadId);
-    const sessionFingerprint = requireSessionFingerprint(body.sessionFingerprint);
-    const verified = await sessions.verifySessionTarget(threadId, sessionFingerprint);
-    await logger.write('bridge', 'info', 'session.target.verified', {
-      source: 'api.codex.thread.message',
-      sessionId: threadId,
-      title: verified.title,
-      projectLabel: verified.projectLabel,
-      filePath: verified.filePath,
-      requestedTitle: sessionFingerprint.title ?? '',
-      requestedProjectLabel: sessionFingerprint.projectLabel ?? ''
-    });
-    const desktopOpen = await maybeOpenDesktopThreadForPhoneSend({
-      desktopOpener,
+    const submissionId = String(body.submissionId ?? '');
+    if (outbox && submissionId.trim()) {
+      const accepted = await outbox.enqueue({
+        kind: 'existing_thread',
+        threadId,
+        projectId,
+        submissionId,
+        text: prompt,
+        payload: body
+      });
+      await outbox.dispatchReady();
+      sendOutboxResponse(response, outbox.get(accepted.id), url);
+      return;
+    }
+    const dispatched = await dispatchExistingThreadMessage({
       threadId,
-      logger
-    });
-    const desktop = await getRecoverableDesktopLiveStatus({
-      adapter: store.adapter,
-      sessionId: threadId,
+      body,
+      config,
+      store,
       logger,
-      recovery: desktopLiveRecovery,
-      diagnostics: desktopLiveDiagnostics,
-      source: 'api.codex.thread.message.preflight'
+      sessions,
+      sessionSettings,
+      defaultReasoningEffortProvider,
+      codexSettingsProvider,
+      threadService,
+      desktopLiveRecovery,
+      desktopLiveDiagnostics,
+      desktopOpener
     });
-    const verifiedDesktopStatus = {
-      ...desktop,
-      desktopOpen,
-      preflight: buildDesktopSendPreflight(desktop, threadId)
-    };
-    assertDesktopThreadReady(verifiedDesktopStatus, threadId);
-    const task = store.createTask({
-      projectId,
-      prompt,
-      codexSessionId: threadId,
-      sessionFingerprint,
-      verifiedSessionTarget: verified,
-      verifiedDesktopStatus,
-      submissionSource: 'phone_thread_message',
-      model,
-      reasoningEffort
-    });
-    await logger.write('bridge', 'info', 'codex.thread.message.desktop_task.queued', {
-      taskId: task.id,
-      threadId,
-      projectId,
-      promptLength: prompt.length,
-      model: model || 'auto',
-      reasoningEffort: reasoningEffort || 'auto',
-      desktopVerification: 'verified_before_task',
-      desktopStatus: verifiedDesktopStatus.status,
-      desktopCurrentSessionId: verifiedDesktopStatus.currentSessionId ?? '',
-      desktopSessionVerified: verifiedDesktopStatus.sessionVerified === true
-    });
-    sendJson(response, 202, { run: serializeTask(task, serializationOptions(url)) });
+    sendJson(response, dispatched.statusCode, serializeDispatchPayload(dispatched.payload, url));
     return;
   }
 
   const apiRunMatch = url.pathname.match(/^\/api\/codex\/runs\/([^/]+)$/);
   if (method === 'GET' && apiRunMatch) {
+    const queued = outbox?.get(apiRunMatch[1]);
+    if (queued) {
+      sendOutboxResponse(response, queued, url);
+      return;
+    }
     const task = store.getTask(apiRunMatch[1]);
     if (task) {
       sendJson(response, 200, { run: serializeTask(task, serializationOptions(url)) });
@@ -782,6 +936,12 @@ async function route({ request, response, config, store, eventBus, logger, sessi
 
   const apiRunInterruptMatch = url.pathname.match(/^\/api\/codex\/runs\/([^/]+)\/interrupt$/);
   if (method === 'POST' && apiRunInterruptMatch) {
+    const queued = outbox?.get(apiRunInterruptMatch[1]);
+    if (queued && ['queued', 'failed', 'uncertain'].includes(queued.status)) {
+      const canceled = await outbox.cancel(queued.id);
+      sendOutboxResponse(response, canceled, url);
+      return;
+    }
     const task = store.getTask(apiRunInterruptMatch[1]);
     if (task) {
       const interrupted = store.interruptTask(apiRunInterruptMatch[1]);
@@ -795,7 +955,24 @@ async function route({ request, response, config, store, eventBus, logger, sessi
 
   const apiThreadInterruptMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/interrupt$/);
   if (method === 'POST' && apiThreadInterruptMatch) {
-    const task = store.interruptSessionTask(apiThreadInterruptMatch[1]);
+    const threadId = apiThreadInterruptMatch[1];
+    if (shouldUseAppServerForExistingThread(config, threadId)) {
+      const interrupted = await threadService.interruptThread(threadId);
+      sendJson(response, 200, { run: serializeTask(interrupted, serializationOptions(url)) });
+      return;
+    }
+    if (shouldUseDesktopPrimaryFallback(config)) {
+      try {
+        const interrupted = await threadService.interruptThread(threadId);
+        sendJson(response, 200, { run: serializeTask(interrupted, serializationOptions(url)) });
+        return;
+      } catch (error) {
+        if (error?.statusCode !== 404) {
+          throw error;
+        }
+      }
+    }
+    const task = store.interruptSessionTask(threadId);
     const confirmed = await maybeWaitForInterruptConfirmation(store, task, url);
     sendJson(response, 200, { run: serializeTask(confirmed, serializationOptions(url)) });
     return;
@@ -835,7 +1012,7 @@ async function route({ request, response, config, store, eventBus, logger, sessi
 
   const sessionOpenMatch = url.pathname.match(/^\/codex\/sessions\/([^/]+)\/open$/);
   if (method === 'POST' && sessionOpenMatch) {
-    sendJson(response, 202, { desktop: await openCodexThreadDeeplink(sessionOpenMatch[1]) });
+    sendJson(response, 202, { desktop: await desktopOpener(sessionOpenMatch[1]) });
     return;
   }
 
@@ -881,6 +1058,19 @@ async function route({ request, response, config, store, eventBus, logger, sessi
       durationMs: Date.now() - startedAt
     }).catch(() => {});
     sendJson(response, 201, { image });
+    return;
+  }
+
+  if (method === 'POST' && url.pathname === '/mobile/files') {
+    const startedAt = Date.now();
+    const body = await readJsonObjectBody(request, 24 * 1024 * 1024);
+    const file = await saveMobileFileUpload({ body, config, logger });
+    await logger?.write?.('bridge', 'info', 'mobile.file.upload.completed', {
+      filePath: file.filePath,
+      bytes: file.bytes,
+      durationMs: Date.now() - startedAt
+    }).catch(() => {});
+    sendJson(response, 201, { file });
     return;
   }
 
@@ -944,8 +1134,34 @@ async function route({ request, response, config, store, eventBus, logger, sessi
   const approvalMatch = url.pathname.match(/^\/approvals\/([^/]+)$/);
   if (method === 'POST' && approvalMatch) {
     const body = await readJsonObjectBody(request);
-    const approval = store.decideApproval(approvalMatch[1], body.decision);
+    const approvalId = approvalMatch[1];
+    const appServerApproval = typeof threadService.getApproval === 'function'
+      ? threadService.getApproval(approvalId)
+      : null;
+    const approval = appServerApproval
+      ? threadService.decideApproval(approvalId, body.decision)
+      : store.decideApproval(approvalId, body.decision);
     sendJson(response, 200, { approval: serializeApproval(approval) });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/user-inputs') {
+    const userInputs = typeof threadService.listUserInputs === 'function'
+      ? threadService.listUserInputs()
+      : [];
+    sendJson(response, 200, { userInputs });
+    return;
+  }
+
+  const userInputMatch = url.pathname.match(/^\/user-inputs\/([^/]+)$/);
+  if (method === 'POST' && userInputMatch) {
+    if (typeof threadService.answerUserInput !== 'function') {
+      sendJson(response, 404, { error: 'Structured user input is unavailable' });
+      return;
+    }
+    const body = await readJsonObjectBody(request);
+    const userInput = threadService.answerUserInput(userInputMatch[1], body.answers);
+    sendJson(response, 200, { userInput });
     return;
   }
 
@@ -966,6 +1182,7 @@ async function getDefaultCodexSettings({ codexSettingsProvider, defaultReasoning
     return {
       model: '',
       reasoningEffort: fallbackReasoningEffort,
+      source: '',
       models: []
     };
   }
@@ -975,14 +1192,25 @@ async function getDefaultCodexSettings({ codexSettingsProvider, defaultReasoning
     return {
       model: normalizeModelId(settings?.model ?? ''),
       reasoningEffort: providerReasoningEffort || fallbackReasoningEffort,
+      source: String(settings?.source ?? settings?.modelCatalogSource ?? ''),
+      modelCatalogRevision: String(settings?.modelCatalogRevision ?? ''),
       models: Array.isArray(settings?.models) ? settings.models : []
     };
   } catch {
     return {
       model: '',
       reasoningEffort: fallbackReasoningEffort,
+      source: '',
       models: []
     };
+  }
+}
+
+async function readPrimaryCodexSettings({ threadService }) {
+  try {
+    return await readAppServerCodexSettings(threadService);
+  } catch {
+    return await readDesktopCodexSettings();
   }
 }
 
@@ -1128,6 +1356,51 @@ async function saveMobileImageUpload({ body, config, logger }) {
   };
 }
 
+async function saveMobileFileUpload({ body, config, logger }) {
+  const originalName = path.basename(String(body.fileName ?? '').trim());
+  assertSafeMobileFileName(originalName);
+  const base64 = normalizeImageBase64(String(body.base64 ?? ''));
+  if (base64.length === 0) {
+    const error = new Error('文件内容为空。');
+    error.statusCode = 400;
+    throw error;
+  }
+  const bytes = Buffer.from(base64, 'base64');
+  if (bytes.length === 0) {
+    const error = new Error('文件内容无法解析。');
+    error.statusCode = 400;
+    throw error;
+  }
+  const maxBytes = Math.max(1, Number(config.mobileFileMaxBytes ?? 10 * 1024 * 1024));
+  if (bytes.length > maxBytes) {
+    const error = new Error(`文件超过 ${Math.ceil(maxBytes / (1024 * 1024))}MB 上传限制。`);
+    error.statusCode = 413;
+    throw error;
+  }
+
+  const uploadDir = config.mobileFilesDir ?? path.join(process.cwd(), 'logs', 'mobile-files');
+  await fs.mkdir(uploadDir, { recursive: true });
+  const fileName = `${timestampFilePart()}-${safeAttachmentFileName(originalName)}`;
+  const filePath = path.join(uploadDir, fileName);
+  await fs.writeFile(filePath, bytes);
+  const mimeType = String(body.mimeType ?? 'application/octet-stream').trim().toLowerCase()
+    || 'application/octet-stream';
+  const messageText = `手机端文件：${filePath.replace(/\\/g, '/')}`;
+  await logger?.write?.('bridge', 'info', 'mobile.file.uploaded', {
+    filePath,
+    fileName,
+    mimeType,
+    bytes: bytes.length
+  }).catch(() => {});
+  return {
+    fileName,
+    filePath,
+    mimeType,
+    bytes: bytes.length,
+    messageText
+  };
+}
+
 async function sendMobileImageFile({ response, url, config }) {
   const requestedPath = String(url.searchParams.get('path') ?? '').trim();
   if (requestedPath.length === 0) {
@@ -1200,6 +1473,38 @@ function safeFileName(value) {
   return text || 'phone-image';
 }
 
+function assertSafeMobileFileName(value) {
+  const name = String(value ?? '').trim();
+  const lower = name.toLowerCase();
+  const extension = path.extname(lower);
+  const allowedExtensions = new Set([
+    '.txt', '.md', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml', '.xml',
+    '.csv', '.tsv', '.ini', '.cfg', '.conf', '.sql', '.html', '.css',
+    '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.py', '.java', '.kt', '.kts',
+    '.c', '.cc', '.cpp', '.h', '.hpp', '.cs', '.go', '.rs', '.sh', '.ps1',
+    '.bat', '.cmd', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.png', '.jpg', '.jpeg', '.webp', '.gif'
+  ]);
+  const sensitive = lower === '.env'
+    || lower.startsWith('.env.')
+    || /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/.test(lower)
+    || ['.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.mobileprovision'].includes(extension)
+    || /(^|[._-])(credential|credentials|secrets?|tokens?)([._-]|$)/.test(lower);
+  if (!name || sensitive || !allowedExtensions.has(extension)) {
+    const error = new Error('该文件类型或敏感文件名不允许上传。');
+    error.statusCode = 415;
+    throw error;
+  }
+}
+
+function safeAttachmentFileName(value) {
+  const safe = String(value ?? 'attachment.txt')
+    .replace(/[^A-Za-z0-9\u4e00-\u9fff._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 100);
+  return safe || 'attachment.txt';
+}
+
 function timestampFilePart() {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
@@ -1247,6 +1552,23 @@ async function getDesktopLiveStatus(adapter, sessionId = '') {
   };
 }
 
+async function getPhoneSendDesktopStatus({ config, adapter, sessionId = '', logger, recovery, diagnostics, source }) {
+  if (appServerRuntimeMode(config) === 'desktop') {
+    return decorateDesktopLiveStatusWithDiagnostics(
+      await getDesktopLiveStatus(adapter, sessionId),
+      diagnostics
+    );
+  }
+  return getRecoverableDesktopLiveStatus({
+    adapter,
+    sessionId,
+    logger,
+    recovery,
+    diagnostics,
+    source
+  });
+}
+
 async function getRecoverableDesktopLiveStatus({ adapter, sessionId = '', logger, recovery, diagnostics, source = 'status' }) {
   const initial = await decorateDesktopLiveStatusWithDiagnostics(
     await getDesktopLiveStatus(adapter, sessionId),
@@ -1286,18 +1608,43 @@ async function getRecoverableDesktopLiveStatus({ adapter, sessionId = '', logger
   });
 }
 
+function assertDesktopReadyForNewThread(status) {
+  if (status?.desktopLive === true) {
+    return;
+  }
+  const message = status?.message ?? status?.reason ?? '桌面 CDP 不可用';
+  const error = new Error(`桌面实时通道不可用，已阻止新建会话，避免手机创建桌面端不可见的独立会话：${message}`);
+  error.statusCode = 503;
+  error.desktop = {
+    ...status,
+    targetSessionId: '',
+    required: 'desktop_live'
+  };
+  error.preflight = {
+    ok: false,
+    canSend: false,
+    desktopLive: false,
+    sessionVerified: false,
+    severity: 'blocked',
+    recommendedAction: 'desktop_cdp_required',
+    recoverableFromPhone: false,
+    message
+  };
+  throw error;
+}
+
 function assertDesktopThreadReady(status, threadId) {
-  if (status?.desktopLive === true && status?.sessionVerified === true) {
+  if (desktopTargetReady(status, threadId)) {
     return;
   }
   const preflight = status?.preflight ?? buildDesktopSendPreflight(status, threadId);
-  const message = status?.message ?? status?.reason ?? '桌面官方实时通道未校验，手机端已阻止发送。';
-  const error = new Error(`桌面端未确认当前会话，已阻止发送，避免手机端和桌面端不同步：${message}`);
+  const message = status?.message ?? status?.reason ?? '桌面 App Server 未确认目标会话，手机端已阻止发送。';
+  const error = new Error(`桌面 App Server 未确认手机选择的目标会话，已阻止发送，避免产生独立会话：${message}`);
   error.statusCode = preflight.recommendedAction === 'sync_session' ? 409 : 503;
   error.desktop = {
     ...status,
     targetSessionId: status?.targetSessionId ?? threadId,
-    required: 'desktop_live_verified_session'
+    required: 'desktop_live_verified_target'
   };
   error.preflight = preflight;
   throw error;
@@ -1307,7 +1654,8 @@ function buildDesktopSendPreflight(status, threadId) {
   const targetSessionId = status?.targetSessionId ?? threadId;
   const desktopLive = status?.desktopLive === true;
   const sessionVerified = status?.sessionVerified === true;
-  const ok = desktopLive && sessionVerified;
+  const targetVerified = status?.targetVerified === true || sessionVerified;
+  const ok = desktopLive && targetVerified;
   const mode = chooseDesktopRepairMode(status);
   let recommendedAction = 'none';
   let recoverableFromPhone = true;
@@ -1319,7 +1667,7 @@ function buildDesktopSendPreflight(status, threadId) {
       recommendedAction = 'sync_session';
       recoverableFromPhone = true;
       severity = 'degraded';
-      message = message || '桌面链路在线，但当前桌面会话与手机目标会话没有校验一致。';
+      message = message || '桌面链路在线，但桌面 App Server 尚未确认手机选择的目标会话。';
     } else if (mode === 'hard') {
       recommendedAction = 'desktop_cdp_restart_required';
       recoverableFromPhone = false;
@@ -1345,6 +1693,7 @@ function buildDesktopSendPreflight(status, threadId) {
     canInterrupt: ok,
     desktopLive,
     sessionVerified,
+    targetVerified,
     status: status?.status ?? '',
     currentSessionId: status?.currentSessionId ?? null,
     targetSessionId,
@@ -1360,6 +1709,16 @@ function buildDesktopSendPreflight(status, threadId) {
     recoveryError: status?.recoveryError ?? '',
     message
   };
+}
+
+function desktopTargetReady(status, threadId = '') {
+  if (status?.desktopLive !== true) {
+    return false;
+  }
+  if (!String(threadId ?? status?.targetSessionId ?? '').trim()) {
+    return true;
+  }
+  return status?.sessionVerified === true || status?.targetVerified === true;
 }
 
 function assertValidCodexSessionId(sessionId) {
@@ -1526,10 +1885,13 @@ async function collectSystemRepairStatus({ store, sessions, logger, diagnostics,
 }
 
 async function collectSystemLinkStatus({ config, store, sessions, logger, diagnostics, sessionId = '', desktopOverride = null }) {
+  const executionMode = systemLinkExecutionMode(config, sessionId);
   const health = await collectLinkHealth({
     repoRoot: config.repoRoot ?? process.cwd(),
     sessionId,
     logger,
+    executionMode,
+    desktopRequired: executionMode !== 'app_server',
     desktopStatusProvider: async () => {
       if (desktopOverride) {
         return desktopOverride;
@@ -1681,12 +2043,14 @@ function chooseSystemRepairAction({ desktop, script, sessionProbe }) {
         message: '桌面 CDP 可用，但脚本桥认证异常；将只重启 live-host，不重启 Codex。'
       };
     }
-    if (desktop?.targetSessionId && desktop?.sessionVerified !== true) {
+    if (desktop?.targetSessionId
+      && desktop?.sessionVerified !== true
+      && desktop?.targetVerified !== true) {
       return {
         action: 'sync_session',
         severity: 'degraded',
         recoverableFromPhone: true,
-        message: '桌面链路在线，但当前会话还没有校验一致'
+        message: '桌面链路在线，但桌面 App Server 尚未确认目标会话'
       };
     }
     return {
@@ -1793,6 +2157,532 @@ function decorateDesktopLiveStatus(status, diagnostics = null) {
           : '当前 Codex 是普通启动态，没有可用 CDP，手机端软恢复无法接入；请用桌面一键启动，或明确确认后再执行硬恢复。'
         : '手机端可以先尝试修复桌面 live-host，然后再重试发送。'
   };
+}
+
+async function dispatchOutboxItem({
+  item,
+  config,
+  store,
+  logger,
+  sessions,
+  sessionSettings,
+  defaultReasoningEffortProvider,
+  codexSettingsProvider,
+  threadService,
+  desktopLiveRecovery,
+  desktopLiveDiagnostics,
+  desktopOpener
+}) {
+  const body = {
+    ...(item.payload ?? {}),
+    projectId: item.projectId,
+    submissionId: item.submissionId,
+    text: item.text,
+    prompt: item.text
+  };
+  const dispatched = item.kind === 'new_thread'
+    ? await dispatchNewThreadMessage({
+        body,
+        config,
+        store,
+        logger,
+        sessionSettings,
+        defaultReasoningEffortProvider,
+        codexSettingsProvider,
+        threadService,
+        desktopLiveRecovery,
+        desktopLiveDiagnostics
+      })
+    : await dispatchExistingThreadMessage({
+        threadId: item.threadId,
+        body,
+        config,
+        store,
+        logger,
+        sessions,
+        sessionSettings,
+        defaultReasoningEffortProvider,
+        codexSettingsProvider,
+        threadService,
+        desktopLiveRecovery,
+        desktopLiveDiagnostics,
+        desktopOpener
+      });
+  return dispatched.payload;
+}
+
+async function canDispatchOutboxItem({ item, store, threadService }) {
+  const activeStatuses = new Set(['queued', 'running', 'waiting_approval', 'recovering']);
+  if (item.kind === 'existing_thread') {
+    const activeDesktopTask = store.findRunningTaskForSession(item.threadId);
+    if (activeDesktopTask) {
+      return typeof store.canSteerSessionTask === 'function'
+        && store.canSteerSessionTask(item.threadId);
+    }
+    let activeRun = typeof threadService?.listRuns === 'function'
+      ? threadService.listRuns().find((run) => (
+          (run.threadId === item.threadId || run.codexSessionId === item.threadId)
+          && activeStatuses.has(String(run.status ?? '').toLowerCase())
+        ))
+      : null;
+    if (activeRun) {
+      if (
+        String(activeRun.status ?? '').toLowerCase() === 'recovering'
+        && typeof threadService?.reconcilePersistedRun === 'function'
+      ) {
+        try {
+          activeRun = await threadService.reconcilePersistedRun(activeRun);
+        } catch {
+          // Dispatch remains the authoritative target check. A recovery probe
+          // must not leave the lane permanently queued when its owner vanished.
+          return true;
+        }
+        if (!activeStatuses.has(String(activeRun?.status ?? '').toLowerCase())) {
+          return true;
+        }
+      }
+      if (activeRun.interruptRequested === true) {
+        return {
+          allowed: false,
+          reason: 'interrupt_pending',
+          runId: String(activeRun.id ?? ''),
+          turnId: String(activeRun.turnId ?? activeRun.activeCodexTurnId ?? '')
+        };
+      }
+      return typeof threadService?.canSteerThread === 'function'
+        && threadService.canSteerThread(item.threadId);
+    }
+    if (typeof threadService?.getThread === 'function') {
+      try {
+        const thread = await threadService.getThread(item.threadId, { tail: 1 });
+        const status = String(thread?.activityStatus ?? thread?.runtimeState ?? '').toLowerCase();
+        if (activeStatuses.has(status)) {
+          return false;
+        }
+      } catch {
+        // Dispatch performs the authoritative target verification and records
+        // a retryable failure when the session or transport is unavailable.
+      }
+    }
+    return true;
+  }
+  const activeProjectTask = store.listTasks().some((task) => (
+    task.projectId === item.projectId
+    && activeStatuses.has(String(task.status ?? '').toLowerCase())
+  ));
+  if (activeProjectTask) {
+    return false;
+  }
+  return !(typeof threadService?.listRuns === 'function' && threadService.listRuns().some((run) => (
+    run.projectId === item.projectId
+    && activeStatuses.has(String(run.status ?? '').toLowerCase())
+  )));
+}
+
+function canRequeueSubmittedOutboxItem({ item, store, threadService }) {
+  const resultId = String(item?.resultId ?? '').trim();
+  if (!resultId) {
+    return false;
+  }
+  const task = store.getTask(resultId);
+  if (task) {
+    return task.status === 'failed'
+      && !task.events.some((event) => event.type === 'codex.app_server.turn.started');
+  }
+  if (typeof threadService?.getRun !== 'function') {
+    return false;
+  }
+  try {
+    const run = threadService.getRun(resultId);
+    return run?.status === 'failed' && !String(run.turnId ?? run.activeCodexTurnId ?? '').trim();
+  } catch {
+    // After a Bridge restart the historical result may not exist in the new
+    // in-memory runtime. Without authoritative failure evidence, keep the
+    // submitted receipt deduplicated.
+    return false;
+  }
+}
+
+async function dispatchNewThreadMessage({
+  body,
+  config,
+  store,
+  logger,
+  sessionSettings,
+  defaultReasoningEffortProvider,
+  codexSettingsProvider,
+  threadService,
+  desktopLiveRecovery,
+  desktopLiveDiagnostics
+}) {
+  const defaults = await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider });
+  const requestedModel = normalizeModelId(body.model ?? '');
+  const requestedReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? '');
+  const effectiveModel = requestedModel || defaults.model;
+  const effectiveReasoningEffort = requestedReasoningEffort || defaults.reasoningEffort;
+  const prompt = String(body.prompt ?? body.text ?? '');
+  const projectId = resolveProjectId(config, String(body.projectId ?? ''));
+  const submissionId = String(body.submissionId ?? '');
+  if (systemLinkExecutionMode(config) === 'app_server') {
+    const result = await threadService.startThread({
+      projectId,
+      prompt,
+      model: effectiveModel,
+      reasoningEffort: effectiveReasoningEffort,
+      submissionId
+    });
+    const createdThreadId = result.thread?.id ?? result.run?.createdCodexSessionId ?? result.run?.createdThreadId ?? '';
+    if (createdThreadId && (body.reasoningEffort !== undefined || body.model !== undefined)) {
+      await sessionSettings.updateSessionSettings(createdThreadId, {
+        model: body.model,
+        reasoningEffort: body.reasoningEffort
+      });
+    }
+    return {
+      statusCode: result.run ? 202 : 201,
+      payload: result
+    };
+  }
+
+  const desktop = await getPhoneSendDesktopStatus({
+    config,
+    adapter: store.adapter,
+    logger,
+    recovery: desktopLiveRecovery,
+    diagnostics: desktopLiveDiagnostics,
+    source: 'api.codex.thread.start.preflight'
+  });
+  assertDesktopReadyForNewThread(desktop);
+  const task = store.createTask({
+    projectId,
+    prompt,
+    verifiedDesktopStatus: desktop,
+    submissionSource: 'phone_new_thread',
+    submissionId,
+    model: effectiveModel,
+    reasoningEffort: effectiveReasoningEffort
+  });
+  await logger.write('bridge', 'info', 'codex.thread.start.desktop_task.queued', {
+    taskId: task.id,
+    projectId,
+    promptLength: prompt.length,
+    model: effectiveModel || 'auto',
+    reasoningEffort: effectiveReasoningEffort || 'auto',
+    runtimeMode: appServerRuntimeMode(config),
+    desktopStatus: desktop.status ?? '',
+    desktopTransport: desktop.transport ?? '',
+    submissionId: submissionId || ''
+  });
+  return { statusCode: 202, payload: { run: task } };
+}
+
+async function dispatchExistingThreadMessage({
+  threadId,
+  body,
+  config,
+  store,
+  logger,
+  sessions,
+  sessionSettings,
+  defaultReasoningEffortProvider,
+  codexSettingsProvider,
+  threadService,
+  desktopLiveRecovery,
+  desktopLiveDiagnostics,
+  desktopOpener
+}) {
+  const projectId = resolveProjectId(config, String(body.projectId ?? ''));
+  const prompt = String(body.text ?? body.prompt ?? '');
+  const storedSettings = await sessionSettings.getSessionSettings(threadId);
+  const defaults = await getThreadCodexDefaults({
+    codexSettingsProvider,
+    defaultReasoningEffortProvider,
+    sessions,
+    threadId
+  });
+  const requestedModel = normalizeModelId(body.model ?? storedSettings.model ?? '');
+  const requestedReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? storedSettings.reasoningEffort ?? '');
+  const model = requestedModel || defaults.model;
+  const reasoningEffort = requestedReasoningEffort || defaults.reasoningEffort;
+  const submissionId = String(body.submissionId ?? '');
+  await logger.write('bridge', 'info', 'codex.thread.message.received', {
+    threadId,
+    submissionId,
+    projectId,
+    promptLength: prompt.length,
+    runtimeMode: appServerRuntimeMode(config)
+  });
+  assertValidCodexSessionId(threadId);
+  const sessionFingerprint = requireSessionFingerprint(body.sessionFingerprint);
+  const verified = await sessions.verifySessionTarget(threadId, sessionFingerprint);
+  await logger.write('bridge', 'info', 'session.target.verified', {
+    source: 'api.codex.thread.message',
+    sessionId: threadId,
+    title: verified.title,
+    projectLabel: verified.projectLabel,
+    filePath: verified.filePath,
+    requestedTitle: sessionFingerprint.title ?? '',
+    requestedProjectLabel: sessionFingerprint.projectLabel ?? '',
+    submissionId,
+    runtimeMode: appServerRuntimeMode(config)
+  });
+  if (shouldUseAppServerForExistingThread(config, threadId)) {
+    if (typeof threadService?.canSteerThread === 'function' && threadService.canSteerThread(threadId)) {
+      try {
+        const run = await threadService.steerMessage({
+          threadId,
+          text: prompt,
+          submissionId
+        });
+        await logger.write('bridge', 'info', 'codex.thread.message.app_server.steered', {
+          runId: run.id,
+          threadId,
+          projectId,
+          promptLength: prompt.length,
+          submissionId,
+          runtimeMode: appServerRuntimeMode(config),
+          sessionFingerprintVerified: true
+        });
+        return { statusCode: 202, payload: { run } };
+      } catch (error) {
+        if (!isSafeSteerFallbackError(error)) {
+          throw error;
+        }
+        await logger.write('bridge', 'info', 'codex.thread.message.app_server.steer_raced_terminal', {
+          threadId,
+          message: error?.message ?? String(error)
+        });
+      }
+    }
+    const run = await threadService.sendMessage({
+      threadId,
+      text: prompt,
+      projectId,
+      model,
+      reasoningEffort,
+      submissionId
+    });
+    await logger.write('bridge', 'info', 'codex.thread.message.app_server.queued', {
+      runId: run.id,
+      threadId,
+      projectId,
+      promptLength: prompt.length,
+      submissionId,
+      model: model || 'auto',
+      reasoningEffort: reasoningEffort || 'auto',
+      runtimeMode: appServerRuntimeMode(config),
+      sessionFingerprintVerified: true
+    });
+    return { statusCode: 202, payload: { run } };
+  }
+  if (typeof store.canSteerSessionTask === 'function' && store.canSteerSessionTask(threadId)) {
+    try {
+      const task = await store.steerSessionTask(threadId, {
+        prompt,
+        submissionId
+      });
+      await logger.write('bridge', 'info', 'codex.thread.message.desktop_task.steered', {
+        taskId: task.id,
+        threadId,
+        projectId,
+        promptLength: prompt.length,
+        turnId: task.activeCodexTurnId ?? '',
+        sessionFingerprintVerified: true
+      });
+      return { statusCode: 202, payload: { run: task } };
+    } catch (error) {
+      if (!isSafeSteerFallbackError(error)) {
+        throw error;
+      }
+      await logger.write('bridge', 'info', 'codex.thread.message.desktop_task.steer_raced_terminal', {
+        threadId,
+        message: error?.message ?? String(error)
+      });
+    }
+  }
+  const desktopOpen = await maybeOpenDesktopThreadForPhoneSend({
+    desktopOpener,
+    threadId,
+    logger
+  });
+  const desktop = await getPhoneSendDesktopStatus({
+    config,
+    adapter: store.adapter,
+    sessionId: threadId,
+    logger,
+    recovery: desktopLiveRecovery,
+    diagnostics: desktopLiveDiagnostics,
+    source: 'api.codex.thread.message.preflight'
+  });
+  const verifiedDesktopStatus = {
+    ...desktop,
+    desktopOpen,
+    preflight: buildDesktopSendPreflight(desktop, threadId)
+  };
+  if (shouldUseDesktopPrimaryFallback(config) && !verifiedDesktopStatus.preflight.ok) {
+    const run = await threadService.sendMessage({
+      threadId,
+      text: prompt,
+      projectId,
+      model,
+      reasoningEffort,
+      submissionId,
+      deliveryMode: 'desktop_fallback'
+    });
+    await logger.write('bridge', 'warn', 'codex.thread.message.desktop_primary_fallback.queued', {
+      runId: run.id,
+      threadId,
+      projectId,
+      promptLength: prompt.length,
+      model: model || 'auto',
+      reasoningEffort: reasoningEffort || 'auto',
+      runtimeMode: appServerRuntimeMode(config),
+      desktopStatus: verifiedDesktopStatus.status ?? '',
+      desktopLive: verifiedDesktopStatus.desktopLive === true,
+      desktopSessionVerified: verifiedDesktopStatus.sessionVerified === true,
+      recommendedAction: verifiedDesktopStatus.preflight.recommendedAction,
+      sessionFingerprintVerified: true
+    });
+    return { statusCode: 202, payload: { run } };
+  }
+  assertDesktopThreadReady(verifiedDesktopStatus, threadId);
+  const task = store.createTask({
+    projectId,
+    prompt,
+    codexSessionId: threadId,
+    sessionFingerprint,
+    verifiedSessionTarget: verified,
+    verifiedDesktopStatus,
+    submissionSource: 'phone_thread_message',
+    submissionId,
+    model,
+    reasoningEffort
+  });
+  await logger.write('bridge', 'info', 'codex.thread.message.desktop_task.queued', {
+    taskId: task.id,
+    threadId,
+    projectId,
+    promptLength: prompt.length,
+    submissionId,
+    model: model || 'auto',
+    reasoningEffort: reasoningEffort || 'auto',
+    desktopVerification: 'verified_before_task',
+    desktopStatus: verifiedDesktopStatus.status,
+    desktopCurrentSessionId: verifiedDesktopStatus.currentSessionId ?? '',
+    desktopSessionVerified: verifiedDesktopStatus.sessionVerified === true,
+    desktopTargetVerified: verifiedDesktopStatus.targetVerified === true
+  });
+  return { statusCode: 202, payload: { run: task } };
+}
+
+function isSafeSteerFallbackError(error) {
+  return error?.safeToFallback === true
+    || error?.code === 'CODEX_STEER_NO_ACTIVE_TURN';
+}
+
+function sendOutboxResponse(response, item, url) {
+  if (!item) {
+    const error = new Error('Unknown outbox item');
+    error.statusCode = 404;
+    throw error;
+  }
+  const outbox = serializeOutboxItem(item);
+  if (item.status === 'submitted' && item.result) {
+    sendJson(response, 202, {
+      ...serializeDispatchPayload(item.result, url),
+      outbox
+    });
+    return;
+  }
+  sendJson(response, 202, {
+    run: serializeOutboxRun(item),
+    outbox
+  });
+}
+
+function serializeDispatchPayload(payload, url) {
+  if (!payload || typeof payload !== 'object') {
+    return {};
+  }
+  return {
+    ...payload,
+    ...(payload.run ? { run: serializeTask(payload.run, serializationOptions(url)) } : {})
+  };
+}
+
+function serializeOutboxItem(item) {
+  return {
+    id: item.id,
+    kind: item.kind,
+    threadId: item.threadId,
+    projectId: item.projectId,
+    submissionId: item.submissionId,
+    text: item.text,
+    status: item.status,
+    order: item.order,
+    attemptCount: item.attemptCount,
+    retryable: item.retryable,
+    error: item.error,
+    nextAttemptAt: item.nextAttemptAt,
+    lastAttemptAt: item.lastAttemptAt,
+    submittedAt: item.submittedAt,
+    resultId: item.resultId,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt
+  };
+}
+
+function serializeOutboxRun(item) {
+  const queued = item.status === 'queued'
+    || item.status === 'dispatching'
+    || (item.status === 'failed' && item.retryable);
+  const status = item.status === 'canceled'
+    ? 'interrupted'
+    : queued
+      ? 'queued'
+      : item.status === 'uncertain'
+        ? 'recovering'
+        : 'failed';
+  return {
+    id: item.id,
+    projectId: item.projectId,
+    prompt: '',
+    promptPreview: item.text.slice(0, 160),
+    promptLength: item.text.length,
+    codexSessionId: item.threadId || null,
+    submissionId: item.submissionId,
+    status,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    activeCodexTurnId: null,
+    interruptReady: status === 'queued',
+    runtime: {
+      kind: 'durable_outbox',
+      state: item.status,
+      canInterrupt: status === 'queued'
+    },
+    error: item.error || null,
+    events: [{
+      id: `${item.id}-status`,
+      taskId: item.id,
+      type: `outbox.${item.status}`,
+      payload: {
+        outboxId: item.id,
+        attemptCount: item.attemptCount,
+        retryable: item.retryable,
+        nextAttemptAt: item.nextAttemptAt
+      },
+      createdAt: item.updatedAt
+    }]
+  };
+}
+
+function requireOutbox(outbox) {
+  if (!outbox) {
+    const error = new Error('Durable outbox is disabled');
+    error.statusCode = 404;
+    throw error;
+  }
 }
 
 async function readJsonObjectBody(request, maxBytes) {
@@ -1987,6 +2877,11 @@ function serializationOptions(url) {
     || url.searchParams.get('full') === 'true';
   return {
     full,
+    cursorRequested: url.searchParams.has('afterSeq'),
+    afterSeq: parseNonNegativeInteger(
+      url.searchParams.get('afterSeq'),
+      parseNonNegativeInteger(url.searchParams.get('sinceEvent'), 0)
+    ),
     sinceEvent: parseNonNegativeInteger(url.searchParams.get('sinceEvent'), 0),
     eventLimit: parseNonNegativeInteger(url.searchParams.get('eventLimit'), 8)
   };
@@ -2030,12 +2925,18 @@ function serializeTask(task, options = {}) {
       result: normalized.result,
       error: normalized.error,
       desktopSync: normalized.desktopSync,
+      runtime: normalized.runtime,
+      submissionId: normalized.submissionId,
       session: normalized.session,
-      events: normalized.events
+      eventCount: normalized.events.length,
+      eventCursor: normalized.events.length,
+      eventGap: false,
+      hasMoreEvents: false,
+      events: normalized.events.map((event, index) => serializeEvent({ ...event, seq: event.seq ?? index + 1 }))
     };
   }
 
-  const events = serializeEventWindow(normalized.events, options);
+  const eventWindow = serializeEventWindow(normalized.events, options);
   return {
     id: normalized.id,
     projectId: normalized.projectId,
@@ -2065,10 +2966,15 @@ function serializeTask(task, options = {}) {
     resultSummary: serializeResultSummary(normalized.result),
     error: normalized.error,
     desktopSync: normalized.desktopSync,
+    runtime: normalized.runtime,
+    submissionId: normalized.submissionId,
     session: serializeSessionSummary(normalized.session),
     eventCount: normalized.events.length,
     latestEvent: serializeEvent(normalized.events.at(-1) ?? null),
-    events
+    eventCursor: eventWindow.eventCursor,
+    eventGap: eventWindow.eventGap,
+    hasMoreEvents: eventWindow.hasMoreEvents,
+    events: eventWindow.events
   };
 }
 
@@ -2103,6 +3009,8 @@ function serializeTaskSummary(task) {
     resultSummary: serializeResultSummary(normalized.result),
     error: normalized.error,
     desktopSync: normalized.desktopSync,
+    runtime: normalized.runtime,
+    submissionId: normalized.submissionId,
     session: serializeSessionSummary(normalized.session),
     eventCount: normalized.events.length,
     latestEvent: serializeEvent(normalized.events.at(-1) ?? null)
@@ -2158,6 +3066,8 @@ function normalizeTaskLike(task) {
     result,
     error: task.error ?? null,
     desktopSync: task.desktopSync ?? null,
+    runtime: task.runtime ?? null,
+    submissionId: String(task.submissionId ?? ''),
     session,
     events: Array.isArray(task.events) ? task.events : []
   };
@@ -2167,7 +3077,7 @@ function deriveInterruptState({ status, interruptRequested, interruptDispatching
   if (status === 'interrupted') {
     return 'confirmed';
   }
-  if (interruptRecovering === true && ['queued', 'running', 'waiting_approval'].includes(status)) {
+  if (interruptRecovering === true && ['queued', 'running', 'waiting_approval', 'recovering'].includes(status)) {
     return 'reconciling';
   }
   if (typeof interruptError === 'string' && interruptError.length > 0) {
@@ -2176,10 +3086,10 @@ function deriveInterruptState({ status, interruptRequested, interruptDispatching
   if (syntheticInterrupt === true && status === 'failed' && String(error ?? '').indexOf('中断失败') >= 0) {
     return 'failed';
   }
-  if (interruptDispatching === true && ['queued', 'running', 'waiting_approval'].includes(status)) {
+  if (interruptDispatching === true && ['queued', 'running', 'waiting_approval', 'recovering'].includes(status)) {
     return 'dispatching';
   }
-  if (interruptRequested === true && ['queued', 'running', 'waiting_approval'].includes(status)) {
+  if (interruptRequested === true && ['queued', 'running', 'waiting_approval', 'recovering'].includes(status)) {
     if (typeof lastInterruptFailure === 'string' && lastInterruptFailure.length > 0) {
       return 'recoverable_failed';
     }
@@ -2189,16 +3099,17 @@ function deriveInterruptState({ status, interruptRequested, interruptDispatching
 }
 
 function serializeEventWindow(events, options = {}) {
-  const sinceEvent = Math.max(0, options.sinceEvent ?? 0);
-  const eventLimit = Math.max(0, options.eventLimit ?? 8);
-  if (eventLimit === 0) {
-    return [];
-  }
-  return events
-    .slice(sinceEvent)
-    .slice(-eventLimit)
-    .map((event) => serializeEvent(event))
-    .filter(Boolean);
+  const page = paginateTaskEvents(events, {
+    afterSeq: options.cursorRequested === true
+      ? Math.max(0, options.afterSeq ?? 0)
+      : Math.max(0, options.sinceEvent ?? 0),
+    eventLimit: Math.max(0, options.eventLimit ?? 8),
+    cursorRequested: options.cursorRequested === true
+  });
+  return {
+    ...page,
+    events: page.events.map((event) => serializeEvent(event)).filter(Boolean)
+  };
 }
 
 function serializeEvent(event) {
@@ -2207,6 +3118,7 @@ function serializeEvent(event) {
   }
   return {
     id: event.id,
+    seq: Number(event.seq ?? 0) || undefined,
     taskId: event.taskId,
     type: event.type,
     payload: serializeEventPayload(event.payload ?? {}),
@@ -2311,6 +3223,71 @@ function compactText(value, limit) {
 function parseNonNegativeInteger(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function appServerRuntimeMode(config = {}) {
+  const value = String(
+    config.appServerRuntimeMode
+    ?? process.env.CODEX_BRIDGE_RUNTIME_MODE
+    ?? 'desktop'
+  ).trim().toLowerCase();
+  return [
+    'desktop',
+    'desktop-primary',
+    'app-server-shadow',
+    'app-server-new-only',
+    'app-server-canary',
+    'app-server-primary'
+  ].includes(value) ? value : 'desktop';
+}
+
+function shouldUseDesktopPrimaryFallback(config) {
+  return appServerRuntimeMode(config) === 'desktop-primary';
+}
+
+function shouldUseAppServerForExistingThread(config, threadId) {
+  const mode = appServerRuntimeMode(config);
+  if (mode === 'app-server-primary') {
+    return true;
+  }
+  if (mode !== 'app-server-canary') {
+    return false;
+  }
+  const configured = config.appServerCanaryThreadIds
+    ?? String(process.env.CODEX_BRIDGE_APP_SERVER_CANARY_THREADS ?? '').split(',');
+  return Array.isArray(configured) && configured
+    .map((item) => String(item ?? '').trim())
+    .includes(String(threadId ?? '').trim());
+}
+
+function systemLinkExecutionMode(config, threadId = '') {
+  const mode = appServerRuntimeMode(config);
+  if (shouldUseAppServerForExistingThread(config, threadId)) {
+    return 'app_server';
+  }
+  if (!String(threadId ?? '').trim() && mode === 'app-server-new-only') {
+    return 'app_server';
+  }
+  return 'desktop';
+}
+
+function runtimeStatus(config, threadService, threadId = '', client = {}) {
+  const mode = appServerRuntimeMode(config);
+  const existingThreadExecution = shouldUseAppServerForExistingThread(config, threadId)
+    ? 'app_server'
+    : shouldUseDesktopPrimaryFallback(config)
+      ? 'desktop_primary'
+    : mode === 'app-server-canary'
+      ? 'canary'
+      : 'desktop';
+  return {
+    mode,
+    existingThreadExecution,
+    protocol: buildBridgeProtocolHandshake(client),
+    appServer: typeof threadService?.runtimeHealth === 'function'
+      ? threadService.runtimeHealth()
+      : null
+  };
 }
 
 function serializeApproval(approval) {

@@ -19,21 +19,24 @@
       {
         "name": "default",
         "signingConfig": "default",
-        "compatibleSdkVersion": "6.0.2(22)",
+        "compatibleSdkVersion": "6.1.1(24)",
         "runtimeOS": "HarmonyOS",
         "arkTSVersion": "1.1",
         "bundleType": "app",
         "label": "$string:app_name",
         "icon": "$media:app_icon",
-        "versionCode": 1000011,
-        "versionName": "1.0.11",
+        "versionCode": 1000014,
+        "versionName": "1.0.14",
         "vendor": "codex-remote",
         "buildOption": {
           "arkOptions": {
             "types": []
+          },
+          "strictMode": {
+            "useNormalizedOHMUrl": true
           }
         },
-        "targetSdkVersion": "6.0.2(22)"
+        "targetSdkVersion": "6.1.1(24)"
       }
     ]
   },
@@ -52,4 +55,3 @@
     }
   ]
 }
-

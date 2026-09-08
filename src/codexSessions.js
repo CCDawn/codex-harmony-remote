@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createLiveActivityEntry } from './codexLiveActivity.js';
 import { classifyCodexClientNotice, createCodexClientNoticeEntry } from './codexClientNotices.js';
+import { extractVisibleWorkspaceRoots, extractWorkspaceLabels } from './codexProjects.js';
 import { normalizeModelId, normalizeReasoningEffort } from './sessionSettingsStore.js';
 
 const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex');
@@ -37,6 +38,20 @@ export class CodexSessionStore {
       return desktopSessions;
     }
     return this.listSessionIndexSessions({ limit, query });
+  }
+
+  async decorateDesktopThreads(threads) {
+    const state = await readDesktopSidebarState(this.globalStatePath);
+    return threads.map((thread) => {
+      const projectRoot = normalizeWorkspaceRoot(state.threadWorkspaceHints[thread.id] ?? thread.projectRoot);
+      return {
+        ...thread,
+        pinned: thread.pinned || state.pinnedThreadIds.has(thread.id),
+        projectRoot,
+        projectLabel: projectRoot ? projectLabelForRoot(projectRoot, state.workspaceLabels) : '未归类',
+        sidebarSection: state.projectlessThreadIds.has(thread.id) ? 'recent' : 'project'
+      };
+    }).sort((a, b) => Number(b.pinned) - Number(a.pinned));
   }
 
   async listDesktopSidebarSessions({ limit = 50, query = '' } = {}) {
@@ -89,6 +104,7 @@ export class CodexSessionStore {
           relativeTime: formatRelativeTime(updatedAtMs),
           projectRoot,
           projectLabel: projectRoot.length > 0 ? projectLabelForRoot(projectRoot, sidebarState.workspaceLabels) : '未归类',
+          sidebarSection: sidebarState.projectlessThreadIds.has(id) ? 'recent' : 'project',
           source: 'desktop-sidebar',
           activitySource: runtime.runtimeSource,
           activityStatus: runtime.runtimeState,
@@ -122,7 +138,10 @@ export class CodexSessionStore {
   }
 
   async listSessionIndexSessions({ limit = 50, query = '' } = {}) {
-    const records = await readJsonl(this.sessionIndexPath);
+    const [records, sidebarState] = await Promise.all([
+      readJsonl(this.sessionIndexPath),
+      readDesktopSidebarState(this.globalStatePath)
+    ]);
     const latestById = new Map();
     for (const record of records) {
       if (!record.id) {
@@ -144,25 +163,30 @@ export class CodexSessionStore {
       })
       .sort((left, right) => String(right.updated_at ?? '').localeCompare(String(left.updated_at ?? '')))
       .slice(0, clampLimit(limit))
-      .map((record) => ({
-        id: String(record.id),
-        title: String(record.thread_name ?? '未命名会话'),
-        updatedAt: String(record.updated_at ?? ''),
-        relativeTime: '',
-        projectRoot: '',
-        projectLabel: '未归类',
-        source: 'session-index',
-        activitySource: 'unknown',
-        activityStatus: 'idle',
-        activityUpdatedAt: '',
-        runtimeState: 'idle',
-        runtimeSource: 'unknown',
-        runtimeUpdatedAt: '',
-        canInterrupt: false,
-        terminalReason: '',
-        pinned: false,
-        detailAvailable: true
-      }));
+      .map((record) => {
+        const id = String(record.id);
+        const projectRoot = normalizeWorkspaceRoot(sidebarState.threadWorkspaceHints[id] ?? '');
+        return {
+          id,
+          title: String(record.thread_name ?? '未命名会话'),
+          updatedAt: String(record.updated_at ?? ''),
+          relativeTime: '',
+          projectRoot,
+          projectLabel: projectRoot.length > 0 ? projectLabelForRoot(projectRoot, sidebarState.workspaceLabels) : '未归类',
+          sidebarSection: sidebarState.projectlessThreadIds.has(id) ? 'recent' : 'project',
+          source: 'session-index',
+          activitySource: 'unknown',
+          activityStatus: 'idle',
+          activityUpdatedAt: '',
+          runtimeState: 'idle',
+          runtimeSource: 'unknown',
+          runtimeUpdatedAt: '',
+          canInterrupt: false,
+          terminalReason: '',
+          pinned: sidebarState.pinnedThreadIds.has(id),
+          detailAvailable: true
+        };
+      });
   }
 
   async getSessionReasoningEffort(sessionId) {
@@ -518,14 +542,10 @@ export class CodexSessionStore {
     const archivedThreadCount = await this.archiveThreadRecord(sessionId);
     const removedIndexRecords = await this.removeSessionIndexRecords(sessionId);
     const removedGlobalStateEntries = await this.removeThreadFromGlobalState(sessionId);
+    const preservedFiles = [...files];
     const deletedFiles = [];
 
-    for (const filePath of files) {
-      await fs.rm(filePath, { force: true });
-      deletedFiles.push(filePath);
-    }
-
-    if (deletedFiles.length === 0 && archivedThreadCount === 0 && removedIndexRecords === 0 && removedGlobalStateEntries === 0) {
+    if (preservedFiles.length === 0 && archivedThreadCount === 0 && removedIndexRecords === 0 && removedGlobalStateEntries === 0) {
       const error = new Error('未找到可删除的 Codex 会话');
       error.statusCode = 404;
       throw error;
@@ -534,6 +554,7 @@ export class CodexSessionStore {
     return {
       id: sessionId,
       deletedFiles,
+      preservedFiles,
       archivedThreadCount,
       removedIndexRecords,
       removedGlobalStateEntries,
@@ -718,14 +739,11 @@ async function readDesktopSidebarState(filePath) {
     parsed = {};
   }
   return {
-    workspaceLabels: normalizeKeyedPaths(parsed['electron-workspace-root-labels'] ?? {}),
+    workspaceLabels: extractWorkspaceLabels(parsed),
     threadWorkspaceHints: parsed['thread-workspace-root-hints'] ?? {},
     pinnedThreadIds: new Set(Array.isArray(parsed['pinned-thread-ids']) ? parsed['pinned-thread-ids'].map(String) : []),
     projectlessThreadIds: new Set(Array.isArray(parsed['projectless-thread-ids']) ? parsed['projectless-thread-ids'].map(String) : []),
-    visibleWorkspaceRoots: new Set([
-      ...normalizePathArray(parsed['electron-saved-workspace-roots'] ?? []),
-      ...normalizePathArray(parsed['project-order'] ?? [])
-    ])
+    visibleWorkspaceRoots: new Set(extractVisibleWorkspaceRoots(parsed))
   };
 }
 
@@ -1756,6 +1774,7 @@ function summarizeToolRun(entries, options = {}) {
     return null;
   }
   const last = entries.at(-1);
+  const toolItems = summarizeToolRunItems(entries);
   const completedCount = entries.filter(isCompletedToolResultEntry).reduce((sum, entry) => {
     const match = firstLine(entry.text).match(/^已运行\s+(\d+)\s+条命令$/);
     return sum + Number.parseInt(match?.[1] ?? '0', 10);
@@ -1768,14 +1787,20 @@ function summarizeToolRun(entries, options = {}) {
       type: 'tool_result',
       role: 'tool',
       text: details.length > 0 ? `${summary}\n\n${details}` : summary,
+      toolItems,
       syncStartOffset: entries[0].syncStartOffset,
       syncEndOffset: last.syncEndOffset
     };
   }
   if (!shouldKeepPendingToolRunActive(last, options)) {
-    return summarizeStalePendingToolRun(entries);
+    return summarizeStalePendingToolRun(entries, toolItems);
   }
-  return last;
+  return {
+    ...last,
+    toolItems,
+    syncStartOffset: entries[0].syncStartOffset,
+    syncEndOffset: last.syncEndOffset
+  };
 }
 
 function shouldKeepPendingToolRunActive(lastEntry, options = {}) {
@@ -1790,10 +1815,15 @@ function shouldKeepPendingToolRunActive(lastEntry, options = {}) {
   return timestamp.length === 0 || timestamp >= activeAfter;
 }
 
-function summarizeStalePendingToolRun(entries) {
+function summarizeStalePendingToolRun(entries, toolItems = summarizeToolRunItems(entries)) {
   const last = entries.at(-1);
   if (!last || last.type !== 'tool_call') {
-    return last ?? null;
+    return last ? {
+      ...last,
+      toolItems,
+      syncStartOffset: entries[0]?.syncStartOffset,
+      syncEndOffset: last.syncEndOffset
+    } : null;
   }
   const command = commandFromToolCallText(last.text);
   const detail = command.length > 0 ? `\n\n${command}` : '';
@@ -1801,7 +1831,10 @@ function summarizeStalePendingToolRun(entries) {
     ...last,
     type: 'tool_result',
     role: 'tool',
-    text: `命令未返回，已停止跟踪${detail}`
+    text: `命令未返回，已停止跟踪${detail}`,
+    toolItems: toolItems.map((item) => item.status === 'running' ? { ...item, status: 'stopped' } : item),
+    syncStartOffset: entries[0]?.syncStartOffset,
+    syncEndOffset: last.syncEndOffset
   };
 }
 
@@ -1853,6 +1886,50 @@ function summarizeToolRunDetails(entries) {
   return visibleDetails.join('\n');
 }
 
+function summarizeToolRunItems(entries) {
+  const items = [];
+  const itemIndexesByCallId = new Map();
+  for (const entry of entries) {
+    if (entry.type === 'tool_call') {
+      for (const sourceItem of Array.isArray(entry.toolItems) ? entry.toolItems : []) {
+        const item = { ...sourceItem };
+        const itemIndex = items.length;
+        items.push(item);
+        if (String(entry.toolCallId ?? '').length > 0) {
+          itemIndexesByCallId.set(String(entry.toolCallId), itemIndex);
+        }
+      }
+      continue;
+    }
+    if (entry.type !== 'tool_result') {
+      continue;
+    }
+    const callId = String(entry.toolCallId ?? '');
+    let itemIndex = callId.length > 0 ? itemIndexesByCallId.get(callId) : undefined;
+    if (!Number.isInteger(itemIndex)) {
+      itemIndex = items.findIndex((item) => item.status === 'running');
+    }
+    if (!Number.isInteger(itemIndex) || itemIndex < 0) {
+      continue;
+    }
+    const item = items[itemIndex];
+    items[itemIndex] = {
+      ...item,
+      detail: String(entry.toolOutputDetail ?? '').trim(),
+      status: toolResultStatus(entry)
+    };
+  }
+  return items.slice(0, 50);
+}
+
+function toolResultStatus(entry) {
+  const detail = String(entry.toolOutputDetail ?? entry.text ?? '');
+  if (/(?:Exit code:|Process exited with code)\s*[1-9]\d*/i.test(detail)) {
+    return 'failed';
+  }
+  return 'completed';
+}
+
 function commandFromToolCallText(text) {
   const value = String(text ?? '').trim();
   const commandPrefix = '正在执行 ';
@@ -1873,6 +1950,9 @@ function firstLine(text) {
 
 function isDuplicateVisibleMessage(left, right) {
   if (left.role !== right.role) {
+    return false;
+  }
+  if (left.role === 'tool') {
     return false;
   }
   const leftText = normalizeMessageForDedupe(left.text);
@@ -2011,7 +2091,9 @@ function summarizeRecord(record, options = {}) {
         timestamp,
         type: 'tool_call',
         role: 'tool',
-        text: summary
+        text: summary,
+        toolCallId: toolCallId(payload),
+        toolItems: [createToolCallItem(payload, timestamp)]
       } : null;
     }
     if (itemType === 'function_call_output') {
@@ -2020,7 +2102,9 @@ function summarizeRecord(record, options = {}) {
         timestamp,
         type: 'tool_result',
         role: 'tool',
-        text: summary
+        text: summary,
+        toolCallId: toolCallId(payload),
+        toolOutputDetail: summarizeFunctionCallOutputDetail(payload, summary)
       } : null;
     }
     if (itemType === 'reasoning') {
@@ -2403,6 +2487,117 @@ function summarizeFunctionCall(payload) {
   return '正在调用工具';
 }
 
+function toolCallId(payload) {
+  return String(payload.call_id ?? payload.callId ?? '').trim();
+}
+
+function createToolCallItem(payload, timestamp) {
+  const name = String(payload.name ?? '').trim() || 'tool';
+  const presentation = functionCallPresentation(payload);
+  return {
+    id: toolCallId(payload) || `${name}-${timestamp}`,
+    name,
+    verb: presentation.verb,
+    target: presentation.target,
+    detail: '',
+    status: 'running'
+  };
+}
+
+function functionCallPresentation(payload) {
+  const name = String(payload.name ?? '').trim();
+  const normalizedName = name.toLowerCase();
+  const argumentsValue = parseFunctionArguments(payload.arguments);
+
+  if (normalizedName === 'exec_command' || normalizedName === 'shell_command' || normalizedName === 'command') {
+    return {
+      verb: 'Ran',
+      target: truncateInline(rawCommandFromFunctionArguments(payload.arguments) || name || 'command', 1200)
+    };
+  }
+  if (normalizedName === 'apply_patch' || normalizedName.includes('edit') || normalizedName.includes('write')) {
+    return {
+      verb: 'Edited',
+      target: truncateInline(patchTarget(argumentsValue) || argumentTarget(argumentsValue) || name || 'working tree', 1200)
+    };
+  }
+  if (normalizedName === 'view_image') {
+    return {
+      verb: 'Viewed',
+      target: truncateInline(argumentTarget(argumentsValue) || 'image', 1200)
+    };
+  }
+  if (normalizedName.includes('search') || normalizedName.includes('find') || normalizedName.includes('grep') || normalizedName.includes('query')) {
+    return {
+      verb: 'Searched',
+      target: truncateInline(searchTarget(argumentsValue) || name || 'search', 1200)
+    };
+  }
+  if (normalizedName.includes('read') || normalizedName.includes('open') || normalizedName.includes('get_file')) {
+    return {
+      verb: 'Read',
+      target: truncateInline(argumentTarget(argumentsValue) || name || 'resource', 1200)
+    };
+  }
+  if (normalizedName.includes('imagegen') || normalizedName.includes('image_gen') || normalizedName.includes('generate_image')) {
+    return {
+      verb: 'Generated',
+      target: truncateInline(argumentTarget(argumentsValue) || 'image', 1200)
+    };
+  }
+  return {
+    verb: 'Called',
+    target: truncateInline(argumentTarget(argumentsValue) || name || 'tool', 1200)
+  };
+}
+
+function parseFunctionArguments(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value;
+  }
+  try {
+    const parsed = JSON.parse(String(value ?? '{}'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function patchTarget(argumentsValue) {
+  const patch = String(argumentsValue.patch ?? argumentsValue.input ?? argumentsValue.diff ?? '');
+  const match = patch.match(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/m);
+  return String(match?.[1] ?? '').trim();
+}
+
+function searchTarget(argumentsValue) {
+  const direct = String(
+    argumentsValue.query
+      ?? argumentsValue.q
+      ?? argumentsValue.pattern
+      ?? argumentsValue.search
+      ?? ''
+  ).trim();
+  if (direct.length > 0) {
+    return direct;
+  }
+  const queries = argumentsValue.search_query;
+  if (Array.isArray(queries) && queries.length > 0) {
+    return String(queries[0]?.q ?? queries[0]?.query ?? '').trim();
+  }
+  return argumentTarget(argumentsValue);
+}
+
+function argumentTarget(argumentsValue) {
+  const directKeys = ['path', 'file', 'filePath', 'file_path', 'uri', 'url', 'ref_id', 'resource', 'title'];
+  for (const key of directKeys) {
+    const value = String(argumentsValue[key] ?? '').trim();
+    if (value.length > 0) {
+      return value;
+    }
+  }
+  return '';
+}
+
 function summarizeFunctionCallOutput(payload, options = {}) {
   if (Array.isArray(payload.output)) {
     const imageMarkdown = options.includeImageMarkdown === true
@@ -2424,11 +2619,25 @@ function summarizeFunctionCallOutput(payload, options = {}) {
   return '工具调用完成';
 }
 
+function summarizeFunctionCallOutputDetail(payload, summary) {
+  if (typeof payload.output === 'string') {
+    const detail = summarizeToolOutput(payload.output);
+    if (detail.length > 0) {
+      return detail;
+    }
+  }
+  return toolResultDetailText(summary) || firstLine(summary);
+}
+
 function commandFromFunctionArguments(value) {
+  return truncateInline(rawCommandFromFunctionArguments(value), 110);
+}
+
+function rawCommandFromFunctionArguments(value) {
   try {
     const parsed = JSON.parse(String(value ?? '{}'));
     const command = String(parsed.cmd ?? parsed.command ?? '').trim();
-    return truncateInline(command, 110);
+    return command;
   } catch {
     return '';
   }

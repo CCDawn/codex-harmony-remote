@@ -1,9 +1,10 @@
 import http from 'node:http';
+import { buildDesktopCdpWebSocketOptions } from '../src/codexDesktopCdpClient.js';
 
-const port = Number.parseInt(process.argv[2] ?? '9229', 10);
+const cdpPort = Number.parseInt(process.argv[2] ?? '9229', 10);
 
 async function main() {
-  const targets = await getJson(`http://127.0.0.1:${port}/json/list`);
+  const targets = await getJson(`http://127.0.0.1:${cdpPort}/json/list`);
   const summaries = [];
 
   for (const target of targets) {
@@ -86,7 +87,7 @@ class CdpClient {
   }
 
   static async connect(url) {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, [], buildDesktopCdpWebSocketOptions(cdpPort));
     await new Promise((resolve, reject) => {
       socket.onopen = resolve;
       socket.onerror = reject;

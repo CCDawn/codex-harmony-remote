@@ -1,5 +1,6 @@
-import { CodexDesktopCdpClient } from './codexDesktopCdpClient.js';
+import { CodexDesktopCdpClient, isRetryableCdpTransportError } from './codexDesktopCdpClient.js';
 import { classifyCodexClientNotice, formatCodexClientNoticeText } from './codexClientNotices.js';
+import { extractLocalImageInputs } from './codexTurnInput.js';
 import { CodexSessionStore } from './codexSessions.js';
 import {
   buildSessionSnapshot,
@@ -36,7 +37,31 @@ export class CodexDesktopCdpAdapter {
       10
     );
     this.postSubmitAckReconcileMs = Number.parseInt(
-      options.postSubmitAckReconcileMs ?? process.env.CODEX_BRIDGE_POST_SUBMIT_ACK_RECONCILE_MS ?? '8000',
+      options.postSubmitAckReconcileMs ?? process.env.CODEX_BRIDGE_POST_SUBMIT_ACK_RECONCILE_MS ?? '30000',
+      10
+    );
+    this.postResumeCdpRecoveryTimeoutMs = Number.parseInt(
+      options.postResumeCdpRecoveryTimeoutMs
+        ?? process.env.CODEX_BRIDGE_POST_RESUME_CDP_RECOVERY_TIMEOUT_MS
+        ?? '15000',
+      10
+    );
+    this.postResumeCdpRecoveryIntervalMs = Number.parseInt(
+      options.postResumeCdpRecoveryIntervalMs
+        ?? process.env.CODEX_BRIDGE_POST_RESUME_CDP_RECOVERY_INTERVAL_MS
+        ?? '250',
+      10
+    );
+    this.postResumeCdpStablePasses = Number.parseInt(
+      options.postResumeCdpStablePasses
+        ?? process.env.CODEX_BRIDGE_POST_RESUME_CDP_STABLE_PASSES
+        ?? '2',
+      10
+    );
+    this.resumeAckTimeoutMs = Number.parseInt(
+      options.resumeAckTimeoutMs
+        ?? process.env.CODEX_BRIDGE_DESKTOP_RESUME_ACK_TIMEOUT_MS
+        ?? '5000',
       10
     );
     this.interruptTurnLookupTimeoutMs = Number.parseInt(
@@ -77,6 +102,12 @@ export class CodexDesktopCdpAdapter {
         ?? '3',
       10
     );
+    this.threadPollFailureReportThreshold = Math.max(2, Number.parseInt(
+      options.threadPollFailureReportThreshold
+        ?? process.env.CODEX_BRIDGE_THREAD_POLL_FAILURE_REPORT_THRESHOLD
+        ?? '2',
+      10
+    ) || 2);
   }
 
   async probe() {
@@ -85,6 +116,35 @@ export class CodexDesktopCdpAdapter {
 
   async getCurrentConversationId() {
     return this.client.getCurrentConversationId();
+  }
+
+  async openDesktopThread(sessionId) {
+    return this.client.openDesktopThread(sessionId);
+  }
+
+  async archiveThread(sessionId) {
+    return this.client.request('thread/archive', {
+      threadId: sessionId
+    });
+  }
+
+  listThreads(params) {
+    return this.client.request('thread/list', params);
+  }
+
+  async listThreadRuntimeStates({ limit = 500 } = {}) {
+    const response = await this.client.request('thread/list', {
+      archived: false,
+      limit: Math.max(1, Math.min(Number(limit) || 500, 500)),
+      sortKey: 'updated_at',
+      sortDirection: 'desc'
+    });
+    const threads = Array.isArray(response)
+      ? response
+      : (response?.data ?? response?.threads ?? []);
+    return threads
+      .map((thread) => desktopThreadRuntimeState(thread))
+      .filter((state) => state.threadId.length > 0);
   }
 
   close() {
@@ -109,7 +169,8 @@ export class CodexDesktopCdpAdapter {
         return {
           verified: true,
           source: 'thread_read',
-          reason: 'desktop app-server thread/read confirmed target session'
+          reason: 'desktop app-server thread/read confirmed target session',
+          thread: detail.thread
         };
       }
     } catch {
@@ -138,13 +199,25 @@ export class CodexDesktopCdpAdapter {
     let turnSubmitted = false;
 
     try {
-      const thread = task.codexSessionId
+      const prepared = task.codexSessionId
         ? await this.prepareExistingThread(task, project, emit)
-        : await this.startThread(task, project, emit);
+        : {
+            thread: await this.startThread(task, project, emit),
+            resumed: true
+          };
+      const thread = prepared.thread;
       const sessionFileCursor = task.codexSessionId
         ? await this.captureSessionFileCursor(task, emit)
         : null;
-      await this.clearDesktopNotificationNoise(thread.id, emit);
+      const noiseClear = await this.clearDesktopNotificationNoise(thread.id, emit);
+      if (!noiseClear.ok && noiseClear.transportError && prepared.resumed) {
+        await this.waitForPostResumeCdpRecovery(thread.id, emit);
+      } else if (!noiseClear.ok && noiseClear.transportError) {
+        emit('codex.desktop_live.noise_clear_ignored_current', {
+          threadId: thread.id,
+          message: '当前桌面会话未执行恢复或重载；忽略通知清理的瞬时 CDP 错误，继续通过 app-server 提交消息。'
+        });
+      }
       notificationPolling = this.startNotificationPolling(thread.id, notifications, emit);
 
       emit('codex.desktop_sync', {
@@ -244,6 +317,40 @@ export class CodexDesktopCdpAdapter {
     } finally {
       notificationPolling?.stop?.();
     }
+  }
+
+  async steer({ task, prompt, emit }) {
+    const threadId = task.codexSessionId || task.createdCodexSessionId;
+    const turnId = task.activeCodexTurnId || await this.findActiveTurnId(threadId, emit);
+    if (!threadId || !turnId) {
+      const error = new Error('当前回合已经结束，无法追加引导消息。');
+      error.statusCode = 409;
+      error.code = 'CODEX_STEER_NO_ACTIVE_TURN';
+      error.safeToFallback = true;
+      throw error;
+    }
+    const text = String(prompt ?? '').trim();
+    const input = [{
+      type: 'text',
+      text,
+      text_elements: []
+    }, ...extractLocalImageInputs(text)];
+    const response = await this.client.request('turn/steer', {
+      threadId,
+      input,
+      expectedTurnId: turnId
+    });
+    emit('codex.app_server.turn.steered', sanitize({
+      threadId,
+      turnId: response?.turnId ?? turnId,
+      inputCount: input.length
+    }));
+    return {
+      accepted: true,
+      threadId,
+      turnId: response?.turnId ?? turnId,
+      response
+    };
   }
 
   async completeDesktopTurnResult({ thread, task, completed, sessionFileCursor, emit }) {
@@ -676,6 +783,7 @@ export class CodexDesktopCdpAdapter {
     let lastReadAt = 0;
     let lastFilePollAt = 0;
     let lastPollFailureMessage = '';
+    let consecutiveThreadPollFailures = 0;
     let latestOfficialTurnStatus = '';
     let latestOfficialThreadStatus = '';
     let promptPersisted = false;
@@ -771,6 +879,8 @@ export class CodexDesktopCdpAdapter {
             threadId,
             includeTurns: true
           });
+          consecutiveThreadPollFailures = 0;
+          lastPollFailureMessage = '';
           const polledTurn = findTurn(detail.thread, turnId);
           latestOfficialTurnStatus = normalizeDesktopRuntimeStatus(polledTurn?.status ?? '');
           latestOfficialThreadStatus = normalizeDesktopRuntimeStatus(detail.thread?.status ?? '');
@@ -807,8 +917,14 @@ export class CodexDesktopCdpAdapter {
             throw error;
           }
           const message = error instanceof Error ? error.message : String(error);
-          if (message !== lastPollFailureMessage) {
-            emit('codex.desktop_live.thread_poll_failed', { message });
+          consecutiveThreadPollFailures += 1;
+          if (consecutiveThreadPollFailures >= this.threadPollFailureReportThreshold
+            && message !== lastPollFailureMessage) {
+            emit('codex.desktop_live.thread_poll_failed', {
+              message,
+              failures: consecutiveThreadPollFailures,
+              diagnosticOnly: true
+            });
             lastPollFailureMessage = message;
           }
         }
@@ -1175,7 +1291,7 @@ export class CodexDesktopCdpAdapter {
         reason: 'shared notification polling is active',
         activeSubscriptions: this.notificationSubscriptions.size
       });
-      return;
+      return { ok: true, skipped: true };
     }
     try {
       const cleared = await this.drainDesktopNotifications();
@@ -1185,9 +1301,79 @@ export class CodexDesktopCdpAdapter {
       if (ignoredCount > 0) {
         emit('codex.desktop_live.noise_cleared', { ignoredCount });
       }
+      return { ok: true, skipped: false };
     } catch (error) {
       emit('codex.desktop_live.noise_clear_failed', { message: error.message });
+      return {
+        ok: false,
+        transportError: isRetryableCdpTransportError(error),
+        error
+      };
     }
+  }
+
+  async waitForPostResumeCdpRecovery(threadId, emit) {
+    const timeoutMs = Math.max(0, Number.isFinite(this.postResumeCdpRecoveryTimeoutMs)
+      ? this.postResumeCdpRecoveryTimeoutMs
+      : 15000);
+    const intervalMs = Math.max(0, Number.isFinite(this.postResumeCdpRecoveryIntervalMs)
+      ? this.postResumeCdpRecoveryIntervalMs
+      : 250);
+    const stablePasses = Math.max(1, Number.isFinite(this.postResumeCdpStablePasses)
+      ? this.postResumeCdpStablePasses
+      : 2);
+    const startedAt = Date.now();
+    let attempts = 0;
+    let consecutivePasses = 0;
+    let lastError = null;
+
+    emit('codex.desktop_live.post_resume_recovery_started', {
+      threadId,
+      timeoutMs,
+      stablePasses,
+      message: '检测到恢复会话后的桌面重载，正在等待 CDP 通道稳定后再发送手机消息。'
+    });
+
+    while (true) {
+      attempts += 1;
+      try {
+        await this.drainDesktopNotifications();
+        consecutivePasses += 1;
+        if (consecutivePasses >= stablePasses) {
+          emit('codex.desktop_live.post_resume_recovered', {
+            threadId,
+            attempts,
+            stablePasses,
+            elapsedMs: Date.now() - startedAt,
+            message: 'Codex 桌面重载已稳定，继续提交手机消息。'
+          });
+          return;
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        consecutivePasses = 0;
+        if (!isRetryableCdpTransportError(lastError)) {
+          throw lastError;
+        }
+      }
+
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs >= timeoutMs) {
+        break;
+      }
+      await sleep(Math.min(intervalMs, Math.max(0, timeoutMs - elapsedMs)));
+    }
+
+    const detail = lastError?.message ?? 'CDP 通道未连续通过稳定性检查';
+    const error = new Error(`Codex 桌面恢复会话后 CDP 未稳定：${detail}`);
+    emit('codex.desktop_live.post_resume_recovery_failed', {
+      threadId,
+      attempts,
+      stablePasses,
+      elapsedMs: Date.now() - startedAt,
+      message: error.message
+    });
+    throw error;
   }
 
   taskModel(task = {}) {
@@ -1225,14 +1411,32 @@ export class CodexDesktopCdpAdapter {
     if (!verified.verified) {
       throw new Error(`Codex 桌面端未确认目标会话，已阻止发送：${verified.reason}`);
     }
+    const currentDesktopSession = isVerifiedCurrentDesktopSession(task, verified);
     emit('codex.desktop_host.session.verified', {
       sessionId: task.codexSessionId,
       source: verified.source ?? 'unknown',
-      message: verified.source === 'host_manager'
+      message: currentDesktopSession
+        ? '已确认手机目标就是桌面当前会话，直接发送，不重复恢复或重载当前会话。'
+        : verified.source === 'host_manager'
         ? '已通过 Codex 桌面官方会话管理器确认历史会话，正在先恢复会话再发送。'
         : '已通过 Codex 桌面官方会话通道确认目标会话，正在先恢复会话再发送。'
     });
-    return this.resumeThread(task, project, emit, verified);
+    if (currentDesktopSession) {
+      emit('codex.app_server.thread.resume_skipped_current', {
+        threadId: task.codexSessionId,
+        currentSessionId: task.verifiedDesktopStatus.currentSessionId,
+        source: verified.source,
+        message: '目标会话已在桌面端打开且通过实时 thread/read 校验，已跳过会触发渲染进程重载的 thread/resume。'
+      });
+      return {
+        thread: verified.thread,
+        resumed: false
+      };
+    }
+    return {
+      thread: await this.resumeThread(task, project, emit, verified),
+      resumed: true
+    };
   }
 
   async startTurn(thread, task) {
@@ -1257,7 +1461,7 @@ export class CodexDesktopCdpAdapter {
 
   async resumeThread(task, project, emit, verified = {}) {
     try {
-      const response = await this.client.request('thread/resume', {
+      const response = await withThreadResumeAckTimeout(this.client.request('thread/resume', {
         threadId: task.codexSessionId,
         cwd: null,
         approvalPolicy: this.approvalPolicy,
@@ -1266,7 +1470,7 @@ export class CodexDesktopCdpAdapter {
         modelProvider: null,
         config: null,
         serviceTier: null
-      });
+      }), this.resumeAckTimeoutMs);
       emit('codex.app_server.thread.resumed', summarizeThreadForEvent(response));
       return response.thread;
     } catch (error) {
@@ -1354,11 +1558,30 @@ function normalizeReasoningEffort(value) {
   return ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(text) ? text : null;
 }
 
+function isVerifiedCurrentDesktopSession(task, verified) {
+  const sessionId = String(task?.codexSessionId ?? '').trim();
+  const status = task?.verifiedDesktopStatus ?? {};
+  const currentSessionId = String(status.currentSessionId ?? status.preflight?.currentSessionId ?? '').trim();
+  const targetSessionId = String(status.targetSessionId ?? status.preflight?.targetSessionId ?? sessionId).trim();
+  return Boolean(
+    sessionId
+    && verified?.source === 'thread_read'
+    && verified?.thread
+    && status.sessionVerified === true
+    && currentSessionId === sessionId
+    && targetSessionId === sessionId
+  );
+}
+
 function isDesktopScriptTimeout(error) {
   if (!error || typeof error !== 'object') {
     return false;
   }
-  if (error.code === 'DESKTOP_SCRIPT_APP_SERVER_TIMEOUT' || error.code === 'DESKTOP_SCRIPT_HOST_TIMEOUT') {
+  if (
+    error.code === 'DESKTOP_SCRIPT_APP_SERVER_TIMEOUT'
+    || error.code === 'DESKTOP_SCRIPT_HOST_TIMEOUT'
+    || error.code === 'DESKTOP_THREAD_RESUME_ACK_TIMEOUT'
+  ) {
     return true;
   }
   return /等待桌面脚本桥.*响应超时/.test(String(error.message ?? ''));
@@ -1378,6 +1601,26 @@ function isRecoverablePostSubmitAckError(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withThreadResumeAckTimeout(request, timeoutMs) {
+  const boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5000;
+  let timeoutId;
+  try {
+    return await Promise.race([
+      request,
+      new Promise((resolve, reject) => {
+        timeoutId = setTimeout(() => {
+          const error = new Error(`等待 Codex 桌面 thread/resume 确认超时（${boundedTimeoutMs}ms）`);
+          error.code = 'DESKTOP_THREAD_RESUME_ACK_TIMEOUT';
+          error.method = 'thread/resume';
+          reject(error);
+        }, boundedTimeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 function buildSessionFileCompletedTurn({ threadId, turnId, filePath = '', userText, assistantText, status = 'completed' }) {
@@ -1805,6 +2048,46 @@ function summarizeSessionRecord(record) {
   }
 
   return null;
+}
+
+function desktopThreadRuntimeState(thread) {
+  const rawStatus = typeof thread?.status === 'object'
+    ? String(thread.status?.type ?? '')
+    : String(thread?.status ?? '');
+  const activeFlags = Array.isArray(thread?.status?.activeFlags)
+    ? thread.status.activeFlags.map((flag) => String(flag).toLowerCase())
+    : [];
+  const joinedFlags = activeFlags.join(' ');
+  let state = 'idle';
+  if (rawStatus.toLowerCase() === 'active') {
+    if (joinedFlags.includes('approval')) {
+      state = 'waiting_approval';
+    } else if (joinedFlags.includes('input') || joinedFlags.includes('question')) {
+      state = 'waiting_input';
+    } else if (joinedFlags.includes('recover') || joinedFlags.includes('compact')) {
+      state = 'recovering';
+    } else {
+      state = 'running';
+    }
+  }
+  return {
+    threadId: String(thread?.id ?? thread?.threadId ?? '').trim(),
+    state,
+    updatedAt: desktopThreadUpdatedAt(thread?.updatedAt ?? thread?.updated_at),
+    source: 'desktop-app-server',
+    activeTurnId: String(thread?.activeTurnId ?? thread?.turnId ?? '').trim(),
+    canInterrupt: state !== 'idle'
+  };
+}
+
+function desktopThreadUpdatedAt(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    const milliseconds = numeric > 1000000000000 ? numeric : numeric * 1000;
+    return new Date(milliseconds).toISOString();
+  }
+  const parsed = Date.parse(String(value ?? ''));
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : '';
 }
 
 function extractRecordText(record) {

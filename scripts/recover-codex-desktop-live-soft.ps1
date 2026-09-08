@@ -9,6 +9,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Resolve-CompatiblePowerShellHost {
+  $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentHost -and -not [string]::IsNullOrWhiteSpace([string]$currentHost.Path) -and (Test-Path -LiteralPath ([string]$currentHost.Path))) {
+    return [string]$currentHost.Path
+  }
+
+  $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source) -and (Test-Path -LiteralPath ([string]$pwsh.Source))) {
+    return [string]$pwsh.Source
+  }
+
+  throw '未找到可用的 PowerShell 主机'
+}
+
+$powerShellHostPath = Resolve-CompatiblePowerShellHost
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $BridgeUrl = $BridgeUrl.TrimEnd('/')
 
@@ -242,7 +258,7 @@ $hostCommand = @"
 `$env:CODEX_DESKTOP_CDP_PORT='$selectedCdpPort'
 node .\scripts\start-desktop-cdp-live-host.mjs
 "@
-Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+Start-Process -WindowStyle Hidden -FilePath $powerShellHostPath -ArgumentList @(
   '-NoProfile',
   '-ExecutionPolicy', 'Bypass',
   '-Command', $hostCommand

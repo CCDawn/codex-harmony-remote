@@ -7,6 +7,18 @@ function readScript(relativePath) {
   return fs.readFileSync(path.resolve(relativePath), 'utf8');
 }
 
+test('direct Windows PowerShell startup entrypoints keep a UTF-8 BOM for Chinese diagnostics', () => {
+  for (const filePath of [
+    'scripts/agent/start-stack-interactive.ps1',
+    'scripts/agent/start-stack.ps1',
+    'scripts/start-codex-mobile-stack.ps1',
+    'tools/harmony/deploy.ps1'
+  ]) {
+    const prefix = fs.readFileSync(path.resolve(filePath)).subarray(0, 3);
+    assert.deepEqual([...prefix], [0xef, 0xbb, 0xbf], filePath);
+  }
+});
+
 test('startup stack preserves bridge token for desktop live recovery paths', () => {
   const text = readScript('scripts/start-codex-mobile-stack.ps1');
 
@@ -15,6 +27,95 @@ test('startup stack preserves bridge token for desktop live recovery paths', () 
   assert.match(text, /recover-codex-desktop-live-soft\.ps1/);
   assert.match(text, /restart-codex-desktop-live\.ps1/);
   assert.match(text, /Add-OptionalStringArgument -Arguments \$args -Name '-BridgeToken' -Value \$BridgeToken/);
+});
+
+test('startup stack reuses a compatible PowerShell host for child scripts', () => {
+  const text = readScript('scripts/start-codex-mobile-stack.ps1');
+
+  assert.match(text, /function Resolve-CompatiblePowerShellHost/);
+  assert.match(text, /\$script:PowerShellHostPath = Resolve-CompatiblePowerShellHost/);
+  assert.match(text, /-FilePath \$script:PowerShellHostPath/);
+  assert.match(text, /& \$script:PowerShellHostPath @args/);
+  assert.doesNotMatch(text, /-FilePath 'powershell\.exe'/);
+  assert.doesNotMatch(text, /& powershell\.exe @args/);
+});
+
+test('startup watchdogs reuse their current PowerShell host when recovering children', () => {
+  for (const filePath of [
+    'tools/harmony/watch-local-bridge.ps1',
+    'tools/harmony/watch-bridge-proxy.ps1',
+    'tools/harmony/watch-hdc-connection.ps1'
+  ]) {
+    const text = readScript(filePath);
+    assert.match(text, /\$powerShellHostPath = Resolve-CompatiblePowerShellHost/);
+    assert.match(text, /function Resolve-CompatiblePowerShellHost/);
+    assert.match(text, /-FilePath \$powerShellHostPath/);
+    assert.doesNotMatch(text, /-FilePath 'powershell\.exe'/);
+  }
+});
+
+test('remote main update reuses a compatible PowerShell host for its watcher and deploy', () => {
+  const text = readScript('tools/harmony/remote-update-main.ps1');
+
+  assert.match(text, /function Resolve-CompatiblePowerShellHost/);
+  assert.match(text, /\$powerShellHostPath = Resolve-CompatiblePowerShellHost/);
+  assert.match(text, /-FilePath \$powerShellHostPath/);
+  assert.match(text, /& \$powerShellHostPath @deployArgs/);
+  assert.doesNotMatch(text, /-FilePath 'powershell\.exe'/);
+  assert.doesNotMatch(text, /& powershell @deployArgs/);
+});
+
+test('relay connector reuses a compatible PowerShell host when restarting its local proxy', () => {
+  const text = readScript('tools/harmony/connect-relay-hdc.ps1');
+
+  assert.match(text, /function Resolve-CompatiblePowerShellHost/);
+  assert.match(text, /\$powerShellHostPath = Resolve-CompatiblePowerShellHost/);
+  assert.match(text, /-FilePath \$powerShellHostPath/);
+  assert.doesNotMatch(text, /-FilePath 'powershell(?:\.exe)?'/);
+});
+
+test('local bridge watchdog derives its token from config instead of a process argument', () => {
+  const stackText = readScript('scripts/start-codex-mobile-stack.ps1');
+  const watchdogText = readScript('tools/harmony/watch-local-bridge.ps1');
+  const start = stackText.indexOf('function Ensure-LocalBridgeWatchdog');
+  const end = stackText.indexOf('function Start-RelayProcess', start);
+  const watchdogStartBody = stackText.slice(start, end);
+
+  assert.match(watchdogText, /BridgeConfig\.ets/);
+  assert.match(watchdogText, /DEFAULT_BRIDGE_TOKEN/);
+  assert.doesNotMatch(watchdogStartBody, /-Name '-BridgeToken'/);
+});
+
+test('bridge proxy watchdog authenticates its local health probe from app config', () => {
+  const watchdogText = readScript('tools/harmony/watch-bridge-proxy.ps1');
+
+  assert.match(watchdogText, /BridgeConfig\.ets/);
+  assert.match(watchdogText, /DEFAULT_BRIDGE_TOKEN/);
+  assert.match(watchdogText, /X-Codex-Bridge-Token/);
+});
+
+test('interactive desktop launcher preserves startup failures for diagnosis', () => {
+  const text = readScript('scripts/agent/start-stack-interactive.ps1');
+
+  assert.match(text, /& \$startScript -ForceRestart/);
+  assert.match(text, /desktop-launcher-transcript\.log/);
+  assert.match(text, /desktop-launcher-error\.log/);
+  assert.match(text, /catch \{/);
+  assert.match(text, /Read-Host '按 Enter 关闭窗口'/);
+  assert.match(text, /Codex 远程模式启动失败，窗口将保留/);
+});
+
+test('desktop startup targets the packaged ChatGPT shell instead of the Codex activation wrapper', () => {
+  const stackText = readScript('scripts/start-codex-mobile-stack.ps1');
+  const restartText = readScript('scripts/restart-codex-desktop-live.ps1');
+
+  assert.match(stackText, /OpenAI\\\.Codex_/);
+  assert.match(stackText, /ChatGPT\\\.exe/);
+  assert.match(stackText, /GetProcessesByName\('ChatGPT'\)/);
+  assert.match(restartText, /\$codexDesktopExe/);
+  assert.match(restartText, /Join-Path \$codexAppDir 'ChatGPT\.exe'/);
+  assert.match(restartText, /Start-Process -FilePath \$codexDesktopExe/);
+  assert.match(restartText, /OpenAI\\\.Codex_/);
 });
 
 test('startup stack prints final degraded status instead of hiding HDC failures', () => {
@@ -87,6 +188,10 @@ test('desktop live host launch scripts export bridge token', () => {
     assert.match(text, /\$env:CODEX_BRIDGE_TOKEN='\$BridgeToken'/);
     assert.match(text, /node \.\\scripts\\start-desktop-cdp-live-host\.mjs/);
     assert.match(text, /script bridge auth unhealthy|脚本桥认证异常|desktop script bridge auth unhealthy/);
+    assert.match(text, /function Resolve-CompatiblePowerShellHost/);
+    assert.match(text, /\$powerShellHostPath = Resolve-CompatiblePowerShellHost/);
+    assert.match(text, /-FilePath \$powerShellHostPath/);
+    assert.doesNotMatch(text, /-FilePath 'powershell\.exe'/);
   }
 });
 
@@ -151,4 +256,62 @@ test('safe deploy reads bridge defaults from app config when environment is empt
   assert.match(text, /DEFAULT_BRIDGE_URL/);
   assert.match(text, /DEFAULT_BRIDGE_TOKEN/);
   assert.match(text, /if \(\[string\]::IsNullOrWhiteSpace\(\$BridgeToken\)\)/);
+});
+
+test('startup stack defaults to the desktop-owned runtime and keeps independent App Server modes explicit', () => {
+  const stackText = readScript('scripts/start-codex-mobile-stack.ps1');
+  const agentText = readScript('scripts/agent/start-stack.ps1');
+  const watchdogText = readScript('tools/harmony/watch-local-bridge.ps1');
+  const lanText = readScript('scripts/start-bridge-lan.ps1');
+  const configText = readScript('src/config.js');
+  const appText = readScript('src/app.js');
+  const serverText = readScript('src/server.js');
+
+  assert.match(stackText, /\[string\]\$RuntimeMode = \$env:CODEX_BRIDGE_RUNTIME_MODE/);
+  assert.match(stackText, /\$RuntimeMode = 'desktop'/);
+  assert.match(stackText, /'desktop', 'desktop-primary', 'app-server-shadow', 'app-server-new-only', 'app-server-canary', 'app-server-primary'/);
+  assert.match(stackText, /CODEX_BRIDGE_RUNTIME_MODE='\$RuntimeMode'/);
+  assert.match(stackText, /Bridge 运行模式未生效: expected=\$RuntimeMode; actual=\$actualMode/);
+  assert.match(stackText, /function Set-AppServerRuntimeStartupStatus/);
+  assert.match(stackText, /桌面内嵌 App Server 为唯一所有者；独立 App Server 已禁用/);
+  assert.match(stackText, /App Server 状态=\$state/);
+  assert.match(stackText, /'desktop-primary' \{ @\('LocalBridge', 'AppServerRuntime', 'CodexDesktop', 'DesktopScript', 'SessionApi'\) \}/);
+  assert.match(stackText, /桌面实时主链路已启用，App Server 仅在发送前预检失败时兜底/);
+  assert.match(stackText, /function Ensure-DesktopLiveWatchdog/);
+  assert.match(stackText, /watch-desktop-live\.ps1/);
+  assert.match(agentText, /\$args\.RuntimeMode = \$RuntimeMode/);
+  assert.match(agentText, /\$RuntimeMode = 'desktop'/);
+  assert.match(watchdogText, /\$RuntimeMode = 'desktop'/);
+  assert.match(lanText, /\$RuntimeMode = 'desktop'/);
+  assert.match(configText, /CODEX_BRIDGE_RUNTIME_MODE \?\? 'desktop'/);
+  assert.match(appText, /process\.env\.CODEX_BRIDGE_RUNTIME_MODE[\s\S]*\?\? 'desktop'/);
+  assert.match(appText, /\]\.includes\(value\) \? value : 'desktop'/);
+  assert.match(serverText, /config\.appServerRuntimeMode \?\? 'desktop'/);
+  assert.match(appText, /codex\.thread\.message\.received/);
+  assert.match(appText, /submissionId/);
+  assert.match(watchdogText, /local bridge runtime mismatch/);
+});
+
+test('all desktop CDP helper scripts send the allow-listed websocket Origin', () => {
+  for (const relativePath of [
+    'scripts/connect-desktop-live.mjs',
+    'scripts/start-desktop-cdp-live-host.mjs',
+    'scripts/desktop-mcp-request.mjs',
+    'scripts/probe-desktop-cdp.mjs'
+  ]) {
+    const text = readScript(relativePath);
+    assert.match(text, /buildDesktopCdpWebSocketOptions/);
+    assert.match(text, /new WebSocket\(url, \[\], buildDesktopCdpWebSocketOptions\(cdpPort\)\)/);
+  }
+});
+
+test('desktop live watchdog only hard-starts Codex after the desktop shell is absent', () => {
+  const text = readScript('tools/harmony/watch-desktop-live.ps1');
+
+  assert.match(text, /DEFAULT_BRIDGE_TOKEN/);
+  assert.match(text, /recover-codex-desktop-live-soft\.ps1/);
+  assert.match(text, /restart-codex-desktop-live\.ps1/);
+  assert.match(text, /if \(\$shells\.Count -eq 0\)/);
+  assert.match(text, /普通 Codex 正在运行且没有 CDP；为保护当前桌面工作，不自动关闭它/);
+  assert.doesNotMatch(text, /Stop-CodexDesktopShell/);
 });

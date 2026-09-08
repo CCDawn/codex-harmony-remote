@@ -37,7 +37,7 @@ export class DesktopLiveDiagnostics {
     const script = [
       "$ErrorActionPreference='SilentlyContinue'",
       "$items = @(Get-CimInstance Win32_Process | Where-Object {",
-      "  $_.Name -eq 'Codex.exe' -or ([string]$_.CommandLine -match 'start-desktop-cdp-live-host\\.mjs')",
+      "  $_.Name -in @('Codex.exe', 'ChatGPT.exe') -or ([string]$_.CommandLine -match 'start-desktop-cdp-live-host\\.mjs')",
       "} | ForEach-Object {",
       "  [pscustomobject]@{",
       "    processId = [int]$_.ProcessId",
@@ -155,9 +155,20 @@ export function classifyDiagnostics(snapshot = {}, status = {}) {
 }
 
 function isCodexProcess(processInfo) {
-  const name = String(processInfo?.name ?? '');
+  const name = String(processInfo?.name ?? '').toLowerCase();
   const commandLine = String(processInfo?.commandLine ?? '');
-  return name.toLowerCase() === 'codex.exe' || /\\Codex\.exe/i.test(commandLine);
+  if (/\s--type=/.test(commandLine)) {
+    return false;
+  }
+  if (name === 'chatgpt.exe') {
+    return /\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe/i.test(commandLine);
+  }
+  if (name === 'codex.exe') {
+    return /\\app\\Codex\.exe/i.test(commandLine)
+      && !/\\app\\resources\\codex\.exe/i.test(commandLine)
+      && !/\bapp-server\b/i.test(commandLine);
+  }
+  return false;
 }
 
 function isLiveHostProcess(processInfo) {

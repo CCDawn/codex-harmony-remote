@@ -2,11 +2,52 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { stripTypeScriptTypes } from 'node:module';
 
 const indexPath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/pages/Index.ets');
+const contentActionServicePath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/ContentActionService.ets');
+const notificationServicePath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/AppNotificationService.ets');
+const desktopMonitorPanelPath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/components/DesktopMonitorPanel.ets');
+const desktopMonitorDisplayServicePath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/DesktopMonitorDisplayService.ets');
+const optimisticMessageServicePath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/OptimisticMessageService.ets');
+const sessionPresentationServicePath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/SessionPresentationService.ets');
+const bridgeModelsPath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/model/BridgeModels.ets');
+const entryAbilityPath = path.resolve('HarmonyCodexRemote/entry/src/main/ets/entryability/EntryAbility.ets');
+const moduleProfilePath = path.resolve('HarmonyCodexRemote/entry/src/main/module.json5');
+const backgroundRuntimeServicePath = path.resolve(
+  'HarmonyCodexRemote/entry/src/main/ets/services/AppBackgroundRuntimeService.ets'
+);
 
 function source() {
   return fs.readFileSync(indexPath, 'utf8');
+}
+
+function contentActionServiceSource() {
+  return fs.readFileSync(contentActionServicePath, 'utf8');
+}
+
+function entryAbilitySource() {
+  return fs.readFileSync(entryAbilityPath, 'utf8');
+}
+
+function optimisticMessageServiceSource() {
+  return fs.readFileSync(optimisticMessageServicePath, 'utf8');
+}
+
+function sessionPresentationServiceSource() {
+  return fs.readFileSync(sessionPresentationServicePath, 'utf8');
+}
+
+function bridgeModelsSource() {
+  return fs.readFileSync(bridgeModelsPath, 'utf8');
+}
+
+function moduleProfileSource() {
+  return fs.readFileSync(moduleProfilePath, 'utf8');
+}
+
+function backgroundRuntimeServiceSource() {
+  return fs.readFileSync(backgroundRuntimeServicePath, 'utf8');
 }
 
 function methodBody(name) {
@@ -55,8 +96,19 @@ test('session primary action sends drafts even when the session is interruptible
   assert.match(modeBody, /this\.shouldUseSessionInterruptAction\(\)[\s\S]*return 'interrupt'/);
   assert.match(modeBody, /this\.canSendSessionMessage\(\)[\s\S]*this\.hasRunningTaskForSession\(this\.selectedSession\.id\)[\s\S]*return 'guidance_send'/);
   assert.match(modeBody, /return 'disabled'/);
-  assert.match(colorBody, /mode === 'guidance_send'[\s\S]*return '#14853D'/);
-  assert.match(colorBody, /mode === 'disabled'[\s\S]*return '#8A95A3'/);
+  assert.match(colorBody, /mode === 'guidance_send'[\s\S]*return this\.themeColor\('#14853D'\)/);
+  assert.match(colorBody, /mode === 'disabled'[\s\S]*return this\.themeColor\('#8A95A3'\)/);
+});
+
+test('running sessions keep image, file, and desktop screenshot guidance attachments enabled', () => {
+  const imageBody = methodBody('canPickSessionImage()');
+  const fileBody = methodBody('canPickSessionFile()');
+  const screenshotBody = methodBody('canAttachDesktopScreenshotDraft()');
+
+  assert.doesNotMatch(imageBody, /hasBridgeRunningTaskForSession/);
+  assert.match(imageBody, /this\.isUploadingImage \|\| this\.isBusy/);
+  assert.match(fileBody, /!this\.isPickingFile && this\.canPickSessionImage\(\)/);
+  assert.match(screenshotBody, /this\.canPickSessionImage\(\)/);
 });
 
 test('selected running desktop session can interrupt through thread activity without a bridge task', () => {
@@ -72,6 +124,29 @@ test('selected running desktop session can interrupt through thread activity wit
   assert.match(selectedInterruptBody, /BridgeClient\.interruptCodexThread\(this\.normalizedBridgeUrl\(\), targetSessionId, this\.bridgeToken\)/);
 });
 
+test('session interrupt requires explicit confirmation and records the decision boundary', () => {
+  const composerBody = methodBody('SessionComposer()');
+  const confirmBody = methodBody('confirmSelectedSessionInterrupt()');
+
+  assert.match(composerBody, /this\.confirmSelectedSessionInterrupt\(\)/);
+  assert.doesNotMatch(composerBody, /void this\.interruptSelectedSessionTask\(\)/);
+  assert.match(confirmBody, /AlertDialog\.show\(\{/);
+  assert.match(confirmBody, /ui\.interrupt\.confirmation\.shown/);
+  assert.match(confirmBody, /ui\.interrupt\.confirmation\.cancelled/);
+  assert.match(confirmBody, /ui\.interrupt\.confirmation\.confirmed/);
+  assert.match(confirmBody, /void this\.interruptSelectedSessionTask\(\)/);
+});
+
+test('a draft remains sendable while the prior turn interrupt is being confirmed', () => {
+  const modeBody = methodBody('sessionPrimaryActionMode()');
+  const interruptingIndex = modeBody.indexOf('this.isInterruptingSelectedSessionTask()');
+  const sendableIndex = modeBody.indexOf('this.canSendSessionMessage()');
+
+  assert.ok(sendableIndex >= 0 && sendableIndex < interruptingIndex,
+    'draft sendability must be resolved before the interrupt-only loading state');
+  assert.match(modeBody, /this\.canSendSessionMessage\(\)[\s\S]*this\.hasRunningTaskForSession\(this\.selectedSession\.id\)[\s\S]*return 'guidance_send'/);
+});
+
 test('primary action loading state is scoped to the selected session', () => {
   const symbolBody = methodBody('SessionPrimaryActionSymbol()');
   const modeBody = methodBody('sessionPrimaryActionMode()');
@@ -82,6 +157,29 @@ test('primary action loading state is scoped to the selected session', () => {
   assert.match(modeBody, /this\.isSendingCurrentSessionMessage\(\)/);
   assert.match(modeBody, /this\.isInterruptingSelectedSessionTask\(\)/);
   assert.match(interruptingBody, /interruptingSessionTargetId/);
+});
+
+test('session sending is optimistic in the conversation and does not open a separate sending banner', () => {
+  const sourceText = source();
+  const optimisticSource = optimisticMessageServiceSource();
+  const panelBody = methodBody('SessionConversationPanel()');
+  const cardBody = methodBody('OptimisticSessionMessageCard(message: OptimisticSessionMessage)');
+  const sendBody = methodBody('sendMessageToSelectedSession(retryFailedMessageId: string = \'\'): Promise<boolean>');
+  const newSendBody = methodBody('sendNewSessionMessage(retryFailedMessageId: string = \'\'): Promise<boolean>');
+  const floatingBody = methodBody('shouldShowSessionFloatingStatus(): boolean');
+  const floatingTitleBody = methodBody('sessionFloatingStatusTitle(): string');
+
+  assert.match(optimisticSource, /export interface OptimisticSessionMessage/);
+  assert.match(optimisticSource, /export function appendOptimisticSessionMessage/);
+  assert.match(optimisticSource, /export function removeOptimisticSessionMessage/);
+  assert.match(sourceText, /@State optimisticSessionMessages: OptimisticSessionMessage\[\] = \[\]/);
+  assert.match(panelBody, /visibleOptimisticSessionMessages\(\)/);
+  assert.match(cardBody, /message\.text/);
+  assert.match(cardBody, /LoadingProgress\(\)/);
+  assert.ok(sendBody.indexOf('this.beginOptimisticSessionSend(') < sendBody.indexOf("await this.guard('sendSessionMessage'"));
+  assert.ok(newSendBody.indexOf('this.beginOptimisticSessionSend(') < newSendBody.indexOf("await this.guard('sendNewSessionMessage'"));
+  assert.doesNotMatch(floatingBody, /isSendingSessionMessage/);
+  assert.doesNotMatch(floatingTitleBody, /正在发送到 Codex/);
 });
 
 test('terminal task refresh locally suppresses stale running activity', () => {
@@ -99,6 +197,51 @@ test('task refresh ignores stale async results after current task is cleared', (
   assert.match(body, /this\.currentTask === null \|\| this\.currentTask\.id !== activeTaskId/);
   assert.match(body, /task\.refresh\.result_ignored/);
   assert.match(body, /task\.refresh\.missing_ignored/);
+});
+
+test('durable outbox tasks keep polling through the Codex run API and hand pending state to the real task', () => {
+  const refreshBody = methodBody('refreshTask()');
+  const routeBody = methodBody('taskUsesCodexRunApi(task: BridgeTask | BridgeTaskSummary): boolean');
+  const handoffBody = methodBody('handoffPendingSessionSend(previousTaskId: string, task: BridgeTask): void');
+  const sendBody = methodBody('sendMessageToSelectedSession(retryFailedMessageId: string = \'\'): Promise<boolean>');
+
+  assert.match(routeBody, /this\.taskUsesAppServer\(task\)/);
+  assert.match(routeBody, /task\.runtime\?\.kind === 'durable_outbox'/);
+  assert.match(refreshBody, /this\.taskUsesCodexRunApi\(activeTask\)/);
+  assert.match(refreshBody, /BridgeClient\.getCodexRun/);
+  assert.match(refreshBody, /this\.handoffPendingSessionSend\(activeTaskId, task\)/);
+  assert.match(handoffBody, /this\.pendingSessionSendsByTaskId\[previousTaskId\]/);
+  assert.match(handoffBody, /next\[task\.id\] = pending/);
+  assert.match(handoffBody, /this\.activeSessionTaskId === previousTaskId/);
+  assert.match(sendBody, /this\.currentTask\.runtime\?\.kind === 'durable_outbox'/);
+  assert.match(sendBody, /消息已排队，将在当前回合结束后按顺序自动发送/);
+});
+
+test('mobile negotiates Bridge compatibility and advances a monotonic task event cursor', () => {
+  const sourceText = source();
+  const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
+  const modelText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/model/BridgeModels.ets'), 'utf8');
+  const refreshBody = methodBody('refreshTask()');
+  const mergeBody = methodBody('mergeTaskEventPage(previous: BridgeTask, incoming: BridgeTask): BridgeTask');
+  const dashboardBody = methodBody('refreshDashboard(force: boolean = false): Promise<void>');
+  const contractBody = methodBody('requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean>');
+
+  assert.match(modelText, /export interface BridgeProtocolHandshake/);
+  assert.match(modelText, /eventCursor\?: number/);
+  assert.match(modelText, /eventGap\?: boolean/);
+  assert.match(clientText, /clientProtocol=/);
+  assert.match(clientText, /clientVersion=/);
+  assert.match(clientText, /afterSeq=/);
+  assert.match(clientText, /Bridge 协议不兼容/);
+  assert.match(refreshBody, /this\.currentTaskEventCursor\(activeTask\)/);
+  assert.match(refreshBody, /this\.mergeTaskEventPage\(activeTask, task\)/);
+  assert.match(mergeBody, /incoming\.eventGap === true/);
+  assert.match(mergeBody, /event\.id/);
+  assert.match(dashboardBody, /BridgeClient\.getRuntimeStatus/);
+  assert.match(dashboardBody, /lastRuntimeContractRefreshAt/);
+  assert.match(contractBody, /Bridge 协议不兼容/);
+  assert.match(contractBody, /throw new Error\(message\)/);
+  assert.match(sourceText, /task\.event_cursor\.gap/);
 });
 
 test('running session refresh uses task list and session activity, not only currentTask', () => {
@@ -141,7 +284,7 @@ test('composer action menu pops upward without changing the composer width', () 
   assert.ok(popupIndex < plusIndex, 'popup should be rendered before the stable plus rail so the plus button remains on top');
   assert.match(body, /Stack\(\{ alignContent: Alignment\.Bottom \}\)/);
   assert.match(body, /\.width\(34\)/);
-  assert.match(body, /\.translate\(\{ x: 0, y: -196 \}\)/);
+  assert.match(body, /\.translate\(\{ x: 0, y: -234 \}\)/);
   assert.match(body, /\.zIndex\(1\)/);
   assert.match(body, /\.zIndex\(2\)/);
   assert.match(body, /this\.shouldIgnoreComposerActionToggle\(\)/);
@@ -184,11 +327,11 @@ test('desktop screenshot button uses a drawn icon instead of the blurry display 
   assert.match(popupBody, /this\.attachDesktopScreenshotDraft\(\)/);
   assert.match(popupBody, /source=plus_menu/);
   assert.doesNotMatch(headerBody, /sys\.symbol\.display/);
-  assert.match(iconBody, /\.border\(\{ width: 2, color: '#17202A' \}\)/);
-  assert.match(iconBody, /\.backgroundColor\('#1F6FEB'\)/);
+  assert.match(iconBody, /\.border\(\{ width: 2, color: this\.themeColor\('#17202A'\) \}\)/);
+  assert.match(iconBody, /\.backgroundColor\(this\.themeColor\('#1F6FEB'\)\)/);
   assert.match(attachIconBody, /this\.DesktopScreenshotButtonIcon\(\)/);
   assert.match(attachIconBody, /sys\.symbol\.plus/);
-  assert.match(attachIconBody, /\.backgroundColor\('#14853D'\)/);
+  assert.match(attachIconBody, /\.backgroundColor\(this\.themeColor\('#14853D'\)\)/);
 });
 
 test('desktop screenshot can be attached as a draft image and uploaded with the message', () => {
@@ -211,6 +354,37 @@ test('desktop screenshot can be attached as a draft image and uploaded with the 
   assert.match(readPendingBody, /return this\.readFileAsBase64\(uri\)/);
 });
 
+test('image previews adapt to portrait and landscape before back navigation', () => {
+  const previewBody = methodBody('ImagePreviewOverlay()');
+  const desktopPreviewBody = methodBody('DesktopScreenshotPreviewOverlay()');
+  const previewContentBody = methodBody('AdaptiveImagePreviewContent(imageUrl: string)');
+  const widthBody = methodBody('adaptiveImagePreviewWidth(): string');
+  const heightBody = methodBody('adaptiveImagePreviewHeight(): string');
+  const areaBody = methodBody('handleAdaptiveImagePreviewAreaChange(): void');
+  const backBody = methodBody('onBackPress(): boolean');
+  const captureBody = methodBody('captureDesktopScreenshotPreview(): Promise<void>');
+  const userWidthBody = methodBody('userSessionEntryWidth(entry: CodexSessionEntry): string | number');
+  const userHeightBody = methodBody('userImageEntryHeight(entry: CodexSessionEntry): number');
+
+  assert.match(previewBody, /this\.AdaptiveImagePreviewContent\(this\.previewImageUrl\)/);
+  assert.match(desktopPreviewBody, /this\.AdaptiveImagePreviewContent\(this\.desktopScreenshotPreviewUrl\)/);
+  assert.match(previewContentBody, /\.width\(this\.adaptiveImagePreviewWidth\(\)\)/);
+  assert.match(previewContentBody, /\.height\(this\.adaptiveImagePreviewHeight\(\)\)/);
+  assert.match(previewContentBody, /GestureGroup\(GestureMode\.Parallel[\s\S]*PinchGesture\(\)[\s\S]*PanGesture\(\)/);
+  assert.match(previewContentBody, /TapGesture\(\{ count: 2 \}\)/);
+  assert.match(widthBody, /this\.isLandscapeSessionLayout\(\) \? '88%' : '92%'/);
+  assert.match(heightBody, /this\.isLandscapeSessionLayout\(\) \? '90%' : '75%'/);
+  assert.match(areaBody, /this\.desktopScreenshotOffsetX = 0/);
+  assert.match(areaBody, /this\.desktopScreenshotOffsetY = 0/);
+  assert.doesNotMatch(areaBody, /this\.desktopScreenshotScale = 1/);
+  assert.match(backBody, /if \(this\.hasOpenImagePreview\(\)\)[\s\S]*this\.closeOpenImagePreview\('system_back'\)[\s\S]*return true/);
+  assert.doesNotMatch(captureBody, /startDesktopScreenshotAutoRotation/);
+  assert.match(userWidthBody, /this\.isLandscapeSessionLayout\(\) \? '72%' : '58%'/);
+  assert.match(userHeightBody, /this\.isLandscapeSessionLayout\(\) \? 300 : 430/);
+  assert.match(source(), /@StorageLink\('codexRemotePreviewImageUrl'\) previewImageUrl: string = ''/);
+  assert.match(source(), /@StorageLink\('codexRemoteImagePreviewScale'\) desktopScreenshotScale: number = 1/);
+});
+
 test('automatic reasoning effort displays the desktop default strength', () => {
   const sourceText = source();
   const headerButtonBody = methodBody('ReasoningEffortHeaderButton()');
@@ -228,10 +402,12 @@ test('automatic reasoning effort displays the desktop default strength', () => {
   assert.match(sourceText, /@State desktopDefaultReasoningEffort: string = ''/);
   assert.match(sourceText, /BridgeClient\.getCodexSettings/);
   assert.match(headerButtonBody, /Text\(this\.modelShortLabel\(this\.sessionModel\)\)/);
-  assert.match(headerButtonBody, /思考·\$\{this\.reasoningEffortShortLabel\(this\.sessionReasoningEffort\)\}/);
+  assert.match(headerButtonBody, /· \$\{this\.reasoningEffortShortLabel\(this\.sessionReasoningEffort\)\}/);
+  assert.doesNotMatch(headerButtonBody, /思考·/);
   assert.match(headerButtonBody, /\.width\(166\)/);
   assert.doesNotMatch(headerButtonBody, /Text\('思'\)/);
-  assert.match(shortLabelBody, /return this\.reasoningEffortDisplayLabel\(value\)/);
+  assert.match(shortLabelBody, /this\.normalizeReasoningEffort\(value\)/);
+  assert.match(shortLabelBody, /this\.desktopDefaultReasoningEffort/);
   assert.match(displayLabelBody, /自动·\$\{this\.reasoningEffortLabel\(desktopDefault\)\}/);
   assert.match(descriptionBody, /跟随桌面默认：\$\{this\.reasoningEffortLabel\(desktopDefault\)\}/);
   assert.match(modelOptionsBody, /this\.availableModels/);
@@ -244,6 +420,22 @@ test('automatic reasoning effort displays the desktop default strength', () => {
   assert.match(defaultsBody, /settings\.defaultModel/);
   assert.match(defaultsBody, /settings\.modelOptions/);
   assert.match(defaultsBody, /settings\.defaultReasoningEffort/);
+});
+
+test('model settings cache refreshes after failures and emits catalog diagnostics', () => {
+  const sourceText = source();
+  const loadBody = methodBody('loadSessionReasoningEffort(sessionId: string, force: boolean = false): Promise<void>');
+  const defaultsBody = methodBody('loadDesktopReasoningDefaults(force: boolean = false): Promise<void>');
+
+  assert.match(sourceText, /private modelSettingsCacheTtlMs: number = 10000/);
+  assert.match(loadBody, /force/);
+  assert.match(loadBody, /Date\.now\(\) - this\.reasoningEffortLoadedAt < this\.modelSettingsCacheTtlMs/);
+  assert.match(loadBody, /session\.model_catalog\.loaded/);
+  assert.match(loadBody, /modelCount=\$\{this\.availableModels\.length\}/);
+  assert.doesNotMatch(loadBody, /catch \(error\)[\s\S]*this\.reasoningEffortLoadedSessionId = sessionId/);
+  assert.match(defaultsBody, /force/);
+  assert.match(defaultsBody, /session\.model_catalog\.refreshed/);
+  assert.match(defaultsBody, /modelCount=\$\{this\.availableModels\.length\}/);
 });
 
 test('git codex directives render as compact component blocks', () => {
@@ -304,6 +496,80 @@ test('memory citation directive blocks are clickable and recent activity header 
   assert.match(detailFieldsBody, /label: uuidLike \? '会话' : '来源'/);
   assert.match(detailFieldsBody, /noteStart \+ 7/);
   assert.doesNotMatch(sourceText, /Text\('最近活跃'\)/);
+});
+
+test('session message stream renders rich markdown and concrete expandable tool presentations', () => {
+  const sourceText = source();
+  const presentationSource = sessionPresentationServiceSource();
+  const modelsSource = bridgeModelsSource();
+  const blockBody = methodBody('SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean)');
+  const inlineBody = methodBody('SessionMarkdownInlineText(text: string, isUser: boolean, fontSize: number, lineHeight: number)');
+  const toolBody = methodBody('SessionToolEntryView(entry: CodexSessionEntry)');
+  const tableBody = methodBody('SessionMarkdownTableView(block: SessionMarkdownBlock, isUser: boolean)');
+  const tableColumnWidthBody = methodBody('sessionMarkdownTableColumnWidth(block: SessionMarkdownBlock): number');
+  const parseBody = methodBody('parseSessionMarkdown(text: string): SessionMarkdownBlock[]');
+
+  assert.match(sourceText, /from '\.\.\/services\/SessionPresentationService'/);
+  assert.match(modelsSource, /export interface CodexSessionToolItem/);
+  assert.match(modelsSource, /toolItems\?: CodexSessionToolItem\[\]/);
+
+  assert.match(presentationSource, /export function parseSessionMarkdownInline/);
+  assert.match(presentationSource, /export function parseSessionMarkdownTable/);
+  assert.match(presentationSource, /export function sessionToolPresentationItems/);
+  assert.match(presentationSource, /export function compactAdjacentSessionToolEntries/);
+  assert.match(presentationSource, /previous\.role !== 'tool' \|\| entry\.role !== 'tool'/);
+  assert.match(presentationSource, /retryCount/);
+  for (const kind of ['strong', 'emphasis', 'code', 'strike', 'link']) {
+    assert.match(presentationSource, new RegExp(`'${kind}'`));
+  }
+
+  assert.match(inlineBody, /ForEach\(parseSessionMarkdownInline\(text\)/);
+  assert.match(inlineBody, /Span\(segment\.text\)/);
+  assert.match(inlineBody, /FontWeight\.Bold/);
+  assert.match(inlineBody, /FontStyle\.Italic/);
+  assert.match(inlineBody, /TextDecorationType\.LineThrough/);
+  assert.doesNotMatch(blockBody, /Text\(this\.markdownInlineDisplayText\(block\.text\)\)/);
+
+  assert.match(parseBody, /parseSessionMarkdownTable/);
+  assert.match(parseBody, /pushBlock\('table'/);
+  assert.match(blockBody, /block\.kind === 'table'/);
+  assert.match(blockBody, /this\.SessionMarkdownTableView\(block, isUser\)/);
+  assert.match(tableBody, /parseSessionMarkdownTable\(block\.text\)\.headers/);
+  assert.match(tableBody, /parseSessionMarkdownTable\(block\.text\)\.rows/);
+  assert.match(tableBody, /\.width\(this\.sessionMarkdownTableColumnWidth\(block\)\)/);
+  assert.match(tableBody, /\.constraintSize\(\{ minHeight: 34 \}\)/);
+  assert.match(tableBody, /\.alignSelf\(ItemAlign\.Stretch\)/);
+  assert.doesNotMatch(tableBody, /\.width\(128\)/);
+  assert.doesNotMatch(tableBody, /\.height\(34\)/);
+  assert.match(tableColumnWidthBody, /parseSessionMarkdownTable\(block\.text\)\.headers\.length/);
+  assert.match(tableColumnWidthBody, /this\.sessionWindowWidthVp\(\)/);
+  assert.match(tableColumnWidthBody, /this\.isLandscapeSessionLayout\(\)/);
+
+  const quoteStart = blockBody.indexOf("block.kind === 'quote'");
+  const quoteEnd = blockBody.indexOf("block.kind === 'list'");
+  const quoteBody = blockBody.slice(quoteStart, quoteEnd);
+  assert.equal(quoteStart >= 0 && quoteEnd > quoteStart, true);
+  assert.doesNotMatch(quoteBody, /\.height\('100%'\)/);
+  assert.match(quoteBody, /\.alignSelf\(ItemAlign\.Stretch\)/);
+
+  assert.match(toolBody, /sessionToolPresentationItems\(entry\)/);
+  assert.match(toolBody, /item\.verb/);
+  assert.match(toolBody, /item\.target/);
+  assert.match(toolBody, /item\.detail/);
+  assert.match(toolBody, /this\.toggleSessionToolItem\(entry, item\)/);
+  assert.match(toolBody, /this\.isSessionToolGroup\(entry\)/);
+  assert.match(toolBody, /this\.shouldShowSessionToolGroupItems\(entry\)/);
+  assert.match(toolBody, /全部展开/);
+  assert.match(toolBody, /收起/);
+  assert.doesNotMatch(toolBody, /项工具调用/);
+
+  const normalizeBody = methodBody('normalizeVisibleSessionEntries(entries: CodexSessionEntry[]): CodexSessionEntry[]');
+  const groupTitleBody = methodBody('sessionToolGroupTitle(entry: CodexSessionEntry): string');
+  const statusBody = methodBody('sessionToolItemStatusText(item: SessionToolPresentationItem): string');
+  assert.match(normalizeBody, /compactAdjacentSessionToolEntries\(visibleEntries\)/);
+  assert.match(groupTitleBody, /已完成.*项操作/);
+  assert.match(groupTitleBody, /正在执行.*项操作/);
+  assert.match(statusBody, /重试.*次后成功/);
 });
 
 test('compaction retry events are visible in running task status', () => {
@@ -396,7 +662,7 @@ test('failed session messages render in the conversation with a left retry butto
   const bubbleIndex = cardBody.indexOf('failedSessionMessageStatusText(message)');
   assert.ok(blankIndex >= 0 && retryIndex > blankIndex, 'retry button should appear after the right-aligning blank');
   assert.ok(bubbleIndex > retryIndex, 'retry button should appear to the left of the failed message bubble');
-  assert.match(cardBody, /backgroundColor\(message\.retrying \? '#8A95A3' : '#14853D'\)/);
+  assert.match(cardBody, /backgroundColor\(message\.retrying \? this\.themeColor\('#8A95A3'\) : this\.themeColor\('#14853D'\)\)/);
   assert.match(cardBody, /cancelFailedSessionAutoRetry\(message\.id\)/);
   assert.doesNotMatch(cardBody, /failed_message_repair/);
   assert.doesNotMatch(cardBody, /repairDesktopLiveFromPhone\('failed_message'\)/);
@@ -446,6 +712,132 @@ test('selected session adoption does not replace a newer active guidance task wi
   assert.match(adoptBody, /task\.selected_session\.adopt\.skipped_current_newer/);
   assert.match(newerBody, /taskUpdated/);
   assert.match(newerBody, /summaryUpdated/);
+});
+
+test('app-server send contract clears stale desktop CDP unavailable state', () => {
+  const contractBody = methodBody('requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean>');
+  const applyBody = methodBody('applyAppServerPrimaryStatus(targetSessionId: string, source: string, execution: string): void');
+  const taskBody = methodBody('applyTaskExecutionContract(task: BridgeTask, targetSessionId: string, source: string): void');
+  const openBody = methodBody('openSession(session: CodexSessionSummary): Promise<void>');
+
+  assert.match(contractBody, /!requiresDesktop[\s\S]*applyAppServerPrimaryStatus/);
+  assert.match(applyBody, /this\.desktopLiveState = 'not_required'/);
+  assert.match(applyBody, /this\.desktopLiveReason = ''/);
+  assert.match(applyBody, /this\.desktopLiveRequiresDesktopCdp = false/);
+  assert.match(taskBody, /this\.taskUsesAppServer\(task\)[\s\S]*applyAppServerPrimaryStatus/);
+  assert.doesNotMatch(openBody, /syncDesktopAndRefresh|openDesktopSelectedSession/);
+});
+
+test('session entries expose official text and image copy and share actions', () => {
+  const entryBody = methodBody('SessionEntryCard(entry: CodexSessionEntry)');
+  const actionBody = methodBody('SessionContentActionRow(entry: CodexSessionEntry, imageUrl: string)');
+  const service = contentActionServiceSource();
+
+  assert.match(entryBody, /SessionContentActionRow\(entry, imageUrl\)/);
+  assert.match(entryBody, /SessionContentActionRow\(entry, ''\)/);
+  assert.match(actionBody, /copySessionImage/);
+  assert.match(actionBody, /shareSessionImage/);
+  assert.match(actionBody, /copySessionText/);
+  assert.match(actionBody, /shareSessionText/);
+  assert.match(service, /pasteboard\.MIMETYPE_TEXT_PLAIN/);
+  assert.match(service, /pasteboard\.MIMETYPE_PIXELMAP/);
+  assert.match(service, /new systemShare\.ShareController/);
+  assert.match(service, /fileUri\.getUriFromPath/);
+});
+
+test('session sidebar separates desktop projects from projectless recent sessions', () => {
+  const sidebarBody = methodBody('SessionSidebar()');
+  const itemBody = methodBody('SessionSidebarItem(session: CodexSessionSummary)');
+  const labelsBody = methodBody('sessionProjectLabels(): string[]');
+  const recentBody = methodBody('recentSessions(): CodexSessionSummary[]');
+  const timeWidthBody = methodBody('sessionSidebarTimeWidth(): number');
+
+  assert.match(sidebarBody, /SessionSectionLabel\('项目'\)/);
+  assert.match(sidebarBody, /RecentSessionGroup\(\)/);
+  assert.match(itemBody, /Text\(this\.sessionTimeLabel\(session\)\)[\s\S]*\.textAlign\(TextAlign\.End\)/);
+  assert.match(itemBody, /\.width\(this\.sessionSidebarTimeWidth\(\)\)/);
+  assert.doesNotMatch(itemBody, /Text\(this\.sessionTimeLabel\(session\)\)[\s\S]*?textOverflow/);
+  assert.match(timeWidthBody, /84 \* fontScalePercent\(this\.fontScaleMode\) \/ 100/);
+  assert.match(labelsBody, /session\.sidebarSection === 'recent'/);
+  assert.match(recentBody, /session\.sidebarSection === 'recent'/);
+});
+
+test('session workspace uses responsive landscape columns with a fully hidden collapsible sidebar', () => {
+  const sourceText = source();
+  const workspaceBody = methodBody('SessionWorkspace()');
+  const panelBody = methodBody('SessionPanel()');
+  const sidebarBody = methodBody('SessionSidebar()');
+  const resizeHandleBody = methodBody('SessionSidebarResizeHandle()');
+  const shouldShowToggleBody = methodBody('shouldShowSessionHeaderSidebarToggle(): boolean');
+  const toggleBody = methodBody('toggleSessionSidebarFromHeader(): void');
+  const landscapeBody = methodBody('isLandscapeSessionLayout(): boolean');
+  const sidebarVisibleBody = methodBody('isSessionSidebarVisible(): boolean');
+  const sidebarMenuBody = methodBody('shouldShowHomeActionMenuInSidebar(): boolean');
+  const resizeBody = methodBody('resizeSessionLandscapeSidebar(offsetX: number): void');
+  const closeBody = methodBody('closeSessionSidebar(source: string): void');
+  const openBody = methodBody('openSession(session: CodexSessionSummary): Promise<void>');
+  const restoreBody = methodBody('restoreActiveSessionIfNeeded(): Promise<void>');
+  const returnHomeBody = methodBody('returnToSessionHome(source: string): void');
+  const sendBody = methodBody("sendMessageToSelectedSession(retryFailedMessageId: string = ''): Promise<boolean>");
+  const aboutToAppearBody = methodBody('aboutToAppear(): void');
+  const abilityText = entryAbilitySource();
+  const moduleText = moduleProfileSource();
+
+  assert.match(sourceText, /@StorageLink\('codexRemoteWindowWidth'\) sessionWindowWidth: number = 0/);
+  assert.match(sourceText, /@StorageLink\('codexRemoteWindowHeight'\) sessionWindowHeight: number = 0/);
+  assert.match(sourceText, /@StorageLink\('codexRemoteActiveSessionId'\) activeSessionId: string = ''/);
+  assert.match(sourceText, /@StorageLink\('codexRemoteSessionNavigationState'\) sessionNavigationState: string = ''/);
+  assert.match(sourceText, /@StorageLink\('codexRemoteSessionDraft'\) sessionMessage: string = ''/);
+  assert.match(sourceText, /@StorageLink\('codexRemoteSessionSidebarWidth'\) sessionSidebarWidth: number = 304/);
+  assert.match(sourceText, /@State sessionSidebarUserCollapsed: boolean = false/);
+  assert.match(workspaceBody, /if \(this\.isLandscapeSessionLayout\(\)\)/);
+  assert.match(workspaceBody, /if \(!this\.sessionSidebarUserCollapsed\)[\s\S]*this\.SessionSidebar\(\)[\s\S]*this\.SessionSidebarResizeHandle\(\)/);
+  assert.match(workspaceBody, /\.width\(this\.sessionLandscapeSidebarWidth\(\)\)/);
+  assert.match(workspaceBody, /if \(!this\.sessionSidebarCollapsed\)[\s\S]*this\.SessionSidebar\(\)/);
+  assert.match(panelBody, /this\.SessionSidebarHeaderToggleButton\(\)/);
+  assert.match(sidebarBody, /Column\(\{ space: 3 \}\)[\s\S]*\.layoutWeight\(1\)/);
+  assert.match(resizeHandleBody, /PanGesture\(\{ direction: PanDirection\.Horizontal \}\)/);
+  assert.match(resizeHandleBody, /this\.resizeSessionLandscapeSidebar\(event\.offsetX\)/);
+  assert.match(resizeBody, /Math\.max\(this\.sessionLandscapeSidebarMinWidth\(\), Math\.min\(this\.sessionLandscapeSidebarMaxWidth\(\), nextWidth\)\)/);
+  assert.match(sidebarVisibleBody, /this\.isLandscapeSessionLayout\(\) \? !this\.sessionSidebarUserCollapsed : !this\.sessionSidebarCollapsed/);
+  assert.match(sidebarMenuBody, /this\.isSessionSidebarVisible\(\)/);
+  assert.match(shouldShowToggleBody, /return this\.sessionSidebarCollapsed/);
+  assert.match(toggleBody, /const collapsed = !this\.sessionSidebarUserCollapsed/);
+  assert.match(toggleBody, /this\.sessionSidebarUserCollapsed = collapsed/);
+  assert.match(landscapeBody, /width >= 720 && width > height/);
+  assert.match(closeBody, /this\.sessionSidebarUserCollapsed = this\.isLandscapeSessionLayout\(\)/);
+  assert.match(openBody, /this\.commitSessionNavigation\('session', session\.id, 'open_session'\)/);
+  assert.match(openBody, /this\.sessionSidebarUserCollapsed = false/);
+  assert.match(restoreBody, /const navigation = this\.readSessionNavigation\(\)/);
+  assert.match(restoreBody, /navigation\.mode !== 'session'/);
+  assert.match(restoreBody, /const restoreRevision = navigation\.revision/);
+  assert.match(restoreBody, /this\.isSessionNavigationCurrent\(restoreRevision, sessionId\)/);
+  assert.match(returnHomeBody, /this\.commitSessionNavigation\('home', '', source\)/);
+  assert.match(sendBody, /const navigation = this\.readSessionNavigation\(\)/);
+  assert.match(sendBody, /navigation\.mode !== 'session' \|\| navigation\.sessionId !== this\.selectedSession\.id/);
+  assert.match(sendBody, /reason=navigation_target_mismatch/);
+  assert.doesNotMatch(aboutToAppearBody, /this\.sessionMessage = ''/);
+  assert.match(abilityText, /mainWindow\.on\('windowSizeChange', this\.windowSizeChangeHandler\)/);
+  assert.match(abilityText, /mainWindow\.off\('windowSizeChange', this\.windowSizeChangeHandler\)/);
+  assert.match(abilityText, /AppStorage\.set<number>\(WINDOW_WIDTH_STORAGE_KEY, width\)/);
+  assert.match(abilityText, /AppStorage\.setOrCreate<string>\(ACTIVE_SESSION_STORAGE_KEY, ''\)/);
+  assert.match(abilityText, /AppStorage\.setOrCreate<string>\(SESSION_DRAFT_STORAGE_KEY, ''\)/);
+  assert.match(abilityText, /AppStorage\.setOrCreate<number>\(SESSION_SIDEBAR_WIDTH_STORAGE_KEY, 304\)/);
+  assert.match(moduleText, /"orientation": "auto_rotation"/);
+});
+
+test('failed task overlay is suppressed after the phone prompt has a canonical assistant reply', () => {
+  const selectedBody = methodBody('selectedVisibleTask()');
+  const completedBody = methodBody('failedTaskHasCanonicalCompletion(task: BridgeTask): boolean');
+  const adoptBody = methodBody('adoptSelectedSessionTaskFromSummaries(tasks: BridgeTaskSummary[]): Promise<void>');
+
+  assert.match(selectedBody, /this\.failedTaskHasCanonicalCompletion\(this\.currentTask\)[\s\S]*return null/);
+  assert.match(completedBody, /task\.status !== 'failed'/);
+  assert.match(completedBody, /entry\.role !== 'user'/);
+  assert.match(completedBody, /entry\.role === 'assistant'/);
+  assert.match(completedBody, /index > promptIndex/);
+  assert.match(adoptBody, /this\.failedTaskHasCanonicalCompletion\(task\)/);
+  assert.match(adoptBody, /task\.selected_session\.adopt\.skipped_canonical_completion/);
 });
 
 test('local terminal task state suppresses stale running summaries before adoption', () => {
@@ -558,4 +950,306 @@ test('stale session detail responses cannot overwrite the current conversation',
   assert.match(loadBody, /session\.detail\.stale_error_ignored/);
   assert.match(loadBody, /this\.applySessionActivitySnapshot\(detail, 'detail'\)/);
   assert.match(homeBody, /this\.sessionDetailRequestSeq \+= 1/);
+});
+
+test('mobile uses the Bridge runtime contract before skipping CDP and preserves a retry submission identity', () => {
+  const sourceText = source();
+  const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
+  const modelText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/model/BridgeModels.ets'), 'utf8');
+  const sendBody = methodBody('sendMessageToSelectedSession(retryFailedMessageId: string = \'\'): Promise<boolean>');
+  const newBody = methodBody('sendNewSessionMessage(retryFailedMessageId: string = \'\'): Promise<boolean>');
+  const contractBody = methodBody('requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean>');
+  const desktopReadyBody = methodBody('ensureDesktopLiveReadyForSend(targetSessionId: string, source: string): Promise<boolean>');
+  const taskRuntimeBody = methodBody('taskUsesAppServer(task: BridgeTask | BridgeTaskSummary): boolean');
+  const retryBody = methodBody('submissionIdForRetry(retryFailedMessageId: string): string');
+  const nextRetryBody = methodBody('updateFailedSessionMessageNextRetryAt(failedId: string, nextRetryAt: string): void');
+  const updateRetryBody = methodBody('updateFailedSessionMessage(failedId: string, retrying: boolean, error: string = \'\'): void');
+
+  assert.match(modelText, /export interface BridgeRuntimeStatus/);
+  assert.match(modelText, /existingThreadExecution: string/);
+  assert.match(modelText, /submissionId\?: string/);
+  assert.match(clientText, /static async getRuntimeStatus/);
+  assert.match(clientText, /\$\{baseUrl\}\/health\?\$\{params\.join\('&'\)\}/);
+  assert.match(clientText, /JSON\.stringify\(\{ projectId, text, sessionFingerprint, reasoningEffort, model, submissionId \}\)/);
+  assert.match(clientText, /JSON\.stringify\(\{ projectId, text, reasoningEffort, model, submissionId \}\)/);
+
+  assert.match(sendBody, /const requiresDesktopLive = await this\.requiresDesktopLiveForSend/);
+  assert.match(sendBody, /if \(requiresDesktopLive\) \{[\s\S]*ensureDesktopLiveReadyForSend/);
+  assert.match(sendBody, /submissionId/);
+  assert.match(newBody, /this\.submissionIdForRetry\(retryFailedMessageId\)/);
+  assert.match(contractBody, /BridgeClient\.getRuntimeStatus/);
+  assert.match(contractBody, /runtime\.existingThreadExecution !== 'app_server'/);
+  assert.doesNotMatch(contractBody, /runtime\.existingThreadExecution !== 'desktop_primary'/);
+  assert.match(desktopReadyBody, /status\.sessionVerified === true \|\| status\.targetVerified === true/);
+  assert.match(contractBody, /return true;/);
+  assert.match(taskRuntimeBody, /task\.runtime\?\.kind === 'app_server'/);
+  assert.match(retryBody, /failed\.submissionId/);
+  assert.match(sourceText, /submissionId: pending\.submissionId/);
+  assert.match(nextRetryBody, /submissionId: message\.submissionId/);
+  assert.match(updateRetryBody, /submissionId: message\.submissionId/);
+  assert.match(sourceText, /status === 'recovering'/);
+});
+
+test('mobile renders and answers structured App Server questions and can explicitly hand off to desktop', () => {
+  const sourceText = source();
+  const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
+  const modelText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/model/BridgeModels.ets'), 'utf8');
+  const answerBody = methodBody('answerPendingUserInput(): Promise<void>');
+  const desktopBody = methodBody('openDesktopSelectedSession(source: string): Promise<void>');
+
+  assert.match(modelText, /export interface BridgeUserInput/);
+  assert.match(modelText, /pendingUserInput\?: BridgeUserInput/);
+  assert.match(clientText, /static async answerUserInput/);
+  assert.match(clientText, /\/user-inputs\/\$\{requestId\}/);
+  assert.match(sourceText, /UserInputForm\(\)/);
+  assert.match(sourceText, /waiting_input/);
+  assert.match(answerBody, /BridgeClient\.answerUserInput/);
+  assert.match(desktopBody, /BridgeClient\.openDesktopSession/);
+  assert.match(sourceText, /@State isOpeningDesktopSession: boolean = false/);
+  assert.match(sourceText, /LoadingProgress\(\)/);
+  assert.match(desktopBody, /this\.isOpeningDesktopSession = true/);
+  assert.match(desktopBody, /desktop\.session\.open\.requested/);
+  assert.match(desktopBody, /finally[\s\S]*this\.isOpeningDesktopSession = false/);
+  assert.match(sourceText, /DesktopTakeoverButton\(\)/);
+});
+
+test('notifications are privacy-safe, categorized, and deep-link to the target conversation', () => {
+  const notificationText = fs.readFileSync(notificationServicePath, 'utf8');
+  const abilityText = entryAbilitySource();
+  const navigationBody = methodBody('applyPendingNotificationNavigation(): Promise<void>');
+  const attentionBody = methodBody('publishTaskAttentionNotification(task: BridgeTask, previousStatus: string): Promise<void>');
+
+  assert.match(notificationText, /approval_required/);
+  assert.match(notificationText, /user_input_required/);
+  assert.match(notificationText, /connection_error/);
+  assert.match(notificationText, /parameters:/);
+  assert.doesNotMatch(notificationText, /prompt|command|answer正文|提示词/);
+  assert.match(abilityText, /onNewWant/);
+  assert.match(abilityText, /applyNotificationTarget/);
+  assert.match(navigationBody, /this\.sessions\.find/);
+  assert.match(navigationBody, /await this\.openSession\(target\)/);
+  assert.match(navigationBody, /this\.showTaskEventDetails/);
+  assert.match(attentionBody, /AppNotificationService\.publish/);
+});
+
+test('monitoring falls back to a stable privacy-safe notification and an always-on system-brightness dashboard', () => {
+  const notificationText = fs.readFileSync(notificationServicePath, 'utf8');
+  const panelText = fs.readFileSync(desktopMonitorPanelPath, 'utf8');
+  const displayText = fs.readFileSync(desktopMonitorDisplayServicePath, 'utf8');
+  const abilityText = entryAbilitySource();
+  const indexText = source();
+
+  assert.match(notificationText, /MONITOR_NOTIFICATION_ID:\s*number\s*=\s*31_070/);
+  assert.match(notificationText, /syncMonitorSnapshot/);
+  assert.match(notificationText, /运行 \$\{snapshot\.runningCount\} · 未读 \$\{snapshot\.unreadCount\}/);
+  assert.match(notificationText, /notificationManager\.cancel\(MONITOR_NOTIFICATION_ID\)/);
+  assert.match(notificationText, /isAlertOnce:\s*true/);
+  assert.match(notificationText, /tapDismissed:\s*false/);
+  assert.doesNotMatch(notificationText, /sessionTitles|sessionProjects|prompt|command/);
+
+  assert.match(panelText, /export struct DesktopMonitorPanel/);
+  assert.match(panelText, /Codex 小夜灯/);
+  assert.match(panelText, /this\.snapshot\.runningCount/);
+  assert.match(panelText, /this\.snapshot\.unreadCount/);
+  assert.match(panelText, /usagePrimaryValue/);
+  assert.match(panelText, /this\.landscape/);
+  assert.match(panelText, /this\.snapshot\.shiftIndex/);
+  assert.match(panelText, /this\.snapshot\.mirrored/);
+  assert.match(panelText, /始终常亮/);
+  assert.match(panelText, /跟随系统亮度/);
+  assert.match(panelText, /Row\(\{ space: 1 \}\)/);
+  assert.doesNotMatch(panelText, /Text\('•ᴗ•'\)/);
+  assert.match(panelText, /ENERGY_SEGMENT_COUNT:\s*number\s*=\s*10/);
+  assert.match(panelText, /kind === 'running' \|\| kind === 'unread' \|\| kind === 'recent'/);
+  assert.match(panelText, /endedSessionCount/);
+  assert.match(panelText, /EnergyBar/);
+  assert.match(panelText, /quotaPercentText/);
+  assert.match(panelText, /this\.landscape \? 68 : 70/);
+
+  assert.match(displayText, /setWindowKeepScreenOn\(true\)/);
+  assert.match(displayText, /batteryInfo\.chargingStatus/);
+  assert.match(displayText, /setWindowKeepScreenOn\(false\)/);
+  assert.match(displayText, /followsSystemBrightness:\s*true/);
+  assert.doesNotMatch(displayText, /setWindowBrightness|MONITOR_BRIGHTNESS|originalBrightness/);
+
+  assert.doesNotMatch(abilityText, /LiveViewCapabilityService|LiveViewProbe|LIVE_VIEW_/);
+  assert.doesNotMatch(indexText, /LiveViewCapabilityService|syncSnapshot\(context, snapshot\)/);
+  assert.match(indexText, /AppNotificationService\.syncMonitorSnapshot\(snapshot\)/);
+  assert.match(indexText, /this\.HomeActionMenuItem\('desktop_monitor'/);
+  assert.match(indexText, /DesktopMonitorPanel\(/);
+  assert.match(indexText, /DesktopMonitorDisplayService\.enter/);
+  assert.match(indexText, /DesktopMonitorDisplayService\.leave/);
+});
+
+test('history refresh updates an existing native item without moving or duplicating it', () => {
+  const body = methodBody('mergeSessionEntryPages');
+  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer) {${body}}`)}; return merge;`)();
+  const old = { syncId: 'item-a', text: 'partial' };
+  const other = { syncId: 'item-b', text: 'same text' };
+  const updated = { syncId: 'item-a', text: 'complete' };
+  const distinct = { syncId: 'item-c', text: 'same text' };
+  assert.deepEqual(merge([old, other], [updated, distinct]), [updated, other, distinct]);
+});
+
+test('refreshing a recent page with a wider snapshot keeps latest messages at the bottom', () => {
+  const body = methodBody('mergeSessionEntryPages');
+  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer) {${body}}`)}; return merge;`)();
+  const history = Array.from({ length: 160 }, (_, index) => ({
+    syncId: `message-${index}`, timestamp: new Date(1700000000000 + index * 1000).toISOString(), text: `${index}`
+  }));
+  const current = history.slice(-2);
+  assert.deepEqual(merge(current, history), history);
+  assert.deepEqual(merge(merge(current, history), history), history);
+  assert.deepEqual(merge(history.slice(0, 80), history.slice(80)), history);
+});
+
+test('conversation history loads older cursor pages at the top without re-enabling bottom follow', () => {
+  const sourceText = source();
+  const clientText = fs.readFileSync(
+    path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'),
+    'utf8'
+  );
+  const modelText = bridgeModelsSource();
+  const edgeBody = methodBody('handleSessionScrollEdge(edge: Edge): void');
+  const olderBody = methodBody('loadOlderSessionEntries(source: string): Promise<void>');
+  const refreshBody = methodBody('refreshSelectedSessionDetail(): Promise<void>');
+
+  assert.match(modelText, /export interface CodexSessionSync/);
+  assert.match(modelText, /sync\?: CodexSessionSync/);
+  assert.match(modelText, /syncId\?: string/);
+  assert.match(clientText, /static async getSessionHistoryPage/);
+  assert.match(clientText, /\/api\/codex\/threads\/\$\{sessionId\}\/sync/);
+  assert.match(sourceText, /this\.SessionHistoryLoader\(\)/);
+  assert.match(edgeBody, /edge === Edge\.Top[\s\S]*loadOlderSessionEntries\('scroll_edge_top'\)/);
+  assert.match(olderBody, /BridgeClient\.getSessionHistoryPage/);
+  assert.match(olderBody, /beforeCursor/);
+  assert.match(olderBody, /this\.sessionAutoFollowBottom = false/);
+  assert.match(olderBody, /this\.mergeSessionEntryPages/);
+  assert.match(refreshBody, /this\.mergeSessionDetailPreservingHistory/);
+});
+
+test('the ability owns an idempotent data-transfer background runtime across lifecycle transitions', () => {
+  const abilityText = entryAbilitySource();
+  const profileText = moduleProfileSource();
+  const backgroundText = backgroundRuntimeServiceSource();
+  const indexText = source();
+
+  assert.match(profileText, /"backgroundModes":\s*\["dataTransfer"\]/);
+  assert.match(profileText, /ohos\.permission\.KEEP_BACKGROUND_RUNNING/);
+  assert.match(backgroundText, /export class AppBackgroundRuntimeService/);
+  assert.match(backgroundText, /static async ensureRunning/);
+  assert.match(backgroundText, /startPromise/);
+  assert.match(backgroundText, /backgroundTaskManager\.startBackgroundRunning/);
+  assert.match(backgroundText, /backgroundTaskManager\.BackgroundMode\.DATA_TRANSFER/);
+  assert.match(abilityText, /onCreate[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_create'\)/);
+  assert.match(abilityText, /onForeground[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_foreground'\)/);
+  assert.match(abilityText, /onBackground[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_background'\)/);
+  assert.match(indexText, /AppBackgroundRuntimeService\.ensureRunning\(context,\s*'index_relay'\)/);
+  assert.doesNotMatch(indexText, /backgroundTaskManager\.startBackgroundRunning/);
+});
+
+test('notification badges use absolute unread counts and unchanged monitor snapshots do not accumulate', () => {
+  const notificationText = fs.readFileSync(notificationServicePath, 'utf8');
+  const indexText = source();
+
+  assert.match(notificationText, /static async syncBadgeNumber\(unreadCount: number\): Promise<void>/);
+  assert.match(notificationText, /notificationManager\.setBadgeNumber\(normalizedUnreadCount\)/);
+  assert.match(notificationText, /badgeNumber:\s*0/);
+  assert.doesNotMatch(notificationText, /badgeNumber:\s*snapshot\.unreadCount/);
+  assert.match(notificationText, /lastMonitorNotificationKey/);
+  assert.match(notificationText, /action:\s*'unchanged'/);
+  assert.match(indexText, /AppNotificationService\.syncBadgeNumber\(this\.unreadCompletedSessionIds\.length\)/);
+});
+
+test('mobile deletion blocks running sessions and describes archive-safe desktop synchronization', () => {
+  const indexText = source();
+  const canDeleteBody = methodBody('canDeleteSession(session: CodexSessionSummary): boolean');
+  const confirmDeleteBody = methodBody('confirmDeleteSession(session: CodexSessionSummary): void');
+
+  assert.match(canDeleteBody, /!this\.isSessionRunning\(session\.id\)/);
+  assert.match(confirmDeleteBody, /会话正在运行/);
+  assert.match(confirmDeleteBody, /从手机和桌面会话列表隐藏/);
+  assert.doesNotMatch(confirmDeleteBody, /物理删除/);
+});
+
+test('mobile document attachments use the system picker and enforce client and server limits', () => {
+  const attachmentText = fs.readFileSync(
+    path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/AttachmentService.ets'),
+    'utf8'
+  );
+  const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
+  const composeBody = methodBody('composeOutgoingSessionMessage(text: string, images: PendingSessionImage[], files: PickedMobileFile[]): Promise<ComposedSessionMessage>');
+
+  assert.match(attachmentText, /DocumentViewPicker/);
+  assert.match(attachmentText, /10 \* 1024 \* 1024/);
+  assert.match(attachmentText, /lower === '\.env'/);
+  assert.match(clientText, /static async uploadMobileFile/);
+  assert.match(clientText, /\/mobile\/files/);
+  assert.match(composeBody, /BridgeClient\.uploadMobileFile/);
+  assert.match(composeBody, /AttachmentService\.readAsBase64/);
+  assert.match(source(), /PendingSessionFileStrip\(\)/);
+});
+
+test('mobile exposes the durable send queue editing contract', () => {
+  const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
+  const panelBody = methodBody('OutboxPanel()');
+  const itemBody = methodBody('OutboxItemCard(item: BridgeOutboxItem)');
+
+  assert.match(clientText, /static async listOutbox/);
+  assert.match(clientText, /static async updateOutboxItem/);
+  assert.match(clientText, /static async moveOutboxItem/);
+  assert.match(clientText, /static async cancelOutboxItem/);
+  assert.match(clientText, /static async retryOutboxItem/);
+  assert.match(panelBody, /每个会话严格按顺序发送/);
+  assert.match(itemBody, /saveOutboxItem/);
+  assert.match(itemBody, /moveOutboxItem/);
+  assert.match(itemBody, /cancelOutboxItem/);
+  assert.match(source(), /this\.HomeActionMenuItem\('outbox'/);
+});
+
+test('desktop file links require confirmation before downloading and open with a URI grant', () => {
+  const sourceText = source();
+  const actionText = contentActionServiceSource();
+  const clientText = fs.readFileSync(
+    path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'),
+    'utf8'
+  );
+  const inlineBody = methodBody(
+    'SessionMarkdownInlineText(text: string, isUser: boolean, fontSize: number, lineHeight: number)'
+  );
+
+  assert.match(inlineBody, /openSessionMarkdownLink\(segment\.href\)/);
+  assert.match(sourceText, /title: '下载电脑端文件？'/);
+  assert.match(sourceText, /value: '下载并打开'/);
+  assert.match(sourceText, /ContentActionService\.downloadRemoteFile/);
+  assert.match(sourceText, /ContentActionService\.openRemoteFile/);
+  assert.match(clientText, /static async getRemoteSessionFileMetadata/);
+  assert.match(clientText, /\/files\/metadata/);
+  assert.match(clientText, /\/files\/download/);
+  assert.match(actionText, /ohos\.want\.action\.viewData/);
+  assert.match(actionText, /FLAG_AUTH_READ_URI_PERMISSION/);
+  assert.match(actionText, /context\.filesDir/);
+});
+
+test('desktop file metadata failures are shown as an actionable dialog', () => {
+  const openBody = methodBody('openSessionMarkdownLink(href: string)');
+  const errorBody = methodBody('showRemoteFileError(title: string, detail: string)');
+
+  assert.match(openBody, /showRemoteFileError\('无法下载文件'/);
+  assert.match(errorBody, /AlertDialog\.show/);
+  assert.match(errorBody, /value: '知道了'/);
+  assert.match(errorBody, /message: detail/);
+});
+
+test('session sidebar distinguishes an authorization failure from a genuinely empty conversation list', () => {
+  const sidebarBody = methodBody('SessionSidebar()');
+  const refreshBody = methodBody('refreshSessions(source: string = \'manual\'): Promise<void>');
+  const text = source();
+
+  assert.match(text, /@State sessionsLoadError: string = ''/);
+  assert.match(sidebarBody, /this\.sessionsLoadError\.length > 0/);
+  assert.match(sidebarBody, /连接会话失败/);
+  assert.match(sidebarBody, /检查 Bridge 地址和访问凭证后下拉重试/);
+  assert.match(refreshBody, /this\.sessionsLoadError = ''/);
+  assert.match(refreshBody, /this\.sessionsLoadError = this\.errorText\(err\)/);
 });

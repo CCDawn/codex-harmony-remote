@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { effectiveCodexSettings, effectiveReasoningSettings, extractModelFromConfig, extractReasoningEffortFromConfig } from '../src/codexUserConfig.js';
+import { readAppServerCodexSettings } from '../src/codexDesktopSettings.js';
 
 test('extractReasoningEffortFromConfig reads Codex model_reasoning_effort', () => {
   assert.equal(extractReasoningEffortFromConfig('model_reasoning_effort = "xhigh"\n'), 'xhigh');
@@ -57,6 +58,20 @@ test('effectiveCodexSettings reports model and reasoning defaults', () => {
   assert.equal(settings.defaultReasoningEffort, 'xhigh');
   assert.equal(settings.effectiveReasoningEffort, 'xhigh');
   assert.equal(settings.modelOptions[0].displayName, 'GPT-5.5');
+  assert.equal(settings.modelCatalogRevision, 'gpt-5.5|gpt-5.5');
+
+  const recoveredRevision = effectiveCodexSettings(
+    { model: '', reasoningEffort: '', updatedAt: '' },
+    {
+      model: 'gpt-5.6-terra',
+      modelCatalogRevision: '',
+      models: [
+        { id: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra', isDefault: true },
+        { id: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol' }
+      ]
+    }
+  );
+  assert.equal(recoveredRevision.modelCatalogRevision, 'gpt-5.6-terra|gpt-5.6-terra|gpt-5.6-sol');
 
   const overridden = effectiveCodexSettings(
     { model: 'gpt-5.4-mini', reasoningEffort: 'high', updatedAt: 'now' },
@@ -65,4 +80,41 @@ test('effectiveCodexSettings reports model and reasoning defaults', () => {
   assert.equal(overridden.effectiveModel, 'gpt-5.4-mini');
   assert.equal(overridden.modelSource, 'session');
   assert.equal(overridden.effectiveReasoningEffort, 'high');
+});
+
+test('managed App Server is the primary model catalog and includes all selectable models', async () => {
+  const calls = [];
+  const settings = await readAppServerCodexSettings({
+    async requestAppServer(method, params) {
+      calls.push({ method, params });
+      if (method === 'config/read') {
+        return {
+          config: {
+            model: 'gpt-5.6-terra',
+            model_reasoning_effort: 'high'
+          }
+        };
+      }
+      if (method === 'model/list') {
+        return {
+          data: [
+            { id: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra' },
+            { id: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol' },
+            { id: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna' }
+          ]
+        };
+      }
+      throw new Error(`unexpected ${method}`);
+    }
+  });
+
+  assert.equal(settings.source, 'app_server');
+  assert.equal(settings.model, 'gpt-5.6-terra');
+  assert.equal(settings.reasoningEffort, 'high');
+  assert.deepEqual(settings.models.map((model) => model.id), [
+    'gpt-5.6-terra',
+    'gpt-5.6-sol',
+    'gpt-5.6-luna'
+  ]);
+  assert.deepEqual(calls.map((call) => call.method), ['config/read', 'model/list']);
 });

@@ -7,6 +7,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Resolve-CompatiblePowerShellHost {
+  $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentHost -and -not [string]::IsNullOrWhiteSpace([string]$currentHost.Path) -and (Test-Path -LiteralPath ([string]$currentHost.Path))) {
+    return [string]$currentHost.Path
+  }
+
+  $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source) -and (Test-Path -LiteralPath ([string]$pwsh.Source))) {
+    return [string]$pwsh.Source
+  }
+
+  throw '未找到可用的 PowerShell 主机'
+}
+
+$powerShellHostPath = Resolve-CompatiblePowerShellHost
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
   $ConfigPath = Join-Path $PSScriptRoot 'hdc-relay.local.psd1'
 }
@@ -141,7 +156,7 @@ function Restart-LocalProxy {
   $stdout = Join-Path $startupLogRoot 'hdc-proxy-watchdog.stdout.log'
   $stderr = Join-Path $startupLogRoot 'hdc-proxy-watchdog.stderr.log'
   Write-Host "$(Get-Date -Format o) restart local proxy through config: $ConfigPath" -ForegroundColor Yellow
-  $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+  $proc = Start-Process -FilePath $powerShellHostPath -ArgumentList @(
       '-NoProfile',
       '-ExecutionPolicy', 'Bypass',
       '-File', $relayScript,

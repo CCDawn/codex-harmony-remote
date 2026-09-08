@@ -9,11 +9,15 @@ import { MockCodexAdapter } from '../src/mockCodexAdapter.js';
 import { DiagnosticLogger } from '../src/diagnosticLogger.js';
 import { CodexSessionStore } from '../src/codexSessions.js';
 import { desktopScriptBridge } from '../src/desktopScriptBridge.js';
-import { extractAccountUsageFromDesktopSnapshot, extractAccountUsageFromUsageApi } from '../src/codexAccountUsage.js';
 
 function createTestConfig() {
   const sessionSettingsById = new Map();
   const config = {
+    // Keep the desktop fixture explicit. Production also defaults to the
+    // desktop-owned path; individual tests opt into compatibility modes
+    // unless a case opts into another runtime mode below.
+    appServerRuntimeMode: 'desktop',
+    outboxEnabled: false,
     logger: new DiagnosticLogger({
       root: path.join(os.tmpdir(), `codex-app-test-logs-${Date.now()}-${Math.random().toString(16).slice(2)}`)
     }),
@@ -152,6 +156,75 @@ test('lists task summaries', async () => {
     assert.equal(listed.tasks.length, 1);
     assert.equal(listed.tasks[0].id, created.task.id);
     assert.equal(listed.tasks[0].eventCount > 0, true);
+  } finally {
+    server.close();
+  }
+});
+
+test('health negotiates the Bridge protocol and reports incompatible clients', async () => {
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const compatibleResponse = await fetch(`${baseUrl}/health?clientProtocol=1&clientVersion=1.0.11`);
+    const compatible = await compatibleResponse.json();
+    assert.equal(compatibleResponse.status, 200);
+    assert.equal(compatible.runtime.protocol.protocolVersion, 1);
+    assert.equal(compatible.runtime.protocol.minimumClientProtocol, 1);
+    assert.equal(compatible.runtime.protocol.clientProtocol, 1);
+    assert.equal(compatible.runtime.protocol.clientVersion, '1.0.11');
+    assert.equal(compatible.runtime.protocol.compatible, true);
+    assert.ok(compatible.runtime.protocol.capabilities.includes('event-cursor-v1'));
+    assert.ok(compatible.runtime.protocol.capabilities.includes('outbox-reconcile-v1'));
+    assert.ok(compatible.runtime.protocol.capabilities.includes('runtime-snapshot-v1'));
+
+    const incompatibleResponse = await fetch(`${baseUrl}/health?clientProtocol=999&clientVersion=9.9.9`);
+    const incompatible = await incompatibleResponse.json();
+    assert.equal(incompatibleResponse.status, 200);
+    assert.equal(incompatible.runtime.protocol.compatible, false);
+    assert.equal(incompatible.runtime.protocol.reason, 'client_protocol_newer');
+  } finally {
+    server.close();
+  }
+});
+
+test('task polling supports a forward-only event cursor without duplicates', async () => {
+  const config = createTestConfig();
+  const { server, store } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const createResponse = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        prompt: '事件游标测试'
+      })
+    });
+    const created = await createResponse.json();
+    for (let index = 0; index < 10; index += 1) {
+      store.addEvent(created.task.id, `probe.event.${index}`);
+    }
+
+    const firstResponse = await fetch(`${baseUrl}/tasks/${created.task.id}?afterSeq=0&eventLimit=3`);
+    const first = (await firstResponse.json()).task;
+    assert.deepEqual(first.events.map((event) => event.seq), [1, 2, 3]);
+    assert.equal(first.eventCursor, 3);
+    assert.equal(first.hasMoreEvents, true);
+    assert.equal(first.eventGap, false);
+
+    const secondResponse = await fetch(`${baseUrl}/tasks/${created.task.id}?afterSeq=${first.eventCursor}&eventLimit=3`);
+    const second = (await secondResponse.json()).task;
+    assert.deepEqual(second.events.map((event) => event.seq), [4, 5, 6]);
+    assert.equal(second.eventCursor, 6);
+    assert.equal(second.hasMoreEvents, true);
+    assert.equal(second.events.some((event) => first.events.some((previous) => previous.id === event.id)), false);
   } finally {
     server.close();
   }
@@ -1233,6 +1306,37 @@ test('deletes legacy Codex sessions through POST alias', async () => {
   }
 });
 
+test('opens a legacy Codex session with the configured safe desktop opener', async () => {
+  const openedIds = [];
+  const config = createTestConfig();
+  config.desktopOpener = async (threadId) => {
+    openedIds.push(threadId);
+    return {
+      ok: true,
+      sessionId: threadId,
+      transport: 'cdp'
+    };
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/codex/sessions/019e-open-session/open`, {
+      method: 'POST'
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(openedIds, ['019e-open-session']);
+    assert.equal(body.desktop.sessionId, '019e-open-session');
+    assert.equal(body.desktop.transport, 'cdp');
+  } finally {
+    server.close();
+  }
+});
+
 test('rejects invalid Codex session ids', async () => {
   const config = createTestConfig();
   const { server } = createApp({ config, adapter: new MockCodexAdapter() });
@@ -1352,10 +1456,156 @@ test('CodexSessionStore filters internal context from session details', async ()
   assert.deepEqual(detail.entries.map((entry) => entry.text), ['你好', '你好，我会用中文继续。']);
 });
 
+test('projects endpoint returns the app-server-discovered project catalog', async () => {
+  const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return [{
+        id: 'codex-vibelution',
+        name: 'Vibelution',
+        root: 'C:\\projects\\Vibelution'
+      }];
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/projects`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      projects: [{
+        id: 'codex-vibelution',
+        name: 'Vibelution',
+        root: 'C:\\projects\\Vibelution'
+      }]
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('uploads a permitted phone document and rejects sensitive or oversized files', async () => {
+  const config = createTestConfig();
+  config.mobileFilesDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-mobile-files-'));
+  config.mobileFileMaxBytes = 12;
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const allowed = await fetch(`${baseUrl}/mobile/files`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'bridge.log',
+        mimeType: 'text/plain',
+        base64: Buffer.from('safe-log').toString('base64')
+      })
+    });
+    assert.equal(allowed.status, 201);
+    const uploaded = (await allowed.json()).file;
+    assert.equal(uploaded.fileName.endsWith('-bridge.log'), true);
+    assert.equal(uploaded.bytes, 8);
+    assert.match(uploaded.messageText, /手机端文件/);
+    assert.equal(await fs.readFile(uploaded.filePath, 'utf8'), 'safe-log');
+
+    const sensitive = await fetch(`${baseUrl}/mobile/files`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        fileName: '.env',
+        mimeType: 'text/plain',
+        base64: Buffer.from('TOKEN=secret').toString('base64')
+      })
+    });
+    assert.equal(sensitive.status, 415);
+
+    const oversized = await fetch(`${baseUrl}/mobile/files`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        fileName: 'large.log',
+        mimeType: 'text/plain',
+        base64: Buffer.from('this-is-larger-than-twelve').toString('base64')
+      })
+    });
+    assert.equal(oversized.status, 413);
+  } finally {
+    server.close();
+  }
+});
+
+test('lists and answers structured App Server user input requests over HTTP', async () => {
+  const config = createTestConfig();
+  let receivedAnswers = null;
+  config.threadService = {
+    listUserInputs() {
+      return [{
+        id: 'input-1',
+        runId: 'run-1',
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        itemId: 'item-1',
+        status: 'pending',
+        questions: [{
+          id: 'choice',
+          header: '选择',
+          question: '是否继续？',
+          isOther: false,
+          isSecret: false,
+          options: [{ label: '继续', description: '继续执行' }]
+        }],
+        autoResolutionMs: null,
+        createdAt: '2026-07-29T00:00:00.000Z'
+      }];
+    },
+    getUserInput(id) {
+      return id === 'input-1' ? this.listUserInputs()[0] : null;
+    },
+    answerUserInput(id, answers) {
+      receivedAnswers = answers;
+      return { ...this.getUserInput(id), status: 'answered', answeredAt: '2026-07-29T00:00:01.000Z' };
+    },
+    runtimeHealth() {
+      return { state: 'ready' };
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const listResponse = await fetch(`${baseUrl}/user-inputs`);
+    assert.equal(listResponse.status, 200);
+    assert.equal((await listResponse.json()).userInputs[0].questions[0].id, 'choice');
+
+    const answerResponse = await fetch(`${baseUrl}/user-inputs/input-1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ answers: { choice: ['继续'] } })
+    });
+    assert.equal(answerResponse.status, 200);
+    assert.deepEqual(receivedAnswers, { choice: ['继续'] });
+    assert.equal((await answerResponse.json()).userInput.status, 'answered');
+  } finally {
+    server.close();
+  }
+});
+
 test('requires token when CODEX_BRIDGE_TOKEN is set', async () => {
   const previous = process.env.CODEX_BRIDGE_TOKEN;
   process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
   const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
   const { server } = createApp({ config, adapter: new MockCodexAdapter() });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -1491,6 +1741,11 @@ test('redacts query tokens from bridge request logs', async () => {
   process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
   process.env.CODEX_BRIDGE_LOG_DIR = root;
   const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
   config.logger = new DiagnosticLogger({ root });
   const { server, logger } = createApp({ config, adapter: new MockCodexAdapter() });
   server.listen(0, '127.0.0.1');
@@ -1556,6 +1811,11 @@ test('accepts batched mobile logs while keeping single log compatibility', async
 test('records actual HTTP response byte counts', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-app-response-bytes-'));
   const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
   config.logger = new DiagnosticLogger({ root });
   const { server, logger } = createApp({ config, adapter: new MockCodexAdapter() });
   server.listen(0, '127.0.0.1');
@@ -1663,8 +1923,51 @@ test('rejects non-object JSON bodies with a 400', async () => {
   }
 });
 
-test('exposes official Codex thread API for new phone conversations', async () => {
+test('creates new phone conversations through the strict desktop-backed task path by default', async () => {
   const config = createTestConfig();
+  config.threadService = new FakeThreadService();
+  const adapter = new DesktopVerifiedAdapter();
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const createResponse = await fetch(`${baseUrl}/api/codex/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '你好',
+        model: 'gpt-alt',
+        reasoningEffort: 'medium',
+        submissionId: 'strict-new-1'
+      })
+    });
+    assert.equal(createResponse.status, 202);
+    const created = await createResponse.json();
+    assert.equal(created.run.prompt, '你好');
+    assert.equal(created.run.model, 'gpt-alt');
+    assert.equal(created.run.reasoningEffort, 'medium');
+    assert.equal(created.run.submissionId, 'strict-new-1');
+    assert.equal(config.threadService.run, null);
+    assert.equal(store.listTasks().length, 1);
+
+    const task = await waitForTaskStatus(store, created.run.id, 'completed');
+    assert.equal(task.createdCodexSessionId, '019e-new-desktop-session');
+    assert.equal(task.codexSessionId, '019e-new-desktop-session');
+    assert.equal(adapter.runs.length, 1);
+    assert.equal(adapter.runs[0].codexSessionId, null);
+    assert.equal(adapter.runs[0].model, 'gpt-alt');
+    assert.equal(adapter.runs[0].reasoningEffort, 'medium');
+  } finally {
+    server.close();
+  }
+});
+
+test('keeps App Server new-thread creation behind the explicit app-server-new-only mode', async () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-new-only';
   config.threadService = new FakeThreadService();
   const { server } = createApp({ config, adapter: new MockCodexAdapter() });
   server.listen(0, '127.0.0.1');
@@ -1675,18 +1978,69 @@ test('exposes official Codex thread API for new phone conversations', async () =
     const createResponse = await fetch(`${baseUrl}/api/codex/threads`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ projectId: 'probe', text: '你好', model: 'gpt-alt', reasoningEffort: 'medium' })
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '独立 App Server 新会话',
+        model: 'gpt-alt',
+        reasoningEffort: 'medium',
+        submissionId: 'new-only-1'
+      })
     });
     assert.equal(createResponse.status, 202);
     const created = await createResponse.json();
     assert.equal(created.thread.id, 'thread-1');
     assert.equal(created.run.codexSessionId, 'thread-1');
-    assert.equal(created.run.model, 'gpt-alt');
-    assert.equal(created.run.reasoningEffort, 'medium');
+    assert.equal(created.run.submissionId, 'new-only-1');
     assert.equal(config.threadService.run.model, 'gpt-alt');
     assert.equal(config.threadService.run.reasoningEffort, 'medium');
     assert.equal((await config.sessionSettings.getSessionSettings('thread-1')).model, 'gpt-alt');
     assert.equal((await config.sessionSettings.getSessionSettings('thread-1')).reasoningEffort, 'medium');
+  } finally {
+    server.close();
+  }
+});
+
+test('rejects strict desktop new-thread creation immediately when CDP is offline', async () => {
+  const config = createTestConfig();
+  config.threadService = new FakeThreadService();
+  const adapter = {
+    runs: 0,
+    async getDesktopLiveStatus() {
+      return {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        currentSessionId: null,
+        targetSessionId: '',
+        sessionVerified: false,
+        transport: 'cdp',
+        message: '桌面 CDP 离线'
+      };
+    },
+    async run() {
+      this.runs += 1;
+      throw new Error('offline desktop must not start a task');
+    }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const createResponse = await fetch(`${baseUrl}/api/codex/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: 'probe', text: '不应旁路发送' })
+    });
+    const body = await createResponse.json();
+
+    assert.equal(createResponse.status, 503);
+    assert.match(body.error, /桌面实时通道不可用.*已阻止新建会话/);
+    assert.equal(body.desktop.required, 'desktop_live');
+    assert.equal(config.threadService.run, null);
+    assert.equal(store.listTasks().length, 0);
+    assert.equal(adapter.runs, 0);
   } finally {
     server.close();
   }
@@ -1746,6 +2100,66 @@ test('exposes Codex thread sync API with file cursors', async () => {
     assert.deepEqual(seen.params, { limit: '40', after: '123', before: '' });
     assert.equal(body.session.sync.cursorEnd, '20');
     assert.equal(body.session.entries[0].text, '增量回复');
+  } finally {
+    server.close();
+  }
+});
+
+test('exposes the canonical Codex runtime snapshot API without changing legacy thread routes', async () => {
+  const config = createTestConfig();
+  config.threadService = {
+    async listThreads() {
+      return [{
+        id: 'thread-runtime',
+        title: '统一状态',
+        updatedAt: '2026-07-30T09:00:00.000Z',
+        activityStatus: 'running',
+        detailAvailable: true
+      }];
+    },
+    async getRuntimeSnapshot() {
+      return {
+        schemaVersion: 1,
+        epoch: 'epoch-api',
+        revision: 7,
+        generatedAt: '2026-07-30T09:00:00.000Z',
+        stale: false,
+        sessions: [{
+          threadId: 'thread-runtime',
+          title: '统一状态',
+          projectRoot: '',
+          projectLabel: 'Codex',
+          updatedAt: '2026-07-30T09:00:00.000Z',
+          relativeTime: '刚刚',
+          state: 'running',
+          stateUpdatedAt: '2026-07-30T09:00:00.000Z',
+          source: 'session-file',
+          activeTurnId: 'turn-runtime',
+          canInterrupt: true,
+          terminalReason: '',
+          lastVisibleRole: 'assistant',
+          detailAvailable: true
+        }]
+      };
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const runtimeResponse = await fetch(`${baseUrl}/api/codex/runtime-snapshot`);
+    const runtime = await runtimeResponse.json();
+    const legacyResponse = await fetch(`${baseUrl}/api/codex/threads?limit=10`);
+    const legacy = await legacyResponse.json();
+
+    assert.equal(runtimeResponse.status, 200);
+    assert.equal(runtime.epoch, 'epoch-api');
+    assert.equal(runtime.revision, 7);
+    assert.equal(runtime.sessions[0].activeTurnId, 'turn-runtime');
+    assert.equal(legacyResponse.status, 200);
+    assert.equal(legacy.threads[0].id, 'thread-runtime');
   } finally {
     server.close();
   }
@@ -1829,6 +2243,50 @@ test('exposes desktop default reasoning effort for automatic session settings', 
   }
 });
 
+test('default settings endpoint reads the managed App Server model catalog before CDP fallback', async () => {
+  const config = createTestConfig();
+  delete config.codexSettingsProvider;
+  const threadService = new FakeThreadService();
+  const calls = [];
+  threadService.requestAppServer = async (method) => {
+    calls.push(method);
+    if (method === 'config/read') {
+      return { config: { model: 'gpt-5.6-terra', model_reasoning_effort: 'high' } };
+    }
+    if (method === 'model/list') {
+      return {
+        data: [
+          { id: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra' },
+          { id: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol' },
+          { id: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna' }
+        ]
+      };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  config.threadService = threadService;
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/settings`);
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.settings.modelCatalogSource, 'app_server');
+    assert.equal(body.settings.defaultModel, 'gpt-5.6-terra');
+    assert.deepEqual(body.settings.modelOptions.map((model) => model.id), [
+      'gpt-5.6-terra',
+      'gpt-5.6-sol',
+      'gpt-5.6-luna'
+    ]);
+    assert.deepEqual(calls, ['config/read', 'model/list']);
+  } finally {
+    server.close();
+  }
+});
+
 test('exposes Codex account usage from the configured usage provider', async () => {
   const config = createTestConfig();
   let called = false;
@@ -1866,153 +2324,6 @@ test('exposes Codex account usage from the configured usage provider', async () 
   } finally {
     server.close();
   }
-});
-
-test('does not classify ordinary desktop session list text as Codex account usage', () => {
-  const usage = extractAccountUsageFromDesktopSnapshot({
-    title: 'Codex',
-    location: 'app://codex',
-    accountContext: false,
-    lines: [
-      '对话 会话修复 2 天 解释 Claude auto mode 3 天 评估美国家宽可行性 3 天',
-      '会话修复 2 天',
-      '这是普通聊天消息，不是账号用量页面'
-    ]
-  }, { checkedAt: '2026-06-14T00:00:00.000Z' });
-
-  assert.equal(usage.ok, false);
-  assert.equal(usage.status, 'unavailable');
-  assert.deepEqual(usage.items, []);
-});
-
-test('does not classify context usage or prose urls as account usage', () => {
-  const usage = extractAccountUsageFromDesktopSnapshot({
-    title: 'Codex',
-    location: 'app://codex/thread',
-    accountContext: true,
-    lines: [
-      '上下文用量：76%',
-      'proceedings.iclr.cc/paper_files/paper/2025/file/example-Paper-Conference.pdf'
-    ]
-  }, { checkedAt: '2026-06-14T00:00:00.000Z' });
-
-  assert.equal(usage.ok, false);
-  assert.equal(usage.status, 'unavailable');
-  assert.deepEqual(usage.items, []);
-});
-
-test('does not classify session text and API documentation URLs as account usage', () => {
-  const usage = extractAccountUsageFromDesktopSnapshot({
-    title: 'Codex',
-    location: 'app://codex/thread',
-    accountContext: true,
-    lines: [
-      '置顶 agent论文与项目管理 1 天 Codex 远程部署 / 鸿蒙远程操作 对齐智谱套餐抢购需求 2 天',
-      'developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs/'
-    ]
-  }, { checkedAt: '2026-06-14T00:00:00.000Z' });
-
-  assert.equal(usage.ok, false);
-  assert.equal(usage.status, 'unavailable');
-  assert.equal(usage.source, 'codex_desktop_usage_panel');
-  assert.deepEqual(usage.items, []);
-});
-
-test('does not classify OpenAI help article titles as account usage', () => {
-  const usage = extractAccountUsageFromDesktopSnapshot({
-    title: 'Codex',
-    location: 'app://codex/thread',
-    accountContext: true,
-    lines: [
-      'Using Credits for Flexible Usage',
-      'Using Codex with your ChatGPT plan',
-      'help.openai.com/en/articles/12642688-using-credits-for-flexible-usage-in-chatgpt-freegopluspro',
-      'help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan'
-    ]
-  }, { checkedAt: '2026-06-14T00:00:00.000Z' });
-
-  assert.equal(usage.ok, false);
-  assert.equal(usage.status, 'unavailable');
-  assert.deepEqual(usage.items, []);
-});
-
-test('classifies Codex account usage only when account UI context is present', () => {
-  const usage = extractAccountUsageFromDesktopSnapshot({
-    title: 'Codex',
-    location: 'app://codex/settings/account',
-    accountContext: true,
-    lines: [
-      'Codex Pro plan',
-      'Usage used 12%',
-      'Remaining credits 88%'
-    ]
-  }, { checkedAt: '2026-06-14T00:00:00.000Z' });
-
-  assert.equal(usage.ok, true);
-  assert.equal(usage.status, 'available');
-  assert.equal(usage.source, 'codex_desktop_usage_panel');
-  assert.equal(usage.planName, 'Codex Pro plan');
-  assert.equal(usage.balanceText, 'Remaining credits 88%');
-});
-
-test('extracts real Codex account usage from the authenticated desktop usage API', () => {
-  const usage = extractAccountUsageFromUsageApi({
-    plan_type: 'pro',
-    credits: {
-      has_credits: true,
-      unlimited: false,
-      balance: '123.45'
-    },
-    spend_control: {
-      individual_limit: {
-        used_percent: 12,
-        remaining_percent: 88,
-        used: '12',
-        limit: '100',
-        reset_at: '2026-06-30T16:00:00.000Z'
-      }
-    },
-    rate_limit: {
-      primary_window: {
-        used_percent: 20,
-        limit_window_seconds: 18000,
-        reset_at: '2026-06-17T18:00:00.000Z'
-      },
-      secondary_window: {
-        used_percent: 40,
-        limit_window_seconds: 604800,
-        reset_at: '2026-06-24T18:00:00.000Z'
-      }
-    },
-    additional_rate_limits: [{
-      limit_name: 'gpt-5.5-codex',
-      rate_limit: {
-        primary_window: {
-          used_percent: 70,
-          limit_window_seconds: 86400,
-          reset_at: '2026-06-18T18:00:00.000Z'
-        }
-      }
-    }]
-  }, { checkedAt: '2026-06-17T00:00:00.000Z' });
-
-  assert.equal(usage.ok, true);
-  assert.equal(usage.source, 'codex_desktop_authenticated_usage_api');
-  assert.equal(usage.planName, 'Pro');
-  assert.equal(usage.items.some((item) => item.label === '月度限制' && item.value.includes('剩余 88%')), true);
-  assert.equal(usage.items.some((item) => item.label === '5小时限制' && item.value.includes('已用 20%')), true);
-  assert.equal(usage.items.some((item) => item.label === '每周限制' && item.value.includes('剩余 60%')), true);
-  assert.equal(usage.items.some((item) => item.label === 'gpt-5.5-codex' && item.value.includes('已用 70%')), true);
-  assert.equal(usage.items.some((item) => item.kind === 'balance' && item.value === '余额 123.45'), true);
-});
-
-test('reports unavailable when the authenticated usage API has no usable fields', () => {
-  const usage = extractAccountUsageFromUsageApi({}, { checkedAt: '2026-06-17T00:00:00.000Z' });
-
-  assert.equal(usage.ok, false);
-  assert.equal(usage.status, 'unavailable');
-  assert.equal(usage.source, 'codex_desktop_authenticated_usage_api');
-  assert.deepEqual(usage.items, []);
 });
 
 test('sends existing phone thread messages through the desktop-backed task path', async () => {
@@ -2071,6 +2382,403 @@ test('sends existing phone thread messages through the desktop-backed task path'
     assert.equal(body.run.model, 'gpt-alt');
     assert.equal(body.run.reasoningEffort, 'high');
     assert.equal(adapter.runs[0].reasoningEffort, 'high');
+  } finally {
+    server.close();
+  }
+});
+
+test('deduplicates strict desktop phone retries by submission id', async () => {
+  const config = createTestConfig();
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  const adapter = new DesktopVerifiedAdapter();
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const send = () => fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '只发送一次',
+        submissionId: 'strict-existing-1',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+
+    const firstResponse = await send();
+    const first = await firstResponse.json();
+    assert.equal(firstResponse.status, 202);
+    await waitForTaskStatus(store, first.run.id, 'completed');
+
+    const secondResponse = await send();
+    const second = await secondResponse.json();
+    assert.equal(secondResponse.status, 202);
+    assert.equal(second.run.id, first.run.id);
+    assert.equal(second.run.submissionId, 'strict-existing-1');
+    assert.equal(store.listTasks().length, 1);
+    assert.equal(adapter.runs.length, 1);
+    assert.equal(
+      store.getTask(first.run.id).events.some((event) => event.type === 'task.duplicate_submission_ignored'),
+      true
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('steers a running desktop task immediately instead of leaving guidance stuck in the outbox', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-app-outbox-steer-'));
+  const config = createTestConfig();
+  config.outboxEnabled = true;
+  config.outboxPath = path.join(root, 'outbox.json');
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  const steered = [];
+  let finishRun = () => {};
+  const adapter = {
+    async run({ task, emit }) {
+      emit('codex.app_server.turn.started', {
+        threadId: task.codexSessionId,
+        turn: { id: 'turn-running', status: 'inProgress' }
+      });
+      return await new Promise((resolve) => {
+        finishRun = () => resolve({
+          summary: 'done',
+          changedFiles: [],
+          tests: [],
+          session: { id: task.codexSessionId, entries: [] },
+          desktopSync: { status: 'desktop_live', desktopLive: true },
+          exitCode: 0
+        });
+      });
+    },
+    async steer({ task, prompt, emit }) {
+      steered.push({ taskId: task.id, prompt });
+      emit('codex.app_server.turn.steered', {
+        threadId: task.codexSessionId,
+        turnId: task.activeCodexTurnId
+      });
+      return {
+        accepted: true,
+        threadId: task.codexSessionId,
+        turnId: task.activeCodexTurnId
+      };
+    }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const running = store.createTask({
+      projectId: 'probe',
+      prompt: '第一条消息仍在处理',
+      codexSessionId: '019e-test-session',
+      sessionFingerprint: testSessionFingerprint(),
+      verifiedSessionTarget: testSessionFingerprint()
+    });
+    await until(() => store.getTask(running.id)?.activeCodexTurnId === 'turn-running');
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '这是运行中的引导消息',
+        submissionId: 'desktop-guidance-1',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 202);
+    assert.equal(body.run.id, running.id);
+    assert.equal(body.run.status, 'running');
+    assert.deepEqual(steered, [{
+      taskId: running.id,
+      prompt: '这是运行中的引导消息'
+    }]);
+    assert.equal(store.listTasks().length, 1);
+    assert.equal(body.outbox.status, 'submitted');
+    assert.equal(body.outbox.resultId, running.id);
+    finishRun();
+    await waitForTaskStatus(store, running.id, 'completed');
+    finishRun = () => {};
+  } finally {
+    finishRun();
+    server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('retries a safely failed strict desktop outbox submission with the same id', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-app-outbox-retry-'));
+  const config = createTestConfig();
+  config.outboxEnabled = true;
+  config.outboxPath = path.join(root, 'outbox.json');
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  const adapter = new DesktopVerifiedAdapter();
+  const originalRun = adapter.run.bind(adapter);
+  adapter.run = async (context) => {
+    if (adapter.runs.length === 0) {
+      adapter.runs.push({
+        id: context.task.id,
+        codexSessionId: context.task.codexSessionId,
+        prompt: context.task.prompt
+      });
+      throw new Error('Codex 桌面恢复会话后 CDP 未稳定：Codex 桌面 CDP 连接错误');
+    }
+    return await originalRun(context);
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const send = () => fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '失败前未创建 turn，可以安全重试',
+        submissionId: 'strict-existing-safe-retry-1',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+
+    const firstResponse = await send();
+    const first = await firstResponse.json();
+    await waitForTaskStatus(store, first.run.id, 'failed');
+
+    const secondResponse = await send();
+    const second = await secondResponse.json();
+    assert.equal(secondResponse.status, 202);
+    assert.notEqual(second.run.id, first.run.id);
+    await waitForTaskStatus(store, second.run.id, 'completed');
+    assert.equal(adapter.runs.length, 2);
+    assert.equal(store.listTasks().length, 2);
+  } finally {
+    server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('routes an App Server primary phone message without a desktop CDP preflight', async () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-primary';
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  const adapter = {
+    checked: 0,
+    async getDesktopLiveStatus() {
+      this.checked += 1;
+      throw new Error('primary App Server path must not check CDP');
+    }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '直接交给 App Server',
+        model: 'gpt-alt',
+        reasoningEffort: 'high',
+        submissionId: 'primary-send-1',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 202);
+    assert.equal(body.run.runtime.kind, 'app_server');
+    assert.equal(body.run.submissionId, 'primary-send-1');
+    assert.equal(config.threadService.sentMessages.length, 1);
+    assert.deepEqual(config.threadService.sentMessages[0], {
+      threadId: '019e-test-session',
+      text: '直接交给 App Server',
+      model: 'gpt-alt',
+      reasoningEffort: 'high',
+      submissionId: 'primary-send-1'
+    });
+    assert.equal(store.listTasks().length, 0);
+    assert.equal(adapter.checked, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('desktop-primary falls back to App Server only when desktop preflight is unavailable', async () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'desktop-primary';
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  const adapter = {
+    checkedSessionId: '',
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      this.checkedSessionId = sessionId;
+      return {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        targetSessionId: sessionId,
+        currentSessionId: null,
+        sessionVerified: false,
+        transport: 'cdp',
+        message: '桌面实时通道未连接'
+      };
+    }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '桌面不在线时的受控兜底',
+        submissionId: 'desktop-primary-fallback-1',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 202);
+    assert.equal(body.run.runtime.kind, 'app_server');
+    assert.equal(config.threadService.sentMessages.length, 1);
+    assert.deepEqual(config.threadService.sentMessages[0], {
+      threadId: '019e-test-session',
+      text: '桌面不在线时的受控兜底',
+      model: 'gpt-test',
+      reasoningEffort: '',
+      submissionId: 'desktop-primary-fallback-1'
+    });
+    assert.deepEqual(config.threadService.deliveryModes, ['desktop_fallback']);
+    assert.equal(adapter.checkedSessionId, '019e-test-session');
+    assert.equal(store.listTasks().length, 0);
+
+    const interruptResponse = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/interrupt`, {
+      method: 'POST'
+    });
+    assert.equal(interruptResponse.status, 200);
+    assert.deepEqual(config.threadService.interruptedThreads, ['019e-test-session']);
+    assert.equal(store.listTasks().length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('reports the selected App Server execution contract and active run through health and tasks', async () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-primary';
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    await config.threadService.sendMessage({
+      threadId: '019e-test-session',
+      text: '正在恢复的运行',
+      submissionId: 'health-run-1'
+    });
+    const healthResponse = await fetch(`${baseUrl}/health?threadId=019e-test-session`);
+    const health = await healthResponse.json();
+    const tasksResponse = await fetch(`${baseUrl}/tasks`);
+    const tasks = await tasksResponse.json();
+
+    assert.equal(healthResponse.status, 200);
+    assert.equal(health.runtime.mode, 'app-server-primary');
+    assert.equal(health.runtime.existingThreadExecution, 'app_server');
+    assert.equal(health.runtime.appServer.kind, 'app_server');
+    assert.equal(tasksResponse.status, 200);
+    assert.equal(tasks.tasks.some((task) => task.id === 'run-2' && task.runtime?.kind === 'app_server'), true);
+  } finally {
+    server.close();
+  }
+});
+
+test('strict desktop runtime disables the internally constructed independent App Server service', () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'desktop';
+
+  const { threadService } = createApp({ config, adapter: new MockCodexAdapter() });
+
+  assert.deepEqual(threadService.runtimeHealth(), {
+    kind: 'app_server',
+    enabled: false,
+    state: 'disabled',
+    reason: 'strict_desktop_mode',
+    generation: 0,
+    pendingRequests: 0,
+    reconnectAttempts: 0,
+    reconnectScheduled: false,
+    recoveredRuns: 0,
+    pendingApprovals: 0,
+    pendingUserInputs: 0
+  });
+});
+
+test('uses only configured existing threads in App Server canary mode', async () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-canary';
+  config.appServerCanaryThreadIds = ['019e-canary-session'];
+  config.threadService = new FakeThreadService();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const selectedResponse = await fetch(`${baseUrl}/health?threadId=019e-canary-session`);
+    const otherResponse = await fetch(`${baseUrl}/health?threadId=019e-other-session`);
+    const selected = await selectedResponse.json();
+    const other = await otherResponse.json();
+
+    assert.equal(selected.runtime.existingThreadExecution, 'app_server');
+    assert.equal(other.runtime.existingThreadExecution, 'canary');
+  } finally {
+    server.close();
+  }
+});
+
+test('interrupts the active primary App Server run by its thread without falling back to the desktop task store', async () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-primary';
+  config.threadService = new FakeThreadService();
+  const { server, store } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    await config.threadService.sendMessage({ threadId: '019e-test-session', text: '中断我' });
+    const response = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/interrupt`, {
+      method: 'POST'
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.run.status, 'interrupted');
+    assert.deepEqual(config.threadService.interruptedThreads, ['019e-test-session']);
+    assert.equal(store.listTasks().length, 0);
   } finally {
     server.close();
   }
@@ -2285,9 +2993,9 @@ test('rejects existing phone thread messages before creating a task when desktop
 
     const body = await response.json();
     assert.equal(response.status, 503);
-    assert.match(body.error, /桌面端未确认当前会话/);
+    assert.match(body.error, /桌面 App Server 未确认手机选择的目标会话/);
     assert.equal(body.desktop.targetSessionId, '019e-test-session');
-    assert.equal(body.desktop.required, 'desktop_live_verified_session');
+    assert.equal(body.desktop.required, 'desktop_live_verified_target');
     assert.equal(body.preflight.canSend, false);
     assert.equal(body.preflight.recommendedAction, 'soft_recover_live_host');
     assert.equal(store.listTasks().length, 0);
@@ -2298,24 +3006,39 @@ test('rejects existing phone thread messages before creating a task when desktop
   }
 });
 
-test('rejects existing phone thread messages when desktop live is on a different session', async () => {
+test('sends an existing phone thread through the desktop app-server while desktop shows another session', async () => {
   const config = createTestConfig();
   config.threadService = new FakeThreadService();
   config.sessions = new FakeSessionVerifier();
+  let runCalled = false;
   const adapter = {
     async getDesktopLiveStatus(timeoutMs, sessionId) {
       return {
         ok: true,
         desktopLive: true,
-        status: 'unverified',
-        message: '桌面当前会话不是手机目标会话',
+        status: 'target_ready',
+        message: '桌面 App Server 已确认目标会话；桌面当前页面无需切换。',
         currentSessionId: '019e-other-session',
         targetSessionId: sessionId,
-        sessionVerified: false
+        sessionVerified: false,
+        targetVerified: true,
+        transport: 'cdp'
       };
     },
-    async run() {
-      throw new Error('should not run when desktop session is mismatched');
+    async run({ task, emit }) {
+      runCalled = true;
+      emit('codex.app_server.thread.ready', {
+        threadId: task.codexSessionId,
+        sessionId: task.codexSessionId
+      });
+      return {
+        summary: 'desktop app-server completed target thread',
+        changedFiles: [],
+        tests: [],
+        session: { id: task.codexSessionId, entries: [] },
+        desktopSync: { status: 'desktop_live', desktopLive: true },
+        exitCode: 0
+      };
     }
   };
   const { server, store } = createApp({ config, adapter });
@@ -2335,12 +3058,17 @@ test('rejects existing phone thread messages when desktop live is on a different
     });
     const body = await response.json();
 
-    assert.equal(response.status, 409);
-    assert.match(body.error, /桌面端未确认当前会话/);
-    assert.equal(body.preflight.recommendedAction, 'sync_session');
-    assert.equal(body.preflight.currentSessionId, '019e-other-session');
-    assert.equal(body.preflight.targetSessionId, '019e-test-session');
-    assert.equal(store.listTasks().length, 0);
+    assert.equal(response.status, 202);
+    assert.equal(body.run.codexSessionId, '019e-test-session');
+    const completed = await waitForTaskStatus(store, body.run.id, 'completed');
+    assert.equal(completed.verifiedDesktopStatus.status, 'target_ready');
+    assert.equal(completed.verifiedDesktopStatus.sessionVerified, false);
+    assert.equal(completed.verifiedDesktopStatus.targetVerified, true);
+    assert.equal(completed.verifiedDesktopStatus.preflight.recommendedAction, 'none');
+    assert.equal(completed.verifiedDesktopStatus.preflight.currentSessionId, '019e-other-session');
+    assert.equal(completed.verifiedDesktopStatus.preflight.targetSessionId, '019e-test-session');
+    assert.equal(runCalled, true);
+    assert.equal(config.threadService.sentMessages.length, 0);
   } finally {
     server.close();
   }
@@ -2419,6 +3147,7 @@ test('waits for desktop verification before creating an existing phone thread ta
 
 test('soft-recovers desktop live before sending an existing phone thread task', async () => {
   const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-shadow';
   config.threadService = new FakeThreadService();
   config.sessions = new FakeSessionVerifier();
   let recoverCalled = false;
@@ -2509,8 +3238,65 @@ test('soft-recovers desktop live before sending an existing phone thread task', 
   }
 });
 
+test('strict desktop mode reports an existing-thread CDP failure without auto recovery', async () => {
+  const config = createTestConfig();
+  config.threadService = new FakeThreadService();
+  config.sessions = new FakeSessionVerifier();
+  let recoverCalled = false;
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        message: '桌面 CDP 离线',
+        targetSessionId: sessionId,
+        sessionVerified: false,
+        transport: 'cdp'
+      };
+    },
+    async run() {
+      throw new Error('strict offline request must not run');
+    }
+  };
+  config.desktopLiveRecovery = {
+    shouldRecover() {
+      return true;
+    },
+    async recover() {
+      recoverCalled = true;
+    }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '不要降级或恢复',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.match(body.error, /桌面 App Server 未确认手机选择的目标会话/);
+    assert.equal(recoverCalled, false);
+    assert.equal(store.listTasks().length, 0);
+    assert.equal(config.threadService.sentMessages.length, 0);
+  } finally {
+    server.close();
+  }
+});
+
 test('reports soft recovery failure without running an existing phone thread task', async () => {
   const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-shadow';
   config.threadService = new FakeThreadService();
   config.sessions = new FakeSessionVerifier();
   let recoverCalled = false;
@@ -2559,7 +3345,7 @@ test('reports soft recovery failure without running an existing phone thread tas
     const body = await response.json();
 
     assert.equal(response.status, 503);
-    assert.match(body.error, /桌面端未确认当前会话/);
+    assert.match(body.error, /桌面 App Server 未确认手机选择的目标会话/);
     assert.equal(body.preflight.recommendedAction, 'desktop_cdp_restart_required');
     assert.equal(body.preflight.requiresHardRecovery, true);
     assert.match(body.preflight.recoveryError, /软恢复已停止/);
@@ -3105,6 +3891,74 @@ test('system link status reports HDC degradation without blocking desktop sessio
   }
 });
 
+test('system link status does not require desktop CDP for an app-server primary session', async () => {
+  const config = createTestConfig();
+  config.appServerRuntimeMode = 'app-server-primary';
+  config.sessions = {
+    async listSessions() {
+      return [{ id: '019e-test-session', title: 'Test Session' }];
+    }
+  };
+  config.linkRelayProbeProvider = async () => ({
+    ok: true,
+    bridgeOnline: true,
+    message: 'relay ok'
+  });
+  config.linkHdcProbeProvider = async () => ({
+    ok: true,
+    proxyListening: true,
+    connected: true,
+    shellReady: true,
+    message: 'hdc ok'
+  });
+  config.desktopLiveDiagnostics = {
+    async inspect() {
+      return {
+        failureClass: 'codex_plain_no_cdp',
+        desktopProcessMode: 'plain',
+        requiresDesktopCdp: true,
+        mobileRecoverable: false
+      };
+    }
+  };
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        message: '桌面实时通道未连接',
+        reason: '普通启动态，没有 CDP',
+        targetSessionId: sessionId,
+        sessionVerified: false
+      };
+    },
+    async run() {
+      throw new Error('should not create task');
+    }
+  };
+
+  const { server } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/system/link/status?sessionId=019e-test-session`);
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.link.executionMode, 'app_server');
+    assert.equal(body.link.desktopRequired, false);
+    assert.equal(body.link.desktop.desktopLive, false);
+    assert.equal(body.link.severity, 'ok');
+    assert.equal(body.link.ok, true);
+    assert.equal(body.link.recommendedAction, 'none');
+  } finally {
+    server.close();
+  }
+});
+
 test('system link status treats local HDC shell readiness as usable even when public relay pairing is idle', async () => {
   const config = createTestConfig();
   config.sessions = {
@@ -3262,6 +4116,7 @@ class FakeThreadService {
   constructor() {
     this.run = null;
     this.sentMessages = [];
+    this.deliveryModes = [];
   }
 
   async listThreads() {
@@ -3285,15 +4140,16 @@ class FakeThreadService {
     };
   }
 
-  async startThread({ prompt, model = '', reasoningEffort = '' }) {
+  async startThread({ prompt, model = '', reasoningEffort = '', submissionId = '' }) {
     const thread = await this.getThread('thread-1');
-    this.run = this.buildRun({ id: 'run-1', threadId: thread.id, prompt, model, reasoningEffort });
+    this.run = this.buildRun({ id: 'run-1', threadId: thread.id, prompt, model, reasoningEffort, submissionId });
     return { thread, run: this.run };
   }
 
-  async sendMessage({ threadId, text, model = '', reasoningEffort = '' }) {
-    this.sentMessages.push({ threadId, text, model, reasoningEffort });
-    this.run = this.buildRun({ id: 'run-2', threadId, prompt: text, model, reasoningEffort });
+  async sendMessage({ threadId, text, model = '', reasoningEffort = '', submissionId = '', deliveryMode = 'app_server' }) {
+    this.sentMessages.push({ threadId, text, model, reasoningEffort, submissionId });
+    this.deliveryModes.push(deliveryMode);
+    this.run = this.buildRun({ id: 'run-2', threadId, prompt: text, model, reasoningEffort, submissionId });
     return this.run;
   }
 
@@ -3302,11 +4158,32 @@ class FakeThreadService {
   }
 
   async interruptRun() {
-    this.run.status = 'failed';
+    this.run.status = 'interrupted';
     return this.run;
   }
 
-  buildRun({ id, threadId, prompt, model = '', reasoningEffort = '' }) {
+  async interruptThread(threadId) {
+    this.interruptedThreads = [...(this.interruptedThreads ?? []), threadId];
+    if (this.run) {
+      this.run.status = 'interrupted';
+    }
+    return this.run;
+  }
+
+  listRuns() {
+    return this.run ? [this.run] : [];
+  }
+
+  runtimeHealth() {
+    return {
+      kind: 'app_server',
+      state: 'ready',
+      generation: 3,
+      pendingApprovals: 0
+    };
+  }
+
+  buildRun({ id, threadId, prompt, model = '', reasoningEffort = '', submissionId = '' }) {
     return {
       id,
       projectId: 'probe',
@@ -3317,6 +4194,8 @@ class FakeThreadService {
       status: 'running',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      submissionId,
+      runtime: { kind: 'app_server', state: 'running', generation: 3, canInterrupt: true },
       desktopSync: { status: 'app_server_official', desktopLive: false },
       session: null,
       events: [],
@@ -3475,6 +4354,18 @@ class DesktopVerifiedAdapter {
   }
 
   async getDesktopLiveStatus(timeoutMs, sessionId) {
+    if (!sessionId) {
+      return {
+        ok: true,
+        desktopLive: true,
+        status: 'ready',
+        message: '桌面 CDP 已连接',
+        currentSessionId: null,
+        targetSessionId: '',
+        sessionVerified: false,
+        transport: 'cdp'
+      };
+    }
     return {
       ok: true,
       desktopLive: true,
@@ -3487,6 +4378,7 @@ class DesktopVerifiedAdapter {
   }
 
   async run({ task, emit }) {
+    const sessionId = task.codexSessionId || '019e-new-desktop-session';
     this.runs.push({
       id: task.id,
       codexSessionId: task.codexSessionId,
@@ -3497,17 +4389,17 @@ class DesktopVerifiedAdapter {
     emit('codex.desktop_sync', {
       status: 'desktop_live',
       desktopLive: true,
-      mode: 'resume'
+      mode: task.codexSessionId ? 'resume' : 'new'
     });
     emit('codex.app_server.thread.ready', {
-      threadId: task.codexSessionId,
-      sessionId: task.codexSessionId
+      threadId: sessionId,
+      sessionId
     });
     return {
       summary: 'done',
       changedFiles: [],
       tests: [],
-      session: { id: task.codexSessionId, entries: [] },
+      session: { id: sessionId, entries: [] },
       desktopSync: {
         status: 'desktop_live',
         desktopLive: true
